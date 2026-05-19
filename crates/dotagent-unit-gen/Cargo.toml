@@ -1,0 +1,13 @@
+[package]
+name = "dotagent-unit-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Generate launchd plists (macOS) and systemd unit files (Linux) from agent manifests."
+
+[dependencies]
+thiserror.workspace = true
+dirs.workspace = true

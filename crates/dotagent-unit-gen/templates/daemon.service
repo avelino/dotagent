@@ -1,0 +1,13 @@
+[Unit]
+Description=dotagent daemon ({{LABEL}})
+
+[Service]
+Type=simple
+ExecStart={{BINARY}} daemon
+Restart=always
+RestartSec=10
+StandardOutput=append:{{STDOUT_LOG}}
+StandardError=append:{{STDERR_LOG}}
+
+[Install]
+WantedBy=default.target
