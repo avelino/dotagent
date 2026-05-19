@@ -1,0 +1,36 @@
+[package]
+name = "dotagent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Polyglot agent orchestrator — write agents in any language, scheduled by the OS, monitored by dotagent."
+
+[[bin]]
+name = "dotagent"
+path = "src/main.rs"
+
+[dependencies]
+dotagent-core.workspace = true
+dotagent-scheduler.workspace = true
+dotagent-runner.workspace = true
+dotagent-state.workspace = true
+dotagent-plugin.workspace = true
+dotagent-telemetry.workspace = true
+dotagent-unit-gen.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
