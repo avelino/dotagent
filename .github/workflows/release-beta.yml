@@ -1,0 +1,143 @@
+name: release-beta
+
+# Beta channel: every push to `main` rebuilds the four release archives,
+# republishes a rolling `beta` GitHub release (tag deleted + recreated),
+# and rewrites `Formula/dotagent@beta.rb` with the fresh sha256s and a
+# monotonic `0.0.1-beta.<commit-count>` version.
+#
+# Reuses `_build.yml` for the matrix and `./.github/actions/update-formula`
+# for the formula bump.
+#
+# Loop protection — `paths-ignore` + `github.actor != github-actions[bot]`
+# stop the bot's own commit from retriggering the workflow.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "Formula/**"
+      - "docs/**"
+      - "**/*.md"
+      - ".github/workflows/release.yml"
+      - "scripts/homebrew/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# A second push while a beta is mid-build cancels the in-flight run.
+# The newest commit on main always wins.
+concurrency:
+  group: release-beta
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: compute beta version
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+      short_sha: ${{ steps.calc.outputs.short_sha }}
+      version_file: ${{ steps.calc.outputs.version_file }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # need full history for `git rev-list --count`
+
+      - id: calc
+        run: |
+          set -euo pipefail
+          BASE=$(grep -E '^version = ' Cargo.toml | head -1 | sed -E 's/.*"(.*)".*/\1/')
+          COUNT=$(git rev-list --count HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          VERSION="${BASE}-beta.${COUNT}"
+          echo "version=${VERSION}"   >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT}"   >> "$GITHUB_OUTPUT"
+          # Multiline output (heredoc syntax) — read by `_build.yml`
+          # and written to a VERSION file inside each tarball.
+          {
+            echo 'version_file<<EOF'
+            echo "${VERSION}"
+            echo "built from main@${SHORT}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+          echo "Computed beta version: ${VERSION} (sha ${SHORT})"
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/_build.yml
+    with:
+      archive-prefix: dotagent-beta
+      cache-key: beta
+      version-file: ${{ needs.prepare.outputs.version_file }}
+
+  release:
+    name: republish rolling beta release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Delete previous beta release & tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # `--cleanup-tag` removes the git tag in the same call.
+          # `|| true` because the very first run has nothing to delete.
+          gh release delete beta --yes --cleanup-tag --repo "${GITHUB_REPOSITORY}" || true
+
+      - name: Publish rolling beta release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: beta
+          name: "beta — ${{ needs.prepare.outputs.version }}"
+          body: |
+            Pre-release built from `main@${{ needs.prepare.outputs.short_sha }}`.
+
+            Version: `${{ needs.prepare.outputs.version }}`
+
+            Install via Homebrew:
+            ```
+            brew tap avelino/dotagent https://github.com/avelino/dotagent
+            brew install dotagent@beta
+            brew link --overwrite dotagent@beta
+            ```
+
+            The `beta` tag is **rolling** — it is deleted and recreated
+            on every push to `main`. For a pinned version, install the
+            stable formula (`brew install dotagent`).
+          prerelease: true
+          make_latest: "false"
+          target_commitish: ${{ github.sha }}
+          files: |
+            dotagent-beta-*.tar.gz
+            dotagent-beta-*.tar.gz.sha256
+
+  homebrew:
+    name: refresh dotagent@beta formula
+    needs: [prepare, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: ./.github/actions/update-formula
+        with:
+          formula-path: Formula/dotagent@beta.rb
+          marker-prefix: DOTAGENT_BETA
+          version: ${{ needs.prepare.outputs.version }}
+          archive-prefix: dotagent-beta
+          commit-message: "homebrew: bump dotagent@beta to ${{ needs.prepare.outputs.version }}"
