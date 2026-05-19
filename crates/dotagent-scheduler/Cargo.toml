@@ -1,0 +1,14 @@
+[package]
+name = "dotagent-scheduler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure scheduling logic for dotagent: expected_at, backoff, health state."
+
+[dependencies]
+dotagent-core.workspace = true
+chrono.workspace = true
+serde.workspace = true
