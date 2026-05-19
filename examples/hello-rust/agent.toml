@@ -1,0 +1,21 @@
+# Example: a minimal Rust agent.
+#
+# Built standalone (not a workspace member) so users see how to ship an agent
+# as its own crate. Build: cargo build --release; copy target/release/hello-rust
+# into this directory or adjust `run.command`.
+
+[agent]
+name = "hello-rust"
+description = "Minimal Rust agent — echoes env vars."
+monitor = false
+timeout_seconds = 60
+
+[run]
+command = "./target/release/hello-rust"
+args = []
+
+[[schedules]]
+id = "manual"
+type = "interval"
+interval_minutes = 10080
+args = []

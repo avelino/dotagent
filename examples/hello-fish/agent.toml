@@ -1,0 +1,22 @@
+# Example: a minimal Fish agent.
+#
+# Run via dotagent:
+#   dotagent run hello-fish --schedule manual
+#
+# The agent script just echoes the env vars dotagent injected.
+
+[agent]
+name = "hello-fish"
+description = "Minimal Fish agent — echoes env vars."
+monitor = false
+timeout_seconds = 60
+
+[run]
+command = "fish"
+args = ["./agent.fish"]
+
+[[schedules]]
+id = "manual"
+type = "interval"
+interval_minutes = 10080  # weekly, but `monitor = false` means it's only invoked manually
+args = []

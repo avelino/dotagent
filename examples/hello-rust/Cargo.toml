@@ -1,0 +1,9 @@
+[package]
+name = "hello-rust"
+version = "0.0.1"
+edition = "2021"
+# Not part of the workspace — examples are independent.
+
+[[bin]]
+name = "hello-rust"
+path = "src/main.rs"

@@ -1,0 +1,19 @@
+# Example: a minimal Go agent.
+#
+# Built with `go build -o agent ./...`. dotagent invokes the binary directly.
+
+[agent]
+name = "hello-go"
+description = "Minimal Go agent — echoes env vars."
+monitor = false
+timeout_seconds = 60
+
+[run]
+command = "./agent"
+args = []
+
+[[schedules]]
+id = "manual"
+type = "interval"
+interval_minutes = 10080
+args = []

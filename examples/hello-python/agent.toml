@@ -1,0 +1,19 @@
+# Example: a minimal Python agent.
+#
+# Uses a uv-managed shebang so the script runs without explicit env setup.
+
+[agent]
+name = "hello-python"
+description = "Minimal Python agent — echoes env vars."
+monitor = false
+timeout_seconds = 60
+
+[run]
+command = "python3"
+args = ["./agent.py"]
+
+[[schedules]]
+id = "manual"
+type = "interval"
+interval_minutes = 10080
+args = []
