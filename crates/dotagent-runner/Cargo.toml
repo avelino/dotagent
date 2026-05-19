@@ -1,0 +1,28 @@
+[package]
+name = "dotagent-runner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Spawn agents with timeout (SIGTERM → SIGKILL), capture stdio, inject env vars."
+
+[dependencies]
+dotagent-core.workspace = true
+dotagent-state.workspace = true
+dotagent-plugin.workspace = true
+dotagent-notify.workspace = true
+dotagent-telemetry.workspace = true
+
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
