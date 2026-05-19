@@ -1,0 +1,845 @@
+# dotagent — LLM context (single-fetch digest)
+
+> Polyglot agent orchestrator. You write `agent.toml` + a script in any
+> language. dotagent schedules, supervises, retries, and notifies on
+> failure via OS-native scheduling (launchd / systemd).
+>
+> This file is a dense, single-page reference optimized for LLMs. After
+> reading this you should be able to write a working agent without
+> opening any other doc. Links to deep dives are at the bottom.
+>
+> Source repo: https://github.com/avelino/dotagent
+> Site (humans): https://avelino.gitbook.io/dotagent (or the `docs/`
+> tree of the repo)
+> Spec version: tracks `crates/dotagent-core` — when in doubt, the
+> Rust source under `dotagent-core/src/manifest.rs` wins.
+
+---
+
+## 1. Mental model in 60 seconds
+
+```
+┌────────────┐     ┌───────────────────┐     ┌────────────────┐
+│  launchd/  │ ──▶ │ dotagent daemon   │ ──▶ │  your script   │
+│  systemd   │     │ (single process)  │     │  (any language)│
+└────────────┘     └───────────────────┘     └────────────────┘
+       OS keeps daemon alive       daemon spawns agents on schedule
+```
+
+- The OS scheduler (launchd on macOS / systemd on Linux) keeps the
+  daemon alive. The daemon keeps every agent alive.
+- One daemon, N agents, M schedules per agent.
+- The daemon **never sleeps to wait** — it computes the next event and
+  uses the OS scheduler.
+- Your agent script just reads env vars and exits with a code.
+- Failure path: retry → exhaust retries → fire `[[notifiers]]` (built-in,
+  in-process) and/or `[[on_failure]]` plugins (subprocess, JSON stdio).
+
+---
+
+## 2. TL;DR — 3 files = 1 working agent
+
+```
+~/.config/dotagent/agents/my-agent/
+├── agent.toml      # manifest (contract)
+└── agent.fish      # script (or agent.py / agent.go / a binary)
+```
+
+Smallest viable manifest:
+
+```toml
+[agent]
+name = "my-agent"
+timeout_seconds = 300
+
+[run]
+command = "python3"
+args = ["./agent.py"]
+
+[[schedules]]
+id = "every-90"
+type = "interval"
+interval_minutes = 90
+
+[[notifiers]]
+driver = "desktop"
+events = ["given_up"]
+```
+
+The script:
+
+```python
+import os
+print(f"hello from {os.environ['AGENT_NAME']}")
+# exit 0 = success; any non-zero = attempt_failed
+```
+
+Install:
+
+```bash
+dotagent doctor                # validate
+dotagent run my-agent          # foreground smoke test
+dotagent install               # write launchd plist / systemd unit
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/run.avelino.dotagent.plist
+```
+
+---
+
+## 3. `agent.toml` — every field
+
+```toml
+# ─── [agent] — identity (required) ────────────────────────────────────
+[agent]
+name = "my-agent"                  # REQUIRED. Unique within dotagent root.
+description = "What it does."      # optional
+monitor = true                     # default true. false = excluded from `tick`
+timeout_seconds = 1800             # default 1800. Hard kill (SIGTERM→SIGKILL).
+
+# ─── [run] — how to invoke (required) ─────────────────────────────────
+[run]
+command = "fish"                   # REQUIRED. Executable.
+args = ["./agent.fish"]            # static argv prefix
+working_dir = "."                  # optional, relative to manifest dir
+
+# ─── [env] — environment injection (optional) ─────────────────────────
+[env]
+inherit = true                     # default true. false = hermetic env.
+[env.extra]                        # merged on top
+LOG_LEVEL = "info"
+PYTHONUNBUFFERED = "1"
+
+# ─── [defaults] — agent-wide retry/backoff (optional) ─────────────────
+[defaults]
+max_retries = 3                    # 0 = no retry
+retry_backoff_minutes = [5, 15, 30]
+stale_after_minutes = 120          # window older than this → state=stale
+
+# ─── [[schedules]] — REQUIRED, at least one ───────────────────────────
+[[schedules]]
+id = "daily"                       # REQUIRED. Unique within manifest.
+type = "cron"                      # "cron" | "interval" | "expression"
+weekdays = [1, 2, 3, 4, 5]         # 0=Sun..6=Sat. cron only.
+hours = [8]                        # cron only. Any of 0..23.
+minute = 30                        # cron only. 0..59.
+args = ["--period", "yesterday"]   # appended to [run].args
+# Per-schedule overrides (override [defaults] above):
+max_retries = 20
+retry_backoff_minutes = [30]
+stale_after_minutes = 240
+
+[[schedules]]
+id = "every-90"
+type = "interval"
+interval_minutes = 90              # interval only.
+
+[[schedules]]
+id = "linux-only"
+type = "expression"
+expression = "Mon..Fri *-*-* 08:00:00"  # systemd OnCalendar format (NOT cron syntax!)
+
+# ─── [[preflight]] — abort the run if any check fails (optional) ──────
+[[preflight]]
+plugin = "preflight-warp"
+config = { connect_command = "warp-cli connect" }
+
+# ─── [[notifiers]] — built-in, in-process (optional) ──────────────────
+[[notifiers]]
+driver = "imessage"                # built-in driver names below
+to = "+5511999999999"
+rate_limit_minutes = 60
+events = ["given_up"]              # empty / absent = all events
+
+# ─── [[on_success]] / [[on_failure]] — plugin hooks (optional) ────────
+[[on_success]]
+plugin = "sink-file"
+config = { path = "/Users/me/reports/today.md", mode = "overwrite" }
+
+# ─── [security] — declared intent, schema-only in v0 (optional) ───────
+[security]
+allowed_commands = ["python3", "/usr/bin/python3"]
+allowed_plugins = ["preflight-warp", "sink-roam"]
+network = "allow"                  # "allow" | "deny" | ["host1", "host2"]
+filesystem_writable = ["/Users/me/reports"]
+env_passthrough = ["PATH", "HOME", "LANG"]
+```
+
+### Field-by-field quick reference
+
+| Block          | Field                  | Type            | Required | Default                |
+|----------------|------------------------|-----------------|----------|------------------------|
+| `[agent]`      | `name`                 | string          | yes      | —                      |
+| `[agent]`      | `description`          | string          | no       | —                      |
+| `[agent]`      | `monitor`              | bool            | no       | `true`                 |
+| `[agent]`      | `timeout_seconds`      | int             | no       | `1800`                 |
+| `[run]`        | `command`              | string          | yes      | —                      |
+| `[run]`        | `args`                 | `string[]`      | no       | `[]`                   |
+| `[run]`        | `working_dir`          | string          | no       | manifest dir           |
+| `[env]`        | `inherit`              | bool            | no       | `true`                 |
+| `[env.extra]`  | (any key)              | string          | no       | —                      |
+| `[defaults]`   | `max_retries`          | int             | no       | `0`                    |
+| `[defaults]`   | `retry_backoff_minutes`| `int[]`         | no       | `[]`                   |
+| `[defaults]`   | `stale_after_minutes`  | int             | no       | (no stale check)       |
+| `[[schedules]]`| `id`                   | string          | yes      | —                      |
+| `[[schedules]]`| `type`                 | `"cron"`/`"interval"`/`"expression"` | yes | —      |
+| `[[schedules]]`| `weekdays`             | `int[]` (0..6)  | cron     | (any)                  |
+| `[[schedules]]`| `hours`                | `int[]` (0..23) | cron     | (any)                  |
+| `[[schedules]]`| `minute`               | int (0..59)     | cron     | `0`                    |
+| `[[schedules]]`| `interval_minutes`     | int             | interval | —                      |
+| `[[schedules]]`| `expression`           | string          | expr     | — (systemd OnCalendar) |
+| `[[schedules]]`| `args`                 | `string[]`      | no       | `[]`                   |
+| `[[preflight]]`| `plugin`               | string          | yes      | —                      |
+| `[[preflight]]`| `config`               | table           | no       | `{}`                   |
+| `[[notifiers]]`| `driver`               | string          | yes      | —                      |
+| `[[notifiers]]`| `events`               | `string[]`      | no       | (all events)           |
+| `[[notifiers]]`| (driver-specific)      | varies          | varies   | varies                 |
+| `[[on_success]]`/`[[on_failure]]` | `plugin`    | string | yes      | —                      |
+| `[[on_success]]`/`[[on_failure]]` | `config`    | table  | no       | `{}`                   |
+| `[[on_success]]`/`[[on_failure]]` | `events`    | `string[]` | no  | (all events)           |
+
+---
+
+## 4. Environment variables dotagent injects
+
+When the daemon spawns your agent, these `AGENT_*` vars are set on top
+of the inherited parent env (unless `env.inherit = false`).
+
+| Variable               | Type        | Example                                            |
+|------------------------|-------------|----------------------------------------------------|
+| `AGENT_NAME`           | string      | `finops-weekly`                                    |
+| `AGENT_HOME`           | abs path    | `/Users/me/.config/dotagent/agents/finops-weekly`  |
+| `AGENT_TMPDIR`         | abs path    | `/var/folders/.../tmpAbCdEf` (auto-cleaned on exit)|
+| `AGENT_DRY_RUN`        | `"true"`/`"false"` | `"false"`                                   |
+| `AGENT_SCHEDULE_ID`    | string      | `daily`                                            |
+| `AGENT_SLUG`           | string      | `period_yesterday` (derived from schedule args)    |
+| `AGENT_START_EPOCH`    | int         | `1700000000`                                       |
+| `AGENT_ARGV`           | JSON array  | `["--period","yesterday"]`                         |
+| `AGENT_HEARTBEAT_FILE` | abs path    | (empty when `AGENT_DRY_RUN=true`)                  |
+
+> **Important**: `AGENT_HEARTBEAT_FILE` is **read-only from the agent's
+> perspective**. dotagent writes the heartbeat before and after the run.
+> Do NOT have your agent write to that path — you'll race with the
+> daemon. If you need to persist arbitrary state, use `AGENT_HOME` or
+> a sink plugin.
+
+### Slug derivation
+
+`AGENT_SLUG` comes from the schedule's `args`:
+
+| args                          | slug                  |
+|-------------------------------|-----------------------|
+| `[]`                          | `default`             |
+| `["--period", "yesterday"]`   | `period_yesterday`    |
+| `["--mode", "unsubscribe"]`   | `mode_unsubscribe`    |
+| `["foo bar"]`                 | `foo_bar`             |
+
+Rules: strip leading dashes, lowercase, replace non-alphanumeric with
+`_`, collapse repeated `_`, trim trailing `_`. Empty → `default`.
+
+### Reading env vars
+
+```fish
+echo "$AGENT_NAME ran with schedule $AGENT_SCHEDULE_ID"
+test "$AGENT_DRY_RUN" = "true"; and exit 0
+cd $AGENT_TMPDIR
+```
+
+```python
+import os, json
+name = os.environ["AGENT_NAME"]
+argv = json.loads(os.environ.get("AGENT_ARGV", "[]"))
+if os.environ.get("AGENT_DRY_RUN") == "true":
+    exit(0)
+```
+
+```go
+name := os.Getenv("AGENT_NAME")
+var argv []string
+json.Unmarshal([]byte(os.Getenv("AGENT_ARGV")), &argv)
+```
+
+```bash
+: "${AGENT_NAME:?running outside dotagent?}"
+cd "$AGENT_TMPDIR" || exit
+```
+
+---
+
+## 5. Schedules
+
+Three types. dotagent translates each into the native OS scheduler.
+
+### `type = "cron"`
+
+Fires when `weekday matches AND hour matches AND minute matches`. Uses
+launchd `StartCalendarInterval` (macOS) / systemd `OnCalendar` (Linux).
+
+```toml
+[[schedules]]
+id = "daily-weekdays-8am"
+type = "cron"
+weekdays = [1, 2, 3, 4, 5]   # Mon..Fri (0=Sun..6=Sat)
+hours = [8]
+minute = 30                  # daily at 08:30 Mon..Fri
+```
+
+```toml
+[[schedules]]
+id = "twice-a-day"
+type = "cron"
+hours = [9, 18]              # any weekday
+minute = 0                   # daily at 09:00 and 18:00
+```
+
+### `type = "interval"`
+
+Fires every `interval_minutes`. Uses launchd `StartInterval` (macOS) /
+systemd `OnUnitActiveSec` (Linux).
+
+```toml
+[[schedules]]
+id = "every-90-min"
+type = "interval"
+interval_minutes = 90
+```
+
+### `type = "expression"` (Linux only)
+
+Free-form systemd `OnCalendar` syntax. **NOT cron syntax** — this is
+systemd's calendar event format.
+
+```toml
+[[schedules]]
+id = "linux-weekdays-9am"
+type = "expression"
+expression = "Mon..Fri *-*-* 09:00:00"   # systemd OnCalendar
+```
+
+Quick `OnCalendar` examples:
+- `*-*-* 08:00:00` — daily at 08:00
+- `Mon..Fri *-*-* 08:30:00` — weekdays at 08:30
+- `*-*-01 09:00:00` — first day of each month at 09:00
+- `*-*-* *:00:00` — every hour on the hour
+- `Mon *-*-* 09:00:00` — every Monday at 09:00
+
+If you want cross-platform, **use `cron` or `interval`**, not `expression`.
+
+---
+
+## 6. Notifier drivers (built-in, in-process)
+
+Drivers live inside the daemon (crate `dotagent-notify`). No subprocess
+fork, no extra binaries on `$PATH`.
+
+| Driver     | Transport                                | Subprocess?            |
+|------------|------------------------------------------|------------------------|
+| `desktop`  | `NSUserNotification` / D-Bus             | No                     |
+| `slack`    | HTTPS POST to Slack Incoming Webhooks    | No                     |
+| `ntfy`     | HTTPS POST to ntfy.sh (or self-hosted)   | No                     |
+| `pushover` | HTTPS POST to api.pushover.net           | No                     |
+| `imessage` | `osascript` Messages.app automation      | **Yes** (no Apple API) |
+| `plugin`   | Escape hatch → plugin protocol           | Yes                    |
+
+### `desktop`
+
+```toml
+[[notifiers]]
+driver = "desktop"
+title = "my-agent"          # default: agent name
+subtitle = "free space low" # macOS only
+sound = true                # macOS only
+urgency = "critical"        # Linux only: low | normal | critical
+icon = "dialog-warning"     # Linux only: icon name or absolute path
+expire_ms = 5000            # Linux only: 0 = persistent
+events = ["given_up"]
+```
+
+### `slack`
+
+```toml
+[[notifiers]]
+driver = "slack"
+webhook_url = "https://hooks.slack.com/services/T0/B0/XXX"
+channel = "#alerts"         # optional
+username = "dotagent"       # optional
+icon_emoji = ":robot_face:" # optional
+events = ["given_up", "recovered"]
+```
+
+### `ntfy`
+
+```toml
+[[notifiers]]
+driver = "ntfy"
+topic = "my-alerts"
+base_url = "https://ntfy.sh"   # default; self-host friendly
+token = "tk_..."               # optional bearer auth
+priority = 4                   # 1..5
+title = "disk-alert"           # default: agent name
+tags = ["warning", "skull"]
+events = ["given_up"]
+```
+
+### `pushover`
+
+```toml
+[[notifiers]]
+driver = "pushover"
+token = "<application-token>"
+user  = "<user-key>"
+priority = 1
+title = "disk-alert"           # default: agent name
+events = ["given_up"]
+```
+
+### `imessage` (macOS only)
+
+```toml
+[[notifiers]]
+driver = "imessage"
+to = "+5511999999999"            # phone or email iMessage handle
+rate_limit_minutes = 60          # skip-if-recent; 0 disables
+events = ["given_up"]
+```
+
+### `plugin` (escape hatch for third-party notifiers)
+
+```toml
+[[notifiers]]
+driver = "plugin"
+name = "notify-discord"          # plugin binary: dotagent-plugin-notify-discord
+events = ["given_up"]
+[notifiers.config]
+webhook_url = "https://discord.com/api/webhooks/..."
+```
+
+---
+
+## 7. Built-in plugins (preflight + sink)
+
+Plugins are external binaries (`dotagent-plugin-<name>`) speaking JSON
+over stdio. The dotagent install (via Homebrew or release tarball)
+ships these four first-party plugins.
+
+### `preflight-warp` — abort if Cloudflare WARP is disconnected
+
+```toml
+[[preflight]]
+plugin = "preflight-warp"
+config = { connect_command = "warp-cli connect" }  # optional hint shown in failure notification
+# Optional: { binary = "/usr/local/bin/warp-cli" }
+```
+
+### `preflight-cmd` — abort if a command fails
+
+```toml
+[[preflight]]
+plugin = "preflight-cmd"
+config = {
+  command = "gh",
+  args = ["auth", "status"],
+  expect_exit = 0,                # default 0
+  expect_contains = "Logged in"   # optional substring in stdout/stderr
+}
+```
+
+### `sink-file` — write agent stdout to a file
+
+```toml
+[[on_success]]
+plugin = "sink-file"
+config = { path = "/Users/me/reports/today.md", mode = "overwrite" }
+# mode: "overwrite" (default) | "append"
+```
+
+### `sink-roam` — publish agent stdout to a Roam page (via `mcp` CLI)
+
+```toml
+[[on_success]]
+plugin = "sink-roam"
+config = {
+  page = "today",                        # or "April 22nd, 2026" or "acme/tech/aws/X"
+  marker_regex = "#DORA.*yesterday",     # idempotent replace (deletes match, re-creates)
+  mcp_binary = "~/.cargo/bin/mcp"        # default
+}
+```
+
+Roam-specific: `page` accepts `today` (resolves to current daily note),
+a named daily in **ordinal format** (`April 22nd, 2026` — not ISO!), or
+a namespaced page path (`acme/tech/aws/finops-2026`, created if missing).
+
+Stdin expected format (parsed as hierarchy):
+
+```
+#TAG First line is ROOT (no indentation)
+  L1 header — direct child (indent ≤ 3 spaces)
+    L2 child of previous L1 (indent > 3 spaces)
+  Another L1
+    L2 of that L1
+---
+Notes after `---` separator are cut.
+```
+
+---
+
+## 8. Events
+
+| Event           | Fires when                                          |
+|-----------------|-----------------------------------------------------|
+| `attempt_failed`| Run exited non-zero (a retry may still happen)      |
+| `timed_out`     | Run exceeded `agent.timeout_seconds`                |
+| `given_up`      | All retries exhausted — operator action expected     |
+| `recovered`     | A previously-failing schedule passed                 |
+| `success`       | Every successful run (use sparingly — noisy)         |
+| `preflight`     | A preflight plugin returned `ok: false`              |
+| `daily_summary` | Daemon's internal 22:45 health roll-up               |
+
+`[[notifiers]]` and `[[on_*]]` accept `events = [...]` to filter. Empty
+or absent = all events.
+
+---
+
+## 9. Exit code semantics
+
+dotagent only cares about **zero vs non-zero**.
+
+| Exit code      | Meaning                              | Event fired       |
+|----------------|--------------------------------------|-------------------|
+| `0`            | Success                              | `success` (+ `recovered` if previously failing) |
+| any non-zero   | Failure attempt                      | `attempt_failed`  |
+| (SIGKILL by daemon) | Exceeded `timeout_seconds`      | `timed_out`       |
+
+There's no special handling for `2`, `127`, etc. If you want to surface
+the *kind* of failure to a sink/notifier, write a structured line to
+stderr — dotagent captures the last 5 stderr lines into the failure
+message.
+
+---
+
+## 10. Heartbeat shape
+
+dotagent writes a heartbeat file before AND after every non-dry-run
+execution. Your agent should treat this as **read-only**:
+
+```
+~/.config/dotagent/state/agents/{name}/{slug}.heartbeat.json
+```
+
+Shape (read this if you want to query history from another agent):
+
+```jsonc
+{
+  "name": "my-agent",
+  "slug": "default",
+  "args": [],
+  "started_at": 1700000000,
+  "started_at_iso": "2023-11-14T22:13:20+0000",
+  "finished_at": 1700000100,
+  "finished_at_iso": "2023-11-14T22:15:00+0000",
+  "exit_code": 0,
+  "duration_seconds": 100,
+  "last_success_at": 1700000100,         // preserved; never overwritten on failure
+  "last_success_at_iso": "2023-11-14T22:15:00+0000"
+}
+```
+
+---
+
+## 11. Health states
+
+Computed per `(agent, schedule)` pair on every `tick`:
+
+| State     | Meaning                                                                       |
+|-----------|-------------------------------------------------------------------------------|
+| `ok`      | `last_success_at >= expected_at` and no retries needed                        |
+| `degraded`| Recovered after `attempts > 0`, OR interval-style overdue but within `2*interval` |
+| `failing` | Window passed without success; retrying or already given up                   |
+| `stale`   | Never ran, OR window older than `stale_after_minutes`                         |
+
+---
+
+## 12. Common `dotagent doctor` errors
+
+| Error message                                  | Cause                                                    |
+|-----------------------------------------------|----------------------------------------------------------|
+| `agent name missing`                           | `[agent].name` not set                                   |
+| `agent name not unique`                        | Two manifests claim the same `name`                      |
+| `at least one [[schedules]] required`          | Manifest has no schedules                                |
+| `schedule id missing`                          | `[[schedules]].id` not set                               |
+| `schedule id not unique within manifest`       | Two schedules share the same `id`                        |
+| `weekdays out of range`                        | A value in `weekdays` is not in `0..=6`                  |
+| `hours out of range`                           | A value in `hours` is not in `0..=23`                    |
+| `minute out of range`                          | `minute` not in `0..=59`                                 |
+| `interval_minutes required for type=interval`  | Missing field on interval schedule                       |
+| `expression required for type=expression`      | Missing field on expression schedule                     |
+| `expression type only supported on Linux`      | Used `expression` on macOS                               |
+| `command missing`                              | `[run].command` not set                                  |
+| `unknown notifier driver`                      | `[[notifiers]].driver` is not one of the 6 valid values  |
+| `notifier slack: webhook_url required`         | (driver-specific required field)                         |
+| `plugin <name> not found on $PATH`             | The plugin binary isn't installed                        |
+| `⚠ no [security] section`                      | Harmless warning; v0 is schema-only                      |
+
+---
+
+## 13. Complete examples (combining features)
+
+### Example A — Python agent, cron weekday, Slack notifier, preflight + sink
+
+```toml
+# ~/.config/dotagent/agents/team-standup/agent.toml
+[agent]
+name = "team-standup"
+description = "Daily team summary from GitHub + Sentry, posted to Slack and Roam."
+timeout_seconds = 600
+
+[run]
+command = "uv"
+args = ["run", "./agent.py"]
+
+[env.extra]
+LOG_LEVEL = "info"
+
+[defaults]
+max_retries = 5
+retry_backoff_minutes = [10, 20, 40, 80, 160]
+stale_after_minutes = 240
+
+[[schedules]]
+id = "daily"
+type = "cron"
+weekdays = [1, 2, 3, 4, 5]   # Mon..Fri
+hours = [8]
+minute = 30
+
+# Don't run if VPN is down — retries will keep trying every backoff.
+[[preflight]]
+plugin = "preflight-warp"
+config = { connect_command = "warp-cli connect" }
+
+# Tier 1: noisy desktop banner on every failed attempt
+[[notifiers]]
+driver = "desktop"
+title = "team-standup"
+events = ["attempt_failed", "given_up"]
+
+# Tier 2: Slack only after retries exhausted
+[[notifiers]]
+driver = "slack"
+webhook_url = "https://hooks.slack.com/services/T0/B0/XXX"
+channel = "#eng-ops"
+events = ["given_up", "recovered"]
+
+# Persist the rendered output to today's Roam daily note
+[[on_success]]
+plugin = "sink-roam"
+config = { page = "today", marker_regex = "#STANDUP.*\\d{4}-\\d{2}-\\d{2}" }
+
+[security]
+allowed_commands = ["uv", "python3"]
+allowed_plugins  = ["preflight-warp", "sink-roam"]
+network          = ["api.github.com", "acme.sentry.io", "hooks.slack.com"]
+filesystem_writable = []
+env_passthrough  = ["PATH", "HOME", "GITHUB_TOKEN", "SENTRY_AUTH_TOKEN"]
+```
+
+### Example B — Go binary, interval, iMessage on give-up
+
+```toml
+# ~/.config/dotagent/agents/disk-alert/agent.toml
+[agent]
+name = "disk-alert"
+description = "Alert when free space on / drops below threshold."
+timeout_seconds = 30
+
+[run]
+command = "./agent"          # compiled Go binary in the agent dir
+
+[env.extra]
+DISK_FREE_MIN_PCT = "20"
+DISK_CHECK_MOUNT = "/"
+
+[defaults]
+max_retries = 3
+retry_backoff_minutes = [5, 15, 30]
+stale_after_minutes = 120
+
+[[schedules]]
+id = "every-15min"
+type = "interval"
+interval_minutes = 15
+
+[[notifiers]]
+driver = "desktop"
+title = "disk-alert"
+subtitle = "free space low"
+sound = true
+urgency = "critical"
+events = ["attempt_failed", "given_up"]
+
+[[notifiers]]
+driver = "imessage"
+to = "+5511999999999"
+rate_limit_minutes = 60        # at most 1 ping/hour even on extended failure
+events = ["given_up"]
+```
+
+### Example C — Pure shell collector, daily, file sink only
+
+```toml
+# ~/.config/dotagent/agents/hn-morning/agent.toml
+[agent]
+name = "hn-morning"
+description = "Top 5 HN stories at 08:00 weekdays."
+timeout_seconds = 60
+
+[run]
+command = "fish"
+args = ["./agent.fish"]
+
+[[schedules]]
+id = "weekdays-8am"
+type = "cron"
+weekdays = [1, 2, 3, 4, 5]
+hours = [8]
+minute = 0
+
+[[on_success]]
+plugin = "sink-file"
+config = { path = "/Users/me/reports/hn-today.md", mode = "overwrite" }
+```
+
+---
+
+## 14. What dotagent does NOT do
+
+- **Run your business logic.** It's a scheduler + supervisor.
+- **Provide an SDK.** Read env vars, write stdout/stderr, exit. That's
+  the entire API surface.
+- **Sleep waiting for time.** The OS scheduler fires the trigger.
+- **Substitute the `mcp` CLI.** `sink-roam` calls `mcp` separately.
+- **Run on Windows.** Linux + WSL works; native Windows doesn't.
+- **Template `path` or any config field.** No `{{vars}}` — your agent
+  must build dynamic paths itself.
+
+---
+
+## 15. Filesystem layout
+
+```
+~/.config/dotagent/
+├── agents/<name>/agent.toml         # manifests
+├── state/
+│   ├── agents/<name>/<slug>.heartbeat.json
+│   ├── windows/<name>-<slug>-<ts>.json
+│   ├── known_manifests.json
+│   └── daemon.pid
+├── logs/
+│   ├── daemon/dotagent.log          # daemon stdio + tracing
+│   └── agents/<name>/<name>.log     # rotated; per-agent
+├── audit.log                        # JSONL audit trail
+└── config.toml                      # optional dotagent config
+```
+
+Discovery order for manifests:
+
+1. Every directory in `$DOTAGENT_ROOT` (colon-separated)
+2. `$DOTAGENT_HOME/agents/` (default `~/.config/dotagent/agents/`)
+3. `$CWD/agents/`
+4. `$CWD`
+
+Discovery order for plugin binaries:
+
+1. Every directory in `$DOTAGENT_PLUGIN_PATH`
+2. `$DOTAGENT_HOME/plugins/`
+3. `/usr/local/lib/dotagent/plugins/`
+4. `$PATH`
+
+---
+
+## 16. Env vars dotagent reads (overrides)
+
+| Variable                       | Purpose                                                              | Default              |
+|--------------------------------|----------------------------------------------------------------------|----------------------|
+| `DOTAGENT_HOME`                | Root directory                                                       | `~/.config/dotagent` |
+| `DOTAGENT_ROOT`                | Extra manifest search dirs (colon-separated), prepended to default   | (empty)              |
+| `DOTAGENT_PLUGIN_PATH`         | Extra plugin search dirs (colon-separated), prepended to default     | (empty)              |
+| `RUST_LOG`                     | Tracing filter; overrides `[logging].level` in `config.toml`         | `info`               |
+| `OTEL_EXPORTER_OTLP_HEADERS`   | OTLP auth headers (comma-separated `k=v`); used when OTLP enabled    | (empty)              |
+
+---
+
+## 17. CLI surface (most common)
+
+```bash
+dotagent doctor                  # validate every manifest discoverable
+dotagent run <name>              # foreground run for smoke-testing
+dotagent run <name> --schedule <id> --dry-run
+dotagent status                  # health dashboard
+dotagent logs <name> --follow    # tail an agent's log
+dotagent tick                    # what would the daemon do right now?
+dotagent reload                  # SIGHUP daemon — picks up manifest changes
+dotagent install                 # write launchd plist / systemd unit
+dotagent uninstall               # remove launchd plist / systemd unit
+dotagent plugin list             # list resolved plugin binaries
+dotagent inspect <name>          # heartbeat + windows + schedule resolution
+dotagent daily-summary           # ad-hoc daily roll-up
+```
+
+---
+
+## 18. Patterns (pick the closest shape)
+
+| Pattern                | Shape                                                                | When to use                              |
+|------------------------|----------------------------------------------------------------------|------------------------------------------|
+| Pure data collector    | APIs → jq/filter → sink                                              | Output is structured data, no LLM needed |
+| Brief / digest         | Sources → LLM (cheap model) → notifier                               | Input is noisy, want 3 bullets           |
+| Triage / classifier    | Source → heuristic for 80% → LLM for residue → apply labels          | Mostly deterministic, LLM for the tail   |
+| Generator + idempotent | Sources → LLM → sink with `marker_regex` (replace, don't append)     | Re-runs shouldn't duplicate              |
+| Watchdog / preflight   | `preflight-cmd` or `preflight-warp` → empty agent body → notifier    | Just want to alert on a condition        |
+
+---
+
+## 19. Deep dives (when this digest isn't enough)
+
+- Full schema: `docs/reference/agent-spec.md`
+- Env vars (every detail): `docs/reference/env-vars.md`
+- Plugin protocol (JSON shape, exit codes, env): `docs/reference/plugin-protocol.md`
+- Notifications (driver internals): `docs/concepts/notifications.md`
+- Plugins (creating your own): `docs/concepts/plugins.md`
+- Patterns + extending agents: `docs/concepts/agents.md`
+- Architecture: `docs/concepts/architecture.md`
+- CLI reference (every flag): `docs/reference/cli.md`
+- Filesystem layout (every path): `docs/reference/paths.md`
+- Daemon lifecycle (install/start/stop/reload): `docs/guides/daemon-lifecycle.md`
+- Troubleshooting (sintoma → cause): `docs/guides/troubleshooting.md`
+- Observability (logs, OTel, vendor recipes): `docs/guides/observability.md`
+- Config reference (`config.toml`): `docs/guides/config-reference.md`
+- Threat model: `docs/security/threat-model.md`
+- Migrating from Fish framework: `docs/guides/migrating-from-fish.md`
+- Per-plugin docs: `docs/plugins/<name>.md`
+- Worked examples: `examples/hello-fish/`, `examples/hello-python/`,
+  `examples/hello-go/`, `examples/hello-rust/`, `examples/disk-alert/`
+
+---
+
+## 20. Sanity check before reporting "done"
+
+When you, the LLM, generate an `agent.toml`, verify against this digest:
+
+1. [ ] `[agent].name` is unique and matches the directory name (advisory)
+2. [ ] `[run].command` resolves on `$PATH` (or is absolute)
+3. [ ] At least one `[[schedules]]` with a unique `id`
+4. [ ] Schedule fields match the `type`: cron needs `weekdays/hours/minute`,
+   interval needs `interval_minutes`, expression needs `expression`
+5. [ ] `weekdays` in `0..=6`, `hours` in `0..=23`, `minute` in `0..=59`
+6. [ ] If `type = "expression"`, the syntax is systemd `OnCalendar`
+   (NOT cron), and the agent is documented as Linux-only
+7. [ ] Each `[[notifiers]].driver` is one of: `desktop`, `slack`, `ntfy`,
+   `pushover`, `imessage`, `plugin`
+8. [ ] Driver-specific required fields are present (e.g. `slack` needs
+   `webhook_url`, `imessage` needs `to`, `pushover` needs `token`+`user`)
+9. [ ] Plugin names in `[[preflight]]` / `[[on_*]]` exist in
+   `docs/plugins/` (or are third-party plugins the user installed)
+10. [ ] The agent script reads env vars (`AGENT_*`) — does NOT import an SDK
+11. [ ] The agent script does NOT write to `AGENT_HEARTBEAT_FILE`
+12. [ ] If you used a `[security]` block, the `network` entries match
+   what the agent script actually contacts
