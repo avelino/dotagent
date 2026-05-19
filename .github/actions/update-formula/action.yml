@@ -1,0 +1,97 @@
+name: update-formula
+description: |
+  Rewrite a Homebrew formula's `version` line and four `sha256` lines
+  using the `# <MARKER>_*` anchored sed substitutions, then commit the
+  change to `main` as `github-actions[bot]`.
+
+  Expects the four `.sha256` sidecar files (one per release target) to
+  be present in the current working directory, named:
+    <archive-prefix>-aarch64-darwin.tar.gz.sha256
+    <archive-prefix>-x86_64-darwin.tar.gz.sha256
+    <archive-prefix>-aarch64-linux.tar.gz.sha256
+    <archive-prefix>-x86_64-linux.tar.gz.sha256
+
+  Caller must `actions/checkout@v4` with `ref: main` and
+  `persist-credentials: true` before invoking, plus
+  `actions/download-artifact@v4` to materialize the sidecars.
+
+inputs:
+  formula-path:
+    description: "Path to the formula file relative to repo root"
+    required: true
+  marker-prefix:
+    description: "Prefix used in formula marker comments (e.g. DOTAGENT or DOTAGENT_BETA)"
+    required: true
+  version:
+    description: "Version string written into the formula"
+    required: true
+  archive-prefix:
+    description: "Prefix of the .tar.gz.sha256 files in CWD (e.g. dotagent-0.0.1 or dotagent-beta)"
+    required: true
+  commit-message:
+    description: "Commit message used when pushing to main"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Rewrite formula
+      shell: bash
+      env:
+        FORMULA: ${{ inputs.formula-path }}
+        MARKER:  ${{ inputs.marker-prefix }}
+        VERSION: ${{ inputs.version }}
+        PREFIX:  ${{ inputs.archive-prefix }}
+      run: |
+        set -euo pipefail
+        sha_for () {
+          local suffix="$1"
+          local file="${PREFIX}-${suffix}.tar.gz.sha256"
+          if [ ! -f "$file" ]; then
+            echo "::error::missing $file" >&2
+            exit 1
+          fi
+          awk '{print $1}' "$file"
+        }
+
+        SHA_AARCH64_DARWIN=$(sha_for aarch64-darwin)
+        SHA_X86_64_DARWIN=$(sha_for  x86_64-darwin)
+        SHA_AARCH64_LINUX=$(sha_for  aarch64-linux)
+        SHA_X86_64_LINUX=$(sha_for   x86_64-linux)
+
+        # Each substitution anchors on its trailing marker comment so
+        # the sed is deterministic even if other lines look similar.
+        sed -i -E "s|^(  version )\".*\"( # ${MARKER}_VERSION)$|\\1\"${VERSION}\"\\2|"                              "$FORMULA"
+        sed -i -E "s|^(      sha256 )\".*\"( # ${MARKER}_AARCH64_DARWIN_SHA)$|\\1\"${SHA_AARCH64_DARWIN}\"\\2|"      "$FORMULA"
+        sed -i -E "s|^(      sha256 )\".*\"( # ${MARKER}_X86_64_DARWIN_SHA)$|\\1\"${SHA_X86_64_DARWIN}\"\\2|"        "$FORMULA"
+        sed -i -E "s|^(      sha256 )\".*\"( # ${MARKER}_AARCH64_LINUX_SHA)$|\\1\"${SHA_AARCH64_LINUX}\"\\2|"        "$FORMULA"
+        sed -i -E "s|^(      sha256 )\".*\"( # ${MARKER}_X86_64_LINUX_SHA)$|\\1\"${SHA_X86_64_LINUX}\"\\2|"          "$FORMULA"
+
+        echo "--- updated formula (${FORMULA}) ---"
+        cat "$FORMULA"
+
+        # Fail loudly if any sha256 placeholder survived (means a marker
+        # was missing or the build matrix changed shape).
+        if grep -E 'sha256 ""' "$FORMULA"; then
+          echo "::error::sha256 placeholder still present after substitution" >&2
+          exit 1
+        fi
+
+    - name: Commit & push
+      shell: bash
+      env:
+        FORMULA: ${{ inputs.formula-path }}
+        MESSAGE: ${{ inputs.commit-message }}
+      run: |
+        set -euo pipefail
+        git config user.name  "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+        if git diff --quiet -- "$FORMULA"; then
+          echo "Formula already up to date — nothing to commit."
+          exit 0
+        fi
+
+        git add "$FORMULA"
+        git commit -m "$MESSAGE"
+        git push origin main

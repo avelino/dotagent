@@ -1,0 +1,108 @@
+name: _build
+
+# Reusable build matrix. Both `release.yml` (tag-driven, stable) and
+# `release-beta.yml` (push-driven, rolling beta) call this with
+# different `archive-prefix` / `cache-key` / optional `version-file`.
+#
+# Outputs: 4 artifacts, one per platform, each containing:
+#   <archive-prefix>-<arch>-<os>.tar.gz
+#   <archive-prefix>-<arch>-<os>.tar.gz.sha256
+
+on:
+  workflow_call:
+    inputs:
+      archive-prefix:
+        description: "Tarball base name without the -<arch>-<os>.tar.gz suffix (e.g. dotagent-0.0.1 or dotagent-beta)"
+        type: string
+        required: true
+      cache-key:
+        description: "Suffix appended to the Swatinem rust-cache key — usually `stable` or `beta`"
+        type: string
+        required: false
+        default: release
+      version-file:
+        description: "Multi-line content for a VERSION file written into the tarball root. Empty = no VERSION file."
+        type: string
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14            # Apple silicon
+            target: aarch64-apple-darwin
+            archive-suffix: aarch64-darwin
+          - os: macos-13            # Intel
+            target: x86_64-apple-darwin
+            archive-suffix: x86_64-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive-suffix: x86_64-linux
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive-suffix: aarch64-linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-linker (linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ inputs.cache-key }}-${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Stage archive
+        env:
+          ARCHIVE_NAME: ${{ inputs.archive-prefix }}-${{ matrix.archive-suffix }}
+          VERSION_FILE_CONTENT: ${{ inputs.version-file }}
+        run: |
+          set -e
+          STAGE=$(mktemp -d)
+          mkdir -p "$STAGE/bin"
+          for f in target/${{ matrix.target }}/release/dotagent \
+                   target/${{ matrix.target }}/release/dotagent-plugin-*; do
+            if [ -f "$f" ] && [ -x "$f" ]; then
+              cp "$f" "$STAGE/bin/"
+            fi
+          done
+          cp LICENSE README.md "$STAGE/"
+
+          # Optional VERSION file — used by the beta channel to record
+          # the rolling build's commit count + short sha.
+          if [ -n "${VERSION_FILE_CONTENT}" ]; then
+            printf '%s\n' "${VERSION_FILE_CONTENT}" > "$STAGE/VERSION"
+          fi
+
+          tar -C "$STAGE" -czf "${ARCHIVE_NAME}.tar.gz" .
+          shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive-suffix }}
+          path: |
+            ${{ inputs.archive-prefix }}-${{ matrix.archive-suffix }}.tar.gz
+            ${{ inputs.archive-prefix }}-${{ matrix.archive-suffix }}.tar.gz.sha256
