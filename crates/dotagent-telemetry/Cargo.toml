@@ -1,0 +1,31 @@
+[package]
+name = "dotagent-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tracing + OpenTelemetry wiring for the dotagent daemon (JSON file logs, rotation, optional OTLP export)."
+
+[dependencies]
+dotagent-core.workspace = true
+dotagent-state.workspace = true
+
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+tracing-opentelemetry.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+opentelemetry-stdout.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+flate2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
