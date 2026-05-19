@@ -1,0 +1,86 @@
+name: release
+
+# Stable channel: triggered by `v*.*.*` tag pushes. Reuses `_build.yml`
+# for the 4-platform matrix and `./.github/actions/update-formula` for
+# the Homebrew formula bump.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. v0.0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: compute release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.calc.outputs.version }}
+    steps:
+      - id: calc
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME:-${{ github.event.inputs.tag }}}"
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Computed stable version: ${VERSION}"
+
+  build:
+    needs: prepare
+    uses: ./.github/workflows/_build.yml
+    with:
+      archive-prefix: dotagent-${{ needs.prepare.outputs.version }}
+      cache-key: stable
+
+  release:
+    name: publish github release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dotagent-*.tar.gz
+            dotagent-*.tar.gz.sha256
+          generate_release_notes: true
+          tag_name: ${{ github.ref_name || github.event.inputs.tag }}
+
+  homebrew:
+    name: refresh dotagent formula
+    needs: [prepare, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Always operate against `main` — tags are immutable and the
+      # formula lives on the default branch where `brew tap` resolves.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: ./.github/actions/update-formula
+        with:
+          formula-path: Formula/dotagent.rb
+          marker-prefix: DOTAGENT
+          version: ${{ needs.prepare.outputs.version }}
+          archive-prefix: dotagent-${{ needs.prepare.outputs.version }}
+          commit-message: "homebrew: bump dotagent to ${{ needs.prepare.outputs.version }}"
