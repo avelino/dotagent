@@ -1,0 +1,20 @@
+[package]
+name = "dotagent-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core types for dotagent: manifest, schedule, heartbeat, window state."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+dotagent-notify.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
