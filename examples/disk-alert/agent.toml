@@ -1,0 +1,66 @@
+# disk-alert — example agent
+#
+# Checks the free space on `/` every 15 minutes. If it drops below the
+# configured threshold (default 20%), the agent exits non-zero so
+# dotagent's `on_failure` chain fires.
+#
+# Demonstrates:
+#   - a tiny pure-shell agent (no LLM)
+#   - tiered notifications: desktop on every alert, iMessage only on `given_up`
+#   - retry policy that gives up after 3 attempts so iMessage stays quiet
+#     during transient disk usage spikes
+#
+# Install:
+#   ln -s "$PWD" ~/.config/dotagent/agents/disk-alert
+#   dotagent doctor
+#   dotagent run-now disk-alert         # smoke test
+#   dotagent reload                     # daemon picks it up
+
+[agent]
+name = "disk-alert"
+description = "Alert when free space on / drops below threshold."
+monitor = true
+timeout_seconds = 30
+
+[run]
+command = "fish"
+args = ["./agent.fish"]
+
+[env]
+inherit = true
+
+[env.extra]
+# The threshold (percent free below which we alert). Tweak as needed.
+DISK_FREE_MIN_PCT = "20"
+# Mount point to check. Default `/`.
+DISK_CHECK_MOUNT = "/"
+
+[defaults]
+# 3 attempts with progressive backoff: catches a real disk fill,
+# tolerates a brief spike (e.g., a docker image pull) without paging the phone.
+max_retries = 3
+retry_backoff_minutes = [5, 15, 30]
+stale_after_minutes = 120
+
+[[schedules]]
+id = "every-15min"
+type = "interval"
+interval_minutes = 15
+
+# Tier 1: desktop banner on EVERY alert (cheap, immediately visible at the desk).
+# Built-in driver — no plugin subprocess, native NSUserNotification / D-Bus.
+[[notifiers]]
+driver = "desktop"
+title = "disk-alert"
+subtitle = "free space low"
+sound = true
+urgency = "critical"
+events = ["attempt_failed", "given_up"]
+
+# Tier 2: iMessage only after retries are exhausted (the spike was real).
+# rate_limit_minutes = 60 ensures one ping per hour at most.
+[[notifiers]]
+driver = "imessage"
+to = "+5511999999999"
+rate_limit_minutes = 60
+events = ["given_up"]
