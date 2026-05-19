@@ -1,0 +1,24 @@
+[package]
+name = "dotagent-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Filesystem-backed state store for heartbeats and window state (atomic writes + flock)."
+
+[dependencies]
+dotagent-core.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+fs2.workspace = true
+dirs.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile.workspace = true
