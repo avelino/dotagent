@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dotagent",
+    "crates/dotagent-core",
+    "crates/dotagent-scheduler",
+    "crates/dotagent-runner",
+    "crates/dotagent-state",
+    "crates/dotagent-plugin",
+    "crates/dotagent-notify",
+    "crates/dotagent-telemetry",
+    "crates/dotagent-unit-gen",
+    "plugins/preflight-warp",
+    "plugins/preflight-cmd",
+    "plugins/sink-roam",
+    "plugins/sink-file",
+]
+default-members = ["crates/dotagent"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Avelino <avelinorun@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/avelino/dotagent"
+homepage = "https://github.com/avelino/dotagent"
+readme = "README.md"
+
+[workspace.dependencies]
+# Internal crates
+dotagent-core = { path = "crates/dotagent-core", version = "0.0.1" }
+dotagent-scheduler = { path = "crates/dotagent-scheduler", version = "0.0.1" }
+dotagent-runner = { path = "crates/dotagent-runner", version = "0.0.1" }
+dotagent-state = { path = "crates/dotagent-state", version = "0.0.1" }
+dotagent-plugin = { path = "crates/dotagent-plugin", version = "0.0.1" }
+dotagent-notify = { path = "crates/dotagent-notify", version = "0.0.1" }
+dotagent-telemetry = { path = "crates/dotagent-telemetry", version = "0.0.1" }
+dotagent-unit-gen = { path = "crates/dotagent-unit-gen", version = "0.0.1" }
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "fs", "io-util", "time", "signal"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging + telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "registry", "fmt"] }
+tracing-appender = "0.2"
+tracing-opentelemetry = "0.28"
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", default-features = false, features = ["grpc-tonic", "trace", "logs"] }
+opentelemetry-semantic-conventions = "0.27"
+opentelemetry-stdout = { version = "0.27", features = ["trace", "logs"] }
+flate2 = "1"
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# HTTP (built-in notifiers + plugins)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# Filesystem
+dirs = "5"
+fs2 = "0.4"
+
+# Crypto
+sha2 = "0.10"
+
+# Regex
+regex = "1"
+
+# Dev
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
