@@ -1,0 +1,19 @@
+root: ./
+
+structure:
+  readme: README.md
+  summary: SUMMARY.md
+
+redirects:
+  agents: concepts/agents.md
+  notifications: concepts/notifications.md
+  plugins: concepts/plugins.md
+  agent-spec: reference/agent-spec.md
+  plugin-protocol: reference/plugin-protocol.md
+  migrating-from-fish: guides/migrating-from-fish.md
+  threat-model: security/threat-model.md
+  # Single-fetch digest for LLMs writing agent.toml from scratch.
+  # Canonical raw URL (works with any LLM WebFetch):
+  #   https://raw.githubusercontent.com/avelino/dotagent/main/docs/llms.txt
+  llms: llms.txt
+  llms.txt: llms.txt
