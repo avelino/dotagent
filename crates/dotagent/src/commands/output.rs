@@ -3,7 +3,11 @@
 //! Every CLI command that reports an execution result MUST go through this
 //! module — never `println!("{:?}", outcome)`. Rendering rules:
 //!
-//! - Color/icons only when stdout is a TTY (and `NO_COLOR` is unset).
+//! - Color is applied only when stdout is a TTY and `NO_COLOR` is unset.
+//! - Status icons (`✓`/`✗`/`⊘`) are always emitted; modern terminals and pagers
+//!   handle UTF-8 fine, and operators redirecting to a file usually want the
+//!   icon preserved. Scripts that need pure ASCII / structured fields should
+//!   use `--json`.
 //! - stdout/stderr blocks are emitted with real newlines, indented.
 //! - Truncated tails are explicitly labeled with the number of dropped lines
 //!   and a pointer to the full log under `$DOTAGENT_HOME/logs/agents/<name>/`.
@@ -24,22 +28,32 @@ pub enum Format {
 
 /// Render an `OrchestratedOutcome` for an agent/schedule pair.
 ///
-/// Writes to stdout. The `duration_seconds` is the wall-clock measured by the
-/// caller (which may include preflight time the inner `RunOutcome` doesn't see).
+/// Writes to stdout. The `wall_duration_seconds` is the wall-clock measured by
+/// the caller (which may include preflight time the inner `RunOutcome` doesn't
+/// see). Inside the JSON envelope, the runner's own `duration_seconds` (just
+/// the agent process) is kept under `result.duration_seconds` so consumers can
+/// tell them apart.
 pub fn render_outcome(
     agent: &str,
     schedule: &str,
     outcome: &OrchestratedOutcome,
-    duration_seconds: i64,
+    wall_duration_seconds: i64,
     format: Format,
 ) {
     match format {
-        Format::Json => print_json(agent, schedule, outcome, duration_seconds),
-        Format::Human => print_human(agent, schedule, outcome, duration_seconds),
+        Format::Json => print_json(agent, schedule, outcome, wall_duration_seconds),
+        Format::Human => print_human(agent, schedule, outcome, wall_duration_seconds),
     }
 }
 
-fn print_json(agent: &str, schedule: &str, outcome: &OrchestratedOutcome, duration_seconds: i64) {
+/// Build the JSON envelope without serializing — useful for tests that need to
+/// assert on the schema without capturing stdout.
+fn build_envelope(
+    agent: &str,
+    schedule: &str,
+    outcome: &OrchestratedOutcome,
+    wall_duration_seconds: i64,
+) -> serde_json::Value {
     let result = match outcome {
         OrchestratedOutcome::Ran(run) => json!({
             "kind": "ran",
@@ -57,13 +71,28 @@ fn print_json(agent: &str, schedule: &str, outcome: &OrchestratedOutcome, durati
             "suggest": suggest,
         }),
     };
-    let envelope = json!({
+    json!({
         "agent": agent,
         "schedule": schedule,
-        "duration_seconds": duration_seconds,
+        "wall_duration_seconds": wall_duration_seconds,
         "result": result,
-    });
-    println!("{}", serde_json::to_string(&envelope).unwrap_or_default());
+    })
+}
+
+fn print_json(
+    agent: &str,
+    schedule: &str,
+    outcome: &OrchestratedOutcome,
+    wall_duration_seconds: i64,
+) {
+    let envelope = build_envelope(agent, schedule, outcome, wall_duration_seconds);
+    // serde_json::to_string of a Value built via the json! macro from Strings
+    // and primitives never fails in practice; if it ever does, a panic is
+    // better than a silent empty line in scripted --json consumers.
+    println!(
+        "{}",
+        serde_json::to_string(&envelope).expect("serializing run-now JSON envelope")
+    );
 }
 
 fn print_human(agent: &str, schedule: &str, outcome: &OrchestratedOutcome, duration_seconds: i64) {
@@ -234,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn json_envelope_for_ran_is_stable() {
+    fn json_envelope_for_ran_locks_the_schema() {
         let run = RunOutcome {
             exit_code: 1,
             timed_out: false,
@@ -245,24 +274,44 @@ mod tests {
             stderr_truncated_lines: 200,
         };
         let outcome = OrchestratedOutcome::Ran(run);
-        // Just exercise that the JSON path doesn't panic and produces valid JSON.
-        let mut buf = Vec::new();
-        let envelope = serde_json::json!({
-            "agent": "a", "schedule": "s", "duration_seconds": 12,
-            "result": {
-                "kind": "ran",
-                "exit_code": 1,
-                "timed_out": false,
-                "duration_seconds": 12,
-                "stdout_tail": "",
-                "stderr_tail": "boom",
-                "stdout_truncated_lines": 0,
-                "stderr_truncated_lines": 200,
-            }
-        });
-        serde_json::to_writer(&mut buf, &envelope).unwrap();
-        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
-        assert_eq!(parsed["result"]["exit_code"], 1);
-        let _ = outcome; // silence unused
+
+        let envelope = build_envelope("smoke", "morning", &outcome, 13);
+
+        // Top-level envelope
+        assert_eq!(envelope["agent"], "smoke");
+        assert_eq!(envelope["schedule"], "morning");
+        assert_eq!(envelope["wall_duration_seconds"], 13);
+        // Top-level must NOT carry a bare `duration_seconds` — that lives
+        // inside `result` and would be ambiguous if duplicated up top.
+        assert!(envelope.get("duration_seconds").is_none());
+
+        // Result block
+        let result = &envelope["result"];
+        assert_eq!(result["kind"], "ran");
+        assert_eq!(result["exit_code"], 1);
+        assert_eq!(result["timed_out"], false);
+        assert_eq!(result["duration_seconds"], 12);
+        assert_eq!(result["stderr_tail"], "boom");
+        assert_eq!(result["stderr_truncated_lines"], 200);
+        assert_eq!(result["stdout_truncated_lines"], 0);
+
+        // Round-trip through serde_json — same path `print_json` uses.
+        let serialized = serde_json::to_string(&envelope).expect("must serialize");
+        let reparsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reparsed, envelope);
+    }
+
+    #[test]
+    fn json_envelope_for_preflight_failed_includes_plugin_and_suggest() {
+        let outcome = OrchestratedOutcome::PreflightFailed {
+            plugin: "preflight-warp".into(),
+            suggest: Some("install warp first".into()),
+        };
+
+        let envelope = build_envelope("smoke", "morning", &outcome, 0);
+
+        assert_eq!(envelope["result"]["kind"], "preflight_failed");
+        assert_eq!(envelope["result"]["plugin"], "preflight-warp");
+        assert_eq!(envelope["result"]["suggest"], "install warp first");
     }
 }
