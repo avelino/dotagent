@@ -43,6 +43,12 @@ pub struct RunOutcome {
     pub duration_seconds: i64,
     pub stdout_tail: String,
     pub stderr_tail: String,
+    /// Number of stdout lines dropped before the tail (0 = full output kept).
+    #[serde(default)]
+    pub stdout_truncated_lines: usize,
+    /// Number of stderr lines dropped before the tail (0 = full output kept).
+    #[serde(default)]
+    pub stderr_truncated_lines: usize,
 }
 
 /// What the runner needs to execute one agent.
@@ -356,12 +362,16 @@ pub async fn run(spec: RunSpec<'_>, state: &StateStore) -> Result<RunOutcome> {
         state.write_heartbeat(&hb)?;
     }
 
+    let (stdout_tail, stdout_truncated_lines) = tail_lines(&stdout_buf, TAIL_LINES);
+    let (stderr_tail, stderr_truncated_lines) = tail_lines(&stderr_buf, TAIL_LINES);
     Ok(RunOutcome {
         exit_code,
         timed_out,
         duration_seconds: duration,
-        stdout_tail: tail_lines(&stdout_buf, TAIL_LINES),
-        stderr_tail: tail_lines(&stderr_buf, TAIL_LINES),
+        stdout_tail,
+        stderr_tail,
+        stdout_truncated_lines,
+        stderr_truncated_lines,
     })
 }
 
@@ -396,10 +406,11 @@ fn apply_env(
     cmd.env("AGENT_ARGV", argv_json);
 }
 
-fn tail_lines(s: &str, n: usize) -> String {
+fn tail_lines(s: &str, n: usize) -> (String, usize) {
     let lines: Vec<&str> = s.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..].join("\n")
+    let total = lines.len();
+    let start = total.saturating_sub(n);
+    (lines[start..].join("\n"), start)
 }
 
 #[cfg(unix)]

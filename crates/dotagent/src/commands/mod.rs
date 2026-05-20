@@ -18,6 +18,7 @@ pub mod completions;
 pub mod daemon;
 pub mod daily_summary;
 pub mod list_agents;
+pub mod output;
 pub mod status;
 pub mod utility;
 

@@ -9,6 +9,7 @@ use dotagent_plugin::PluginClient;
 use dotagent_runner::{run_with_hooks, RunContext, RunSpec};
 use dotagent_state::{slug_from_args, AuditLog, ManifestCache, StateStore};
 
+use crate::commands::output::{render_outcome, Format};
 use crate::discovery;
 
 // ---------------------------------------------------------------------
@@ -178,7 +179,7 @@ pub async fn reload() -> Result<()> {
 /// manual triggering after a failure. Uses the schedule's `args` if a
 /// schedule id is provided; otherwise uses the first declared schedule's
 /// args.
-pub async fn run_now(agent_name: String, schedule: Option<String>) -> Result<()> {
+pub async fn run_now(agent_name: String, schedule: Option<String>, format: Format) -> Result<()> {
     let agent = discovery::find_by_name(&agent_name)?;
     let sched = match schedule {
         Some(id) => discovery::schedule_by_id(&agent.manifest, &id)?,
@@ -211,12 +212,6 @@ pub async fn run_now(agent_name: String, schedule: Option<String>) -> Result<()>
     let started = Local::now();
     let outcome = run_with_hooks(spec, &ctx).await?;
     let duration = (Local::now() - started).num_seconds();
-    println!(
-        "run-now {}/{} done in {}s — {:?}",
-        agent_name,
-        sched.id(),
-        duration,
-        outcome
-    );
+    render_outcome(&agent_name, sched.id(), &outcome, duration, format);
     Ok(())
 }
