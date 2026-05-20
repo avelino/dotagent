@@ -390,8 +390,8 @@ The agent's exit code drives this:
 - exit 0 → `on_success` plugins + matching `[[notifiers]]` fire
 - exit ≠ 0 → matching `[[notifiers]]` + any legacy `on_failure` plugins fire
 
-This is the right place to put cross-cutting concerns — *every*
-agent of mine notifies the same way; that doesn't belong in each
+This is the right place to put cross-cutting concerns — when every
+agent notifies the same way, that boilerplate doesn't belong in each
 `agent.fish`.
 
 ### Retry policy

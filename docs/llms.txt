@@ -782,6 +782,7 @@ dotagent uninstall               # remove launchd plist / systemd unit
 dotagent plugin list             # list resolved plugin binaries
 dotagent inspect <name>          # heartbeat + windows + schedule resolution
 dotagent daily-summary           # ad-hoc daily roll-up
+dotagent completions <shell>     # bash|zsh|fish|elvish|powershell — tab-completes agent names
 ```
 
 ---

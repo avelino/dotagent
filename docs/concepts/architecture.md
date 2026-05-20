@@ -260,7 +260,7 @@ Two important properties:
 
 - **Run business logic.** Every domain concern (APIs to hit, prompts to
   draft, files to write) belongs in your agent script. dotagent's
-  surface ends at "I spawned the process and watched what came out."
+  surface ends at "spawn the process, watch what came out."
 - **Sleep to wait for time.** Scheduling math is `compute_next_event` +
   `tokio::time::sleep`. No `loop { sleep(1s); check() }`. This is why a
   hundred schedules don't burn CPU.

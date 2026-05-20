@@ -5,7 +5,8 @@
 //! lives in `commands/`.
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 
 mod commands;
 mod discovery;
@@ -108,6 +109,26 @@ enum Command {
         #[arg(long)]
         schedule: Option<String>,
     },
+
+    /// Print a shell completion script.
+    ///
+    /// Includes dynamic completion of agent names (via `dotagent _list-agents`)
+    /// for subcommands that take an agent name (`run`, `inspect`, `run-now`,
+    /// `logs`, `install`, `uninstall`).
+    ///
+    /// Examples:
+    ///   dotagent completions fish | source
+    ///   dotagent completions zsh  > ~/.zfunc/_dotagent
+    ///   dotagent completions bash > ~/.local/share/bash-completion/completions/dotagent
+    Completions {
+        /// Target shell (bash, zsh, fish, elvish, powershell).
+        shell: Shell,
+    },
+
+    /// (internal) Print discovered agent names, one per line. Used by the
+    /// completion scripts emitted by `dotagent completions`.
+    #[command(name = "_list-agents", hide = true)]
+    ListAgents,
 }
 
 #[derive(Subcommand, Debug)]
@@ -170,5 +191,11 @@ async fn main() -> Result<()> {
         Command::Inspect { name } => commands::utility::inspect(name).await,
         Command::Reload => commands::utility::reload().await,
         Command::RunNow { name, schedule } => commands::utility::run_now(name, schedule).await,
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            commands::completions::print(shell, &mut cmd);
+            Ok(())
+        }
+        Command::ListAgents => commands::list_agents::run(),
     }
 }

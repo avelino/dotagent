@@ -27,6 +27,7 @@ clap-generated help.
 | [`inspect`](#inspect)      | Dump heartbeat + manifest hash + schedule state for one agent.        |
 | [`reload`](#reload)        | Send SIGHUP to the running daemon.                                    |
 | [`run-now`](#run-now)      | Force-run an agent immediately, ignoring schedule windows.            |
+| [`completions`](#completions) | Print a shell completion script (bash / zsh / fish / elvish / powershell). |
 
 ---
 
@@ -462,6 +463,47 @@ Use this to:
   window).
 - Manually exercise the full plugin chain (preflight → spawn → sink →
   notify).
+
+---
+
+## `completions`
+
+Print a shell completion script. The script wires **dynamic** completion
+of agent names: pressing `<TAB>` after `dotagent run`, `inspect`,
+`run-now`, `logs`, `install`, or `uninstall` runs `dotagent _list-agents`
+(a hidden helper) and lists every manifest currently on disk — no stale
+baked-in list to refresh.
+
+```bash
+dotagent completions <SHELL>
+```
+
+| Arg     | Values                                          |
+|---------|-------------------------------------------------|
+| `SHELL` | `bash` · `zsh` · `fish` · `elvish` · `powershell` |
+
+> Dynamic agent-name completion is wired for `bash`, `zsh`, and `fish`.
+> `elvish` / `powershell` get subcommand + flag completion only.
+
+**Install**:
+
+```bash
+# fish — eval in current shell, or save to ~/.config/fish/completions/dotagent.fish
+dotagent completions fish | source
+
+# zsh — drop into a fpath dir
+dotagent completions zsh > ~/.zfunc/_dotagent
+
+# bash — drop into the bash-completion dir
+dotagent completions bash > ~/.local/share/bash-completion/completions/dotagent
+```
+
+Example:
+
+```bash
+$ dotagent run hel<TAB>
+hello-fish  hello-go  hello-python  hello-rust
+```
 
 ---
 

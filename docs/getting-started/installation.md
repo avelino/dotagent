@@ -225,6 +225,29 @@ If `dotagent --help` works but `dotagent doctor` fails, see the
 
 ---
 
+## Shell completion (optional)
+
+Tab-completion of subcommands, flags, and **agent names** (dynamic — runs
+against your live manifests, not a baked-in list).
+
+```bash
+# fish
+dotagent completions fish | source
+# or persistent:
+dotagent completions fish > ~/.config/fish/completions/dotagent.fish
+
+# zsh
+dotagent completions zsh > ~/.zfunc/_dotagent     # ensure ~/.zfunc is in $fpath
+
+# bash
+dotagent completions bash > ~/.local/share/bash-completion/completions/dotagent
+```
+
+After install, `dotagent run hel<TAB>` expands to `hello-fish hello-go
+hello-python hello-rust`. See [`reference/cli.md#completions`](../reference/cli.md#completions).
+
+---
+
 ## What got installed where
 
 After install you should find:

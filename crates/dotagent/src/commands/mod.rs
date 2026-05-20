@@ -14,8 +14,10 @@ use dotagent_runner::{run as runner_run, RunSpec};
 use dotagent_state::StateStore;
 use dotagent_unit_gen::GenContext;
 
+pub mod completions;
 pub mod daemon;
 pub mod daily_summary;
+pub mod list_agents;
 pub mod status;
 pub mod utility;
 
