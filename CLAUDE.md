@@ -247,6 +247,19 @@ Agents continuam chamando `mcp` diretamente. dotagent NÃO importa `mcp`,
 NÃO embute MCP, NÃO substitui MCP. Reaproveite quando o plugin precisar
 (ex: `sink-roam` chama `mcp roam_publish ...`).
 
+### 5. Nunca `{:?}` em output user-facing do CLI
+
+`println!`/`eprintln!` que chegam ao terminal do usuário **nunca** podem
+renderizar struct/enum interna via Debug (`{:?}`) — vaza tipo Rust,
+escapa `\n` como literal, sem hierarquia visual e sem cor. Toda
+comunicação de execução (sucesso, falha, preflight abort) passa por
+`crates/dotagent/src/commands/output.rs::render_outcome`, que respeita
+TTY/`NO_COLOR`, indica truncamento explicitamente e suporta
+`--json` pra scripting.
+
+Vale pra qualquer struct serializável que tenha campo de stdout/stderr,
+exit code ou estado de plugin. Audit rápido: `grep -rn '{:?}' crates/dotagent/src/commands`.
+
 ## Patterns que SEGUIR
 
 ### Adicionar plugin novo

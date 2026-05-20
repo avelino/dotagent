@@ -108,6 +108,10 @@ enum Command {
         name: String,
         #[arg(long)]
         schedule: Option<String>,
+        /// Emit the result as a single JSON line (stable, machine-parseable).
+        /// Default is a human-friendly multi-line report.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Print a shell completion script.
@@ -190,7 +194,18 @@ async fn main() -> Result<()> {
         } => commands::utility::logs(name, schedule, lines, follow).await,
         Command::Inspect { name } => commands::utility::inspect(name).await,
         Command::Reload => commands::utility::reload().await,
-        Command::RunNow { name, schedule } => commands::utility::run_now(name, schedule).await,
+        Command::RunNow {
+            name,
+            schedule,
+            json,
+        } => {
+            let format = if json {
+                commands::output::Format::Json
+            } else {
+                commands::output::Format::Human
+            };
+            commands::utility::run_now(name, schedule, format).await
+        }
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             commands::completions::print(shell, &mut cmd);
