@@ -5,9 +5,9 @@
 > isn't *scheduling the agent* and isn't a built-in notifier lives in a
 > plugin.
 
-> **Looking for notifications?** The five common notifiers (`desktop`,
-> `imessage`, `slack`, `ntfy`, `pushover`) are now **built into the
-> daemon** — they are not plugins. See
+> **Looking for notifications?** The common notifiers (`desktop`,
+> `imessage`, `slack`, `ntfy`, `pushover`, `telegram`) are now **built
+> into the daemon** — they are not plugins. See
 > [`notifications.md`](notifications.md) for the `[[notifiers]]` shape.
 > The plugin protocol below is still how you wire a *custom* notifier
 > (Discord, Teams, etc.) via `driver = "plugin"`.
@@ -237,9 +237,9 @@ These ship with the Homebrew install and live under
 | `sink-roam`                    | sink        | Publishes hierarchical content to Roam Research via `mcp` CLI.|
 | `sink-file`                    | sink        | Writes the message to a file (overwrite or append).           |
 
-> Notifications (`desktop`, `imessage`, `slack`, `ntfy`, `pushover`) are
-> **not** plugins anymore — they ship as in-process drivers inside the
-> daemon. See [`notifications.md`](notifications.md).
+> Notifications (`desktop`, `imessage`, `slack`, `ntfy`, `pushover`,
+> `telegram`) are **not** plugins anymore — they ship as in-process
+> drivers inside the daemon. See [`notifications.md`](notifications.md).
 
 For per-plugin details (config schema, examples, troubleshooting) see
 **[`docs/plugins/`](../plugins/README.md)**.

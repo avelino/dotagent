@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Built-in notification drivers for dotagent (desktop, Slack, ntfy, Pushover, iMessage)."
+description = "Built-in notification drivers for dotagent (desktop, Slack, ntfy, Pushover, Telegram, iMessage)."
 
 [dependencies]
 async-trait = "0.1"

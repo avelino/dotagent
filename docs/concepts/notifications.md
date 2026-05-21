@@ -47,6 +47,7 @@ events = ["given_up", "recovered"]
 | `slack`      | HTTPS POST to Slack Incoming Webhooks                  | No (in-process reqwest)  |
 | `ntfy`       | HTTPS POST to ntfy.sh (or self-hosted)                 | No (in-process reqwest)  |
 | `pushover`   | HTTPS POST to api.pushover.net                         | No (in-process reqwest)  |
+| `telegram`   | HTTPS POST to api.telegram.org (Bot API)               | No (in-process reqwest)  |
 | `imessage`   | `osascript` Messages.app automation                    | **Yes** — Apple has no API |
 | `plugin`     | Falls back to the plugin protocol (`kind = "notify"`)  | Yes (legacy escape hatch)|
 
@@ -97,6 +98,33 @@ user     = "uQiRzpo4DXghDmr9QzzfQu27cmVRsG"
 priority = 1
 title    = "disk-alert"        # default: agent name
 ```
+
+### `telegram`
+
+```toml
+[[notifiers]]
+driver       = "telegram"
+bot_token    = "${TELEGRAM_BOT_TOKEN}"   # env interpolation; failsafe if unset
+chat_id      = "-1001234567890"          # or "@my_channel"
+parse_mode   = "MarkdownV2"              # optional: MarkdownV2 | HTML | Markdown
+disable_notification = false             # optional: silent send
+```
+
+- `bot_token` accepts `${VAR}` references — the env var is resolved at
+  send time, never logged, and `Debug` redacts it. A literal token also
+  works but committing it to the manifest is **not** recommended.
+- When `parse_mode = "MarkdownV2"`, dotagent auto-escapes the 18
+  characters Telegram reserves (`_*[]()~\`>#+-=|{}.!`). Pass an
+  already-escaped body if you need formatting (asterisks, links, etc.) —
+  in that case use raw HTML or build the body yourself before handing it
+  to the notifier.
+- One-way only: dotagent does not receive Telegram updates (no inline
+  keyboards, no webhooks).
+
+> **Network allow-list.** If you declare `[security] network = [...]`,
+> include `"api.telegram.org"` so the (future) sandbox lets the bot
+> reach the API. v0 is schema-only, so it's a no-op today, but the
+> declaration documents intent.
 
 ### `imessage` (macOS only)
 

@@ -274,7 +274,7 @@ doesn't prevent the attacker from doing it.
 
 By default: **nothing**.
 
-- Slack / ntfy / Pushover notifiers: **only** when configured per agent.
+- Slack / ntfy / Pushover / Telegram notifiers: **only** when configured per agent.
   Each delivery POSTs the agent name + schedule + event + message body
   to the configured webhook.
 - OpenTelemetry export: opt-in via `[telemetry] otlp_endpoint`. The

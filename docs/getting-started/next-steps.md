@@ -22,8 +22,8 @@ flowchart TD
 
 The example in [`first-agent.md`](first-agent.md) already wired a
 **desktop banner**. The rest of the built-in drivers (`slack`, `ntfy`,
-`pushover`, `imessage`) follow the same shape — a `[[notifiers]]`
-block, no plugin install, no subprocess fork:
+`pushover`, `telegram`, `imessage`) follow the same shape — a
+`[[notifiers]]` block, no plugin install, no subprocess fork:
 
 ```toml
 [[notifiers]]

@@ -83,7 +83,7 @@ flowchart TD
 | `dotagent-scheduler`  | **Pure** scheduling math. `compute_next_event`, `expected_at`, `should_retry`, `health_state`. No IO. |
 | `dotagent-runner`     | Spawn the agent subprocess. Timeout, env injection, stdio capture, heartbeat lifecycle, hook firing. |
 | `dotagent-state`      | Filesystem state: heartbeats, window state, audit log, plugin state, manifest cache.            |
-| `dotagent-notify`     | Built-in notifier drivers (`desktop`, `slack`, `ntfy`, `pushover`, `imessage`).                 |
+| `dotagent-notify`     | Built-in notifier drivers (`desktop`, `slack`, `ntfy`, `pushover`, `telegram`, `imessage`).     |
 | `dotagent-plugin`     | `PluginClient` — discover + spawn + JSON-stdio for preflight / sink / third-party notify.       |
 | `dotagent-telemetry`  | `tracing` setup, JSON file logging, daily rotation, retention sweep, optional OTLP export.      |
 | `dotagent-unit-gen`   | Render `daemon.plist` (macOS) / `daemon.service` (Linux) from templates.                        |

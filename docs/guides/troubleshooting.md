@@ -339,7 +339,7 @@ tail ~/.config/dotagent/audit.log \
   | jq 'select(.event.plugin == "notifier:imessage")'
 ```
 
-### Slack / ntfy / Pushover notifier doesn't fire
+### Slack / ntfy / Pushover / Telegram notifier doesn't fire
 
 Native HTTPS — check connectivity from the daemon's environment:
 
