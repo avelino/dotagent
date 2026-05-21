@@ -19,7 +19,7 @@ members = [
 default-members = ["crates/dotagent"]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Avelino <avelinorun@gmail.com>"]
@@ -30,15 +30,15 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal crates
-dotagent-core = { path = "crates/dotagent-core", version = "0.1.1" }
-dotagent-scheduler = { path = "crates/dotagent-scheduler", version = "0.1.1" }
-dotagent-runner = { path = "crates/dotagent-runner", version = "0.1.1" }
-dotagent-state = { path = "crates/dotagent-state", version = "0.1.1" }
-dotagent-plugin = { path = "crates/dotagent-plugin", version = "0.1.1" }
-dotagent-notify = { path = "crates/dotagent-notify", version = "0.1.1" }
-dotagent-secrets = { path = "crates/dotagent-secrets", version = "0.1.1" }
-dotagent-telemetry = { path = "crates/dotagent-telemetry", version = "0.1.1" }
-dotagent-unit-gen = { path = "crates/dotagent-unit-gen", version = "0.1.1" }
+dotagent-core = { path = "crates/dotagent-core", version = "0.1.2" }
+dotagent-scheduler = { path = "crates/dotagent-scheduler", version = "0.1.2" }
+dotagent-runner = { path = "crates/dotagent-runner", version = "0.1.2" }
+dotagent-state = { path = "crates/dotagent-state", version = "0.1.2" }
+dotagent-plugin = { path = "crates/dotagent-plugin", version = "0.1.2" }
+dotagent-notify = { path = "crates/dotagent-notify", version = "0.1.2" }
+dotagent-secrets = { path = "crates/dotagent-secrets", version = "0.1.2" }
+dotagent-telemetry = { path = "crates/dotagent-telemetry", version = "0.1.2" }
+dotagent-unit-gen = { path = "crates/dotagent-unit-gen", version = "0.1.2" }
 
 # Async runtime
 tokio = { version = "1", features = [
