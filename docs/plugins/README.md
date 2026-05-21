@@ -11,7 +11,7 @@ JSON shape, exit codes), see [`docs/reference/plugin-protocol.md`](../reference/
 > **Note on notifications.** Notifications **used to be plugins** (`notify-imessage`,
 > `notify-desktop`, etc). They are now **built into the daemon** under the
 > `[[notifiers]]` array — no plugin subprocess, native APIs (NSUserNotification
-> on macOS, D-Bus on Linux, HTTPS for Slack/ntfy/Pushover). See
+> on macOS, D-Bus on Linux, HTTPS for Slack/ntfy/Pushover/Telegram). See
 > [`docs/concepts/notifications.md`](../concepts/notifications.md) for the new shape.
 
 ## Preflight plugins (`kind = "preflight"`)

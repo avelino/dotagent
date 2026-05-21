@@ -99,10 +99,11 @@ env_passthrough      = ["PATH", "HOME", "LANG"]
 ### `[[notifiers]]` — built-in drivers
 
 The `notifiers` array runs **in-process inside the daemon**, no subprocess.
-Supported `driver` values: `desktop`, `slack`, `ntfy`, `pushover`, `imessage`
-(macOS only — wraps `osascript`), and `plugin` (escape hatch to the legacy
-plugin protocol). See [`docs/concepts/notifications.md`](../concepts/notifications.md)
-for per-driver config schemas.
+Supported `driver` values: `desktop`, `slack`, `ntfy`, `pushover`,
+`telegram`, `imessage` (macOS only — wraps `osascript`), and `plugin`
+(escape hatch to the legacy plugin protocol). See
+[`docs/concepts/notifications.md`](../concepts/notifications.md) for
+per-driver config schemas.
 
 ### `[[on_failure]]` / `[[on_success]]` — legacy plugin hooks
 

@@ -29,6 +29,7 @@
 //! | `slack`      | HTTPS POST (Incoming Webhooks)                            |
 //! | `ntfy`       | HTTPS POST (`ntfy.sh` or self-hosted)                     |
 //! | `pushover`   | HTTPS POST (`api.pushover.net`)                           |
+//! | `telegram`   | HTTPS POST (`api.telegram.org`, Bot API)                  |
 //! | `imessage`   | `osascript` (no native API exists; macOS only)            |
 //! | `plugin`     | falls back to the legacy plugin protocol                   |
 //!
@@ -40,6 +41,7 @@ pub mod imessage;
 pub mod ntfy;
 pub mod pushover;
 pub mod slack;
+pub mod telegram;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -102,6 +104,7 @@ pub enum NotifierConfig {
     Slack(slack::SlackConfig),
     Ntfy(ntfy::NtfyConfig),
     Pushover(pushover::PushoverConfig),
+    Telegram(telegram::TelegramConfig),
     Imessage(imessage::ImessageConfig),
     /// Escape hatch for third-party notifiers — falls back to the plugin protocol.
     Plugin(PluginNotifierConfig),
@@ -152,6 +155,7 @@ impl NotifierEntry {
             NotifierConfig::Slack(c) => Box::new(c.clone()),
             NotifierConfig::Ntfy(c) => Box::new(c.clone()),
             NotifierConfig::Pushover(c) => Box::new(c.clone()),
+            NotifierConfig::Telegram(c) => Box::new(c.clone()),
             NotifierConfig::Imessage(c) => Box::new(c.clone()),
             NotifierConfig::Plugin(_) => return Ok(None),
         }))
@@ -164,6 +168,7 @@ impl NotifierEntry {
             NotifierConfig::Slack(_) => "slack",
             NotifierConfig::Ntfy(_) => "ntfy",
             NotifierConfig::Pushover(_) => "pushover",
+            NotifierConfig::Telegram(_) => "telegram",
             NotifierConfig::Imessage(_) => "imessage",
             NotifierConfig::Plugin(_) => "plugin",
         }

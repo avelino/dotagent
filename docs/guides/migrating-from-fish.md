@@ -37,8 +37,9 @@ cargo install --path plugins/sink-roam
 # (whichever plugins your agents use — notifiers are built in)
 ```
 
-> Notifiers (`desktop`, `imessage`, `slack`, `ntfy`, `pushover`) ship
-> inside the `dotagent` binary. No extra `cargo install` needed.
+> Notifiers (`desktop`, `imessage`, `slack`, `ntfy`, `pushover`,
+> `telegram`) ship inside the `dotagent` binary. No extra `cargo
+> install` needed.
 
 ### 2. Convert `meta.json` → `agent.toml`
 

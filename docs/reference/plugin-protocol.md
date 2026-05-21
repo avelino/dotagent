@@ -1,8 +1,8 @@
 # Plugin Protocol
 
-> **Note.** The five most common notifiers (`desktop`, `imessage`,
-> `slack`, `ntfy`, `pushover`) are now **built into the daemon** — they
-> do not use this protocol. See
+> **Note.** The common notifiers (`desktop`, `imessage`, `slack`,
+> `ntfy`, `pushover`, `telegram`) are now **built into the daemon** —
+> they do not use this protocol. See
 > [`docs/concepts/notifications.md`](../concepts/notifications.md) for
 > the `[[notifiers]]` shape. This protocol is the contract for
 > **preflight checks**, **output sinks**, and **third-party notifiers**
