@@ -105,6 +105,12 @@ Supported `driver` values: `desktop`, `slack`, `ntfy`, `pushover`,
 [`docs/concepts/notifications.md`](../concepts/notifications.md) for
 per-driver config schemas.
 
+Notifier config strings that contain `${VAR}` are resolved at send time
+against the daemon-loaded secrets file (see
+[`docs/concepts/secrets.md`](../concepts/secrets.md)), with `std::env`
+as fallback. Currently only `telegram.bot_token` honors interpolation;
+other drivers are being migrated case-by-case.
+
 ### `[[on_failure]]` / `[[on_success]]` — legacy plugin hooks
 
 These two arrays still drive the plugin protocol (`dotagent-plugin-<name>`

@@ -1,9 +1,15 @@
 //! Telegram notifications via the Bot API (`api.telegram.org`).
 //!
 //! Sends a `sendMessage` POST with the formatted body. `bot_token`
-//! supports `${ENV_VAR}` interpolation so secrets stay out of the
-//! manifest file — declare `bot_token = "${TELEGRAM_BOT_TOKEN}"` and
-//! export the variable in the daemon's env.
+//! supports `${VAR}` interpolation so secrets stay out of the manifest
+//! file — declare `bot_token = "${TELEGRAM_BOT_TOKEN}"` and put the
+//! actual value in `~/.config/dotagent/secrets.env` (preferred) or
+//! export it into the daemon's environment.
+//!
+//! Resolution order at send time:
+//! 1. [`dotagent_secrets::lookup`] — the daemon-loaded secrets store.
+//! 2. `std::env::var` — fallback for operators who wired vars into the
+//!    plist / systemd unit directly.
 //!
 //! Tokens never reach `tracing` output: errors are logged with the
 //! HTTP status only, and `Debug` redacts the token explicitly.
@@ -56,11 +62,13 @@ impl fmt::Debug for TelegramConfig {
     }
 }
 
-/// Expand `${VAR}` references against `std::env`. Returns `Err` if a
-/// referenced variable is unset — failing fast beats sending requests
-/// authenticated as the literal string `"${TELEGRAM_BOT_TOKEN}"`.
+/// Expand `${VAR}` references against the secrets store + process env.
+/// Returns `Err` if a referenced variable is unset — failing fast beats
+/// sending requests authenticated as the literal string
+/// `"${TELEGRAM_BOT_TOKEN}"`.
 fn expand_env(input: &str) -> std::result::Result<String, String> {
-    expand_env_with(input, |k| std::env::var(k).ok())
+    // `dotagent_secrets::lookup` already does store-first, env-fallback.
+    expand_env_with(input, dotagent_secrets::lookup)
 }
 
 /// Inner form that takes a `getter`, so tests can pass a closure and

@@ -113,6 +113,25 @@ pub enum AuditEvent {
     ConfigReloaded {
         reason: String,
     },
+    /// Daemon loaded `~/.config/dotagent/secrets.env`. Records the path,
+    /// resolved key count, and how many `op://` (or future scheme)
+    /// references failed — **never** values. See
+    /// `docs/concepts/secrets.md`.
+    SecretsLoaded {
+        path: String,
+        key_count: usize,
+        /// References (e.g., `op://...`) that the resolver could not
+        /// expand. Those keys are unset in the store, on purpose, so
+        /// notifier sends fail loud instead of leaking the literal
+        /// `op://...` string.
+        unresolved_references: usize,
+    },
+    /// Daemon refused to load the secrets file (insecure mode, parse
+    /// error, IO error). Reason is human-readable, value-free.
+    SecretsRefused {
+        path: String,
+        reason: String,
+    },
 }
 
 impl AuditEvent {
@@ -130,6 +149,7 @@ impl AuditEvent {
             AuditEvent::AgentRun { exit_code: 0, .. }
             | AuditEvent::ConfigReloaded { .. }
             | AuditEvent::AgentRecovered { .. }
+            | AuditEvent::SecretsLoaded { .. }
             | AuditEvent::PluginInvoked { ok: false, .. } => Severity::Notice,
 
             AuditEvent::AgentRun { .. } /* non-zero exit */
@@ -137,6 +157,7 @@ impl AuditEvent {
             | AuditEvent::PreflightFailed { .. }
             | AuditEvent::ManifestDriftDetected { .. }
             | AuditEvent::PhantomAgentDetected { .. }
+            | AuditEvent::SecretsRefused { .. }
             | AuditEvent::AuditChainBroken { .. } => Severity::Critical,
         }
     }

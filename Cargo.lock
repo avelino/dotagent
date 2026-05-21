@@ -568,6 +568,7 @@ dependencies = [
  "dotagent-plugin",
  "dotagent-runner",
  "dotagent-scheduler",
+ "dotagent-secrets",
  "dotagent-state",
  "dotagent-telemetry",
  "dotagent-unit-gen",
@@ -600,6 +601,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "dirs",
+ "dotagent-secrets",
  "notify-rust",
  "reqwest",
  "serde",
@@ -688,6 +690,15 @@ dependencies = [
  "chrono",
  "dotagent-core",
  "serde",
+]
+
+[[package]]
+name = "dotagent-secrets"
+version = "0.1.1"
+dependencies = [
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

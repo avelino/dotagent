@@ -97,6 +97,13 @@ pub async fn run() -> Result<()> {
     let app_config =
         dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
 
+    // Secrets load happens after the config is in hand because the config
+    // can override the secrets path. Failures here never abort the daemon —
+    // the file is optional, and a refused (insecure-mode) file should
+    // still let the daemon run so the operator can see the doctor warning
+    // and fix permissions without losing scheduled runs.
+    load_secrets_at_startup(&app_config, &audit);
+
     let mut last_summary_date: Option<chrono::NaiveDate> = None;
     let mut last_retention_date: Option<chrono::NaiveDate> = None;
     let exit_reason = loop {
@@ -143,6 +150,12 @@ pub async fn run() -> Result<()> {
             _ = sighup.recv() => {
                 info!("SIGHUP — reloading on next tick");
                 let _ = audit.append(AuditEvent::ConfigReloaded { reason: "SIGHUP".into() });
+                // Re-read secrets so operators can rotate without a full
+                // daemon restart (the issue explicitly calls out SIGHUP /
+                // restart as the supported refresh mechanism).
+                let reloaded = dotagent_core::Config::load(dotagent_state::paths::config_file())
+                    .unwrap_or_default();
+                load_secrets_at_startup(&reloaded, &audit);
                 continue;
             }
             _ = sigterm.recv() => break "SIGTERM",
@@ -155,6 +168,95 @@ pub async fn run() -> Result<()> {
         reason: exit_reason.into(),
     })?;
     Ok(())
+}
+
+/// Load the daemon-level secrets file (default `~/.config/dotagent/secrets.env`,
+/// overridable via `[secrets] file = "..."` in `config.toml` or the
+/// `DOTAGENT_SECRETS_FILE` env var).
+///
+/// Audit outcome:
+/// - file missing → no event (audit log is already noisy enough).
+/// - load ok → `SecretsLoaded { path, key_count }` (never the values).
+/// - refuse (insecure mode / parse / IO error) → `SecretsRefused`. On a
+///   SIGHUP reload the previously-installed store is **dropped** before
+///   we give up — better to fall through to `std::env` (and fail loud
+///   on missing `${VAR}`) than to keep serving a token the operator
+///   thought they had rotated. The audit reason records that the
+///   previous store was dropped so the chain stays self-explanatory.
+///
+/// Daemon does NOT abort on refusal — operators should keep seeing scheduled
+/// runs and notice the warning via `dotagent doctor`.
+fn load_secrets_at_startup(config: &dotagent_core::Config, audit: &AuditLog) {
+    let path = resolve_secrets_path(config);
+    match dotagent_secrets::SecretsStore::load(&path) {
+        Ok(Some(store)) => {
+            let key_count = store.len();
+            let unresolved_references = store.unresolved_references();
+            if unresolved_references > 0 {
+                warn!(
+                    path = %path.display(),
+                    unresolved_references,
+                    "some secret references failed to resolve — those keys are unset"
+                );
+            }
+            info!(
+                path = %path.display(),
+                key_count,
+                unresolved_references,
+                "loaded secrets file"
+            );
+            dotagent_secrets::install(store);
+            let _ = audit.append(AuditEvent::SecretsLoaded {
+                path: path.display().to_string(),
+                key_count,
+                unresolved_references,
+            });
+        }
+        Ok(None) => {
+            // Missing file is the default state on startup — no audit
+            // noise. But on a reload, dropping the previously-loaded
+            // store IS noteworthy (operator may have deleted the file
+            // by mistake).
+            if dotagent_secrets::reset_if_present() {
+                warn!(path = %path.display(), "secrets file disappeared; previous store dropped");
+                let _ = audit.append(AuditEvent::SecretsRefused {
+                    path: path.display().to_string(),
+                    reason: "file no longer exists; previous store dropped".into(),
+                });
+            }
+        }
+        Err(e) => {
+            // `e.to_string()` is value-free by construction (see
+            // `SecretsError`). Don't change that contract.
+            let raw_reason = e.to_string();
+            let dropped = dotagent_secrets::reset_if_present();
+            let reason = if dropped {
+                format!("{raw_reason}; previous store dropped")
+            } else {
+                raw_reason
+            };
+            warn!(
+                path = %path.display(),
+                dropped_previous = dropped,
+                %reason,
+                "refusing to load secrets file"
+            );
+            let _ = audit.append(AuditEvent::SecretsRefused {
+                path: path.display().to_string(),
+                reason,
+            });
+        }
+    }
+}
+
+/// `[secrets] file` in `config.toml` wins over the `DOTAGENT_SECRETS_FILE`
+/// env var, which wins over the default. Empty string in config falls
+/// through to the env-based resolver.
+pub(crate) fn resolve_secrets_path(config: &dotagent_core::Config) -> std::path::PathBuf {
+    if config.secrets.is_set() {
+        return std::path::PathBuf::from(&config.secrets.file);
+    }
+    dotagent_state::paths::secrets_file()
 }
 
 /// Output of one tick iteration.

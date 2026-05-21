@@ -102,6 +102,25 @@ pub fn config_file() -> PathBuf {
     home().join("config.toml")
 }
 
+/// Daemon-level secrets file: `$DOTAGENT_HOME/secrets.env`.
+///
+/// Resolution order:
+/// 1. `DOTAGENT_SECRETS_FILE` env var (absolute path) — operator escape hatch
+/// 2. `$DOTAGENT_HOME/secrets.env`
+///
+/// The override at `[secrets] file = "..."` in `config.toml` is honored
+/// **inside** the caller (daemon startup), not here — paths returned by
+/// this module are env-only so they remain pure functions of the
+/// environment.
+pub fn secrets_file() -> PathBuf {
+    if let Ok(p) = std::env::var("DOTAGENT_SECRETS_FILE") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    home().join("secrets.env")
+}
+
 pub fn audit_log_file() -> PathBuf {
     home().join("audit.log")
 }

@@ -1,0 +1,17 @@
+[package]
+name = "dotagent-secrets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Daemon-level secrets loader for dotagent (KEY=VALUE env file, 0600-enforced)."
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

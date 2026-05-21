@@ -110,9 +110,14 @@ parse_mode   = "MarkdownV2"              # optional: MarkdownV2 | HTML | Markdow
 disable_notification = false             # optional: silent send
 ```
 
-- `bot_token` accepts `${VAR}` references — the env var is resolved at
-  send time, never logged, and `Debug` redacts it. A literal token also
-  works but committing it to the manifest is **not** recommended.
+- `bot_token` accepts `${VAR}` references — resolution happens at send
+  time against the daemon-loaded secrets file
+  (`~/.config/dotagent/secrets.env`), falling back to the process env.
+  Values never reach `tracing` output, and `Debug` redacts the token
+  explicitly. A literal token also works but committing it to the
+  manifest is **not** recommended. See
+  [secrets concept](./secrets.md) for the loader's posture
+  (0600-enforced, never echoed, audit-logged by key count only).
 - When `parse_mode = "MarkdownV2"`, dotagent auto-escapes the 18
   characters Telegram reserves (``_*[]()~`>#+-=|{}.!``). Pass an
   already-escaped body if you need formatting (asterisks, links, etc.) —

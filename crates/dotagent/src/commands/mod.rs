@@ -152,6 +152,12 @@ pub async fn uninstall(all: bool, name: Option<String>) -> Result<()> {
 /// Validate every discovered manifest + check that referenced plugins resolve
 /// + warn about missing `[security]` declarations + detect manifest drift.
 pub async fn doctor() -> Result<()> {
+    // Report secrets file status first — it's the most common source of
+    // confusion when notifiers can't resolve `${VAR}`. Counted toward
+    // warnings (insecure mode is a problem the operator should fix), never
+    // toward errors (daemon still runs without secrets).
+    let (mut errors, mut warnings) = report_secrets_status();
+
     let agents = discovery::discover_all()?;
     if agents.is_empty() {
         println!("no agents discovered");
@@ -162,9 +168,6 @@ pub async fn doctor() -> Result<()> {
         .context("opening manifest cache")?
         .load()
         .unwrap_or_default();
-
-    let mut errors = 0usize;
-    let mut warnings = 0usize;
 
     for agent in &agents {
         let name = &agent.manifest.agent.name;
@@ -295,6 +298,78 @@ pub async fn plugin_list() -> Result<()> {
 
 pub async fn plugin_invoke(name: String, _payload: String) -> Result<()> {
     Err(anyhow!("plugin invoke {name} — not yet implemented"))
+}
+
+/// Print a one-block status for the secrets file. Returns `(errors,
+/// warnings)` so the caller can fold the counts into its summary.
+///
+/// Never prints keys or values — only path, presence, permission state,
+/// and key count.
+///
+/// **Note**: this calls `SecretsStore::load` directly, which means any
+/// `op://...` references in the file are resolved *again* via `op read`
+/// (one fork per reference). For an interactive `doctor` invocation
+/// this is fine — the count is single-digit in practice. If a future
+/// CI gate calls `doctor` in a tight loop, swap to
+/// `dotagent_secrets::snapshot()` to read the daemon's in-memory copy
+/// without re-shelling out.
+fn report_secrets_status() -> (usize, usize) {
+    let config =
+        dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
+    let path = daemon::resolve_secrets_path(&config);
+    let source_hint = if config.secrets.is_set() {
+        " (from config.toml [secrets].file)"
+    } else if std::env::var("DOTAGENT_SECRETS_FILE").is_ok() {
+        " (from DOTAGENT_SECRETS_FILE)"
+    } else {
+        " (default)"
+    };
+    println!("secrets file: {}{source_hint}", path.display());
+
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    match dotagent_secrets::SecretsStore::load(&path) {
+        Ok(Some(store)) => {
+            #[cfg(unix)]
+            let mode_str = std::fs::metadata(&path)
+                .ok()
+                .map(|m| {
+                    use std::os::unix::fs::PermissionsExt;
+                    format!("{:o}", m.permissions().mode() & 0o777)
+                })
+                .unwrap_or_else(|| "?".into());
+            #[cfg(not(unix))]
+            let mode_str = "n/a".to_string();
+            println!("    ✓ loaded — {} key(s), mode {mode_str}", store.len());
+            if store.unresolved_references() > 0 {
+                // Counted as warnings — daemon still ran but some keys
+                // are unset and any notifier needing them will fail.
+                println!(
+                    "    ⚠ {} secret reference(s) failed to resolve (e.g. `op://...`). \
+                    Affected keys are unset; check daemon logs for which reference failed.",
+                    store.unresolved_references()
+                );
+                warnings += 1;
+            }
+        }
+        Ok(None) => {
+            println!("    (not present — secrets are optional)");
+        }
+        Err(dotagent_secrets::SecretsError::InsecureMode { mode, .. }) => {
+            println!(
+                "    ⚠ insecure permissions (mode {mode:o}) — daemon will refuse to load. \
+                Fix with: chmod 600 {}",
+                path.display()
+            );
+            warnings += 1;
+        }
+        Err(e) => {
+            println!("    ✗ {e}");
+            errors += 1;
+        }
+    }
+    println!();
+    (errors, warnings)
 }
 
 fn gen_context() -> Result<GenContext> {

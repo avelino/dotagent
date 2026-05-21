@@ -12,6 +12,7 @@ description = "Built-in notification drivers for dotagent (desktop, Slack, ntfy,
 async-trait = "0.1"
 chrono.workspace = true
 dirs.workspace = true
+dotagent-secrets.workspace = true
 notify-rust = "4"
 reqwest.workspace = true
 serde.workspace = true

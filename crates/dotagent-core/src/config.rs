@@ -42,6 +42,30 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub secrets: SecretsConfig,
+}
+
+/// Daemon-level secrets file override. See
+/// [`docs/concepts/secrets.md`](../../../docs/concepts/secrets.md) for the
+/// full posture; this struct only carries the path override.
+///
+/// The default (empty `file`) resolves to `$DOTAGENT_HOME/secrets.env` —
+/// you only need this section when you want the file somewhere else (for
+/// example, mounted from a secret manager into `/run/secrets/dotagent.env`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SecretsConfig {
+    /// Override the path to the secrets file. Empty (default) means the
+    /// resolver in `dotagent-state::paths::secrets_file` is used (which
+    /// itself honors `DOTAGENT_SECRETS_FILE`).
+    #[serde(default)]
+    pub file: String,
+}
+
+impl SecretsConfig {
+    pub fn is_set(&self) -> bool {
+        !self.file.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +187,23 @@ mod tests {
         assert_eq!(c.logging.level, "debug");
         assert_eq!(c.logging.format, "json"); // default
         assert_eq!(c.logging.retention_days, 30); // default
+    }
+
+    #[test]
+    fn secrets_file_override_parses() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[secrets]\nfile = \"/etc/dotagent/s.env\"\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(c.secrets.is_set());
+        assert_eq!(c.secrets.file, "/etc/dotagent/s.env");
+    }
+
+    #[test]
+    fn secrets_default_is_empty() {
+        let c = Config::default();
+        assert!(!c.secrets.is_set());
+        assert_eq!(c.secrets.file, "");
     }
 
     #[test]
