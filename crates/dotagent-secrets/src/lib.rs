@@ -82,11 +82,13 @@ pub enum SecretsError {
         #[source]
         source: std::io::Error,
     },
-    /// File exists but mode is too permissive. Daemon refuses to load — same
-    /// posture as ssh refusing to use a world-readable private key.
+    /// File exists but mode is too permissive (any group or world bit is
+    /// set). Daemon refuses to load, matching ssh's posture for private
+    /// keys. The exact rule is `mode & 0o077 == 0` — `0600` is the canonical
+    /// answer but `0400` / `0700` also pass; anything looser fails.
     #[error(
-        "insecure permissions on {path}: mode is {mode:o}, must be 0600 \
-        (run: chmod 600 {path})",
+        "insecure permissions on {path}: mode is {mode:o}, must be owner-only \
+        (no group/world bits — e.g. 0600). run: chmod 600 {path}",
         path = path.display(),
     )]
     InsecureMode { path: PathBuf, mode: u32 },
@@ -294,30 +296,40 @@ fn parse(raw: &str, path: &Path) -> Result<BTreeMap<String, String>, SecretsErro
     Ok(out)
 }
 
+/// Drain a char iterator after a closing quote and ensure everything
+/// left is whitespace. The `quote` arg only feeds the error message.
+fn ensure_trailing_whitespace<I: Iterator<Item = char>>(
+    chars: &mut I,
+    quote: char,
+) -> Result<(), String> {
+    for c in chars {
+        if !c.is_whitespace() {
+            return Err(format!(
+                "unexpected `{c}` after closing `{quote}` (escape with `\\{quote}` or remove it)"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Dotenv-style quote handling.
 ///
 /// - Leading whitespace before the value is trimmed.
-/// - `"..."` → strip quotes, process `\n \r \t \\ \"` escapes. Trailing
-///   characters after the closing `"` are an error (we want to flag the
-///   "I forgot to escape" case rather than silently ignore them).
-/// - `'...'` → strip quotes, literal interior (no escapes).
+/// - `"..."` → strip quotes, process `\n \r \t \\ \"` escapes. After the
+///   closing `"`, **only** trailing whitespace is allowed; anything else
+///   is an error (silently ignoring `KEY="v" trailing` masks typos).
+/// - `'...'` → strip quotes, literal interior (no escapes). Same trailing
+///   rule as double-quoted: whitespace ok, anything else errors.
 /// - Otherwise → trailing whitespace trimmed, no escapes applied.
 fn unquote_value(raw: &str) -> Result<String, String> {
     let v = raw.trim_start();
     if let Some(rest) = v.strip_prefix('"') {
         let mut out = String::with_capacity(rest.len());
-        let mut chars = rest.chars().peekable();
+        let mut chars = rest.chars();
         while let Some(c) = chars.next() {
             match c {
                 '"' => {
-                    // Trailing content after the close quote → confusing,
-                    // refuse rather than guess.
-                    if chars.peek().is_some_and(|&c| !c.is_whitespace()) {
-                        return Err(
-                            "unexpected content after closing `\"` (escape the quote with \\\")"
-                                .into(),
-                        );
-                    }
+                    ensure_trailing_whitespace(&mut chars, '"')?;
                     return Ok(out);
                 }
                 '\\' => match chars.next() {
@@ -343,9 +355,7 @@ fn unquote_value(raw: &str) -> Result<String, String> {
         let mut chars = rest.chars();
         while let Some(c) = chars.next() {
             if c == '\'' {
-                if chars.next().is_some() {
-                    return Err("unexpected content after closing `'`".into());
-                }
+                ensure_trailing_whitespace(&mut chars, '\'')?;
                 return Ok(out);
             }
             out.push(c);
@@ -641,6 +651,37 @@ mod tests {
     }
 
     #[test]
+    fn trailing_whitespace_after_close_quote_is_ok() {
+        // Both quote styles must accept trailing whitespace before EOL —
+        // it's how real `.env` files end up after a copy-paste.
+        let dir = tempdir().unwrap();
+        let body = "DBL=\"hi\"   \nSGL='hi'   \n";
+        let p = write_file(dir.path(), "secrets.env", body, 0o600);
+        let store = SecretsStore::load(&p).unwrap().unwrap();
+        assert_eq!(store.get("DBL"), Some("hi"));
+        assert_eq!(store.get("SGL"), Some("hi"));
+    }
+
+    #[test]
+    fn trailing_junk_after_close_quote_errors() {
+        // Both quote styles must reject non-whitespace trailing content —
+        // covers `KEY="v" trailing` (was silently accepted) AND
+        // `KEY='v'x` (was rejected; now uniform with double).
+        let dir = tempdir().unwrap();
+        let p_dbl = write_file(dir.path(), "dbl.env", "TOKEN=\"v\" trailing\n", 0o600);
+        let err = SecretsStore::load(&p_dbl).unwrap_err();
+        match err {
+            SecretsError::Parse { reason, .. } => {
+                assert!(reason.contains("after closing"), "{reason}")
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+        let p_sgl = write_file(dir.path(), "sgl.env", "TOKEN='v'trailing\n", 0o600);
+        let err = SecretsStore::load(&p_sgl).unwrap_err();
+        assert!(matches!(err, SecretsError::Parse { .. }));
+    }
+
+    #[test]
     fn unsupported_escape_errors() {
         let dir = tempdir().unwrap();
         let body = "TOKEN=\"\\q\"\n";
@@ -737,6 +778,22 @@ mod tests {
         match err {
             SecretsError::InsecureMode { mode, .. } => assert_eq!(mode, 0o640),
             other => panic!("expected InsecureMode, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_owner_only_modes_other_than_0600() {
+        // 0400 (read-only owner) and 0700 (rwx owner) both have zero
+        // group/world bits, so they pass — matches the ssh posture
+        // documented in `docs/concepts/secrets.md`.
+        let dir = tempdir().unwrap();
+        for mode in [0o400u32, 0o600, 0o700] {
+            let p = write_file(dir.path(), &format!("m{mode:o}.env"), "K=v\n", mode);
+            let store = SecretsStore::load(&p)
+                .unwrap_or_else(|e| panic!("mode {mode:o} should pass, got {e}"))
+                .unwrap();
+            assert_eq!(store.get("K"), Some("v"));
         }
     }
 

@@ -176,7 +176,8 @@ pub async fn run() -> Result<()> {
 ///
 /// Audit outcome:
 /// - file missing → no event (audit log is already noisy enough).
-/// - load ok → `SecretsLoaded { path, key_count }` (never the values).
+/// - load ok → `SecretsLoaded { path, key_count, unresolved_references }`
+///   (never the values).
 /// - refuse (insecure mode / parse / IO error) → `SecretsRefused`. On a
 ///   SIGHUP reload the previously-installed store is **dropped** before
 ///   we give up — better to fall through to `std::env` (and fail loud
@@ -251,10 +252,20 @@ fn load_secrets_at_startup(config: &dotagent_core::Config, audit: &AuditLog) {
 
 /// `[secrets] file` in `config.toml` wins over the `DOTAGENT_SECRETS_FILE`
 /// env var, which wins over the default. Empty string in config falls
-/// through to the env-based resolver.
+/// through to the env-based resolver. Non-absolute config values are
+/// ignored with a warning — under launchd / systemd the daemon's
+/// working directory is not predictable, so relative paths would
+/// resolve to surprising places.
 pub(crate) fn resolve_secrets_path(config: &dotagent_core::Config) -> std::path::PathBuf {
     if config.secrets.is_set() {
-        return std::path::PathBuf::from(&config.secrets.file);
+        let candidate = std::path::PathBuf::from(&config.secrets.file);
+        if candidate.is_absolute() {
+            return candidate;
+        }
+        warn!(
+            value = %config.secrets.file,
+            "ignoring [secrets].file: must be absolute, falling back to default resolver"
+        );
     }
     dotagent_state::paths::secrets_file()
 }
