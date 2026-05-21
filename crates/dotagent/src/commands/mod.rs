@@ -306,20 +306,31 @@ pub async fn plugin_invoke(name: String, _payload: String) -> Result<()> {
 /// Never prints keys or values — only path, presence, permission state,
 /// and key count.
 ///
-/// **Note**: this calls `SecretsStore::load` directly, which means any
-/// `op://...` references in the file are resolved *again* via `op read`
-/// (one fork per reference). For an interactive `doctor` invocation
-/// this is fine — the count is single-digit in practice. If a future
-/// CI gate calls `doctor` in a tight loop, swap to
-/// `dotagent_secrets::snapshot()` to read the daemon's in-memory copy
-/// without re-shelling out.
+/// **Note**: `dotagent doctor` runs in its OWN process, separate from
+/// the daemon, so the in-memory `dotagent_secrets::snapshot()` is always
+/// empty here — there is no daemon store to inspect. That means doctor
+/// has to call `SecretsStore::load` again, which re-shells out to
+/// `op read` once per `op://` reference. For an interactive run this
+/// is fine (single-digit refs in practice). If a future CI gate calls
+/// `doctor` in a tight loop with many refs, cache inside this function
+/// rather than reaching for `snapshot()`.
 fn report_secrets_status() -> (usize, usize) {
     let config =
         dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
     let path = daemon::resolve_secrets_path(&config);
-    let source_hint = if config.secrets.is_set() {
+    // Match the resolver's actual behavior: it ignores empty / non-absolute
+    // overrides and falls back to default. Reporting "(from VAR)" when the
+    // var is empty would tell the operator a lie.
+    let cfg_absolute =
+        config.secrets.is_set() && std::path::Path::new(&config.secrets.file).is_absolute();
+    let env_absolute = std::env::var("DOTAGENT_SECRETS_FILE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|v| std::path::PathBuf::from(v).is_absolute())
+        .unwrap_or(false);
+    let source_hint = if cfg_absolute {
         " (from config.toml [secrets].file)"
-    } else if std::env::var("DOTAGENT_SECRETS_FILE").is_ok() {
+    } else if env_absolute {
         " (from DOTAGENT_SECRETS_FILE)"
     } else {
         " (default)"

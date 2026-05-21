@@ -105,7 +105,10 @@ pub fn config_file() -> PathBuf {
 /// Daemon-level secrets file: `$DOTAGENT_HOME/secrets.env`.
 ///
 /// Resolution order:
-/// 1. `DOTAGENT_SECRETS_FILE` env var (absolute path) — operator escape hatch
+/// 1. `DOTAGENT_SECRETS_FILE` env var — must be absolute. Non-absolute
+///    values are ignored with a warning (the daemon's working directory
+///    is not predictable under launchd/systemd, so relative paths would
+///    resolve to surprising places).
 /// 2. `$DOTAGENT_HOME/secrets.env`
 ///
 /// The override at `[secrets] file = "..."` in `config.toml` is honored
@@ -115,7 +118,14 @@ pub fn config_file() -> PathBuf {
 pub fn secrets_file() -> PathBuf {
     if let Ok(p) = std::env::var("DOTAGENT_SECRETS_FILE") {
         if !p.is_empty() {
-            return PathBuf::from(p);
+            let candidate = PathBuf::from(&p);
+            if candidate.is_absolute() {
+                return candidate;
+            }
+            tracing::warn!(
+                value = %p,
+                "ignoring DOTAGENT_SECRETS_FILE: must be absolute, falling back to default"
+            );
         }
     }
     home().join("secrets.env")

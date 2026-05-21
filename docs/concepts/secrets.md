@@ -189,13 +189,29 @@ to re-populate the store.
 dotagent's append-only `audit.log` records the load outcome — never
 the values themselves.
 
-| Event              | Severity | Payload                                          |
-|--------------------|----------|--------------------------------------------------|
-| `secrets_loaded`   | Notice   | `path`, `key_count`                              |
-| `secrets_refused`  | Critical | `path`, `reason` (e.g., "insecure permissions … mode 640") |
+| Event              | Severity | Payload                                                                        |
+|--------------------|----------|--------------------------------------------------------------------------------|
+| `secrets_loaded`   | Notice   | `path`, `key_count`, `unresolved_references`                                   |
+| `secrets_refused`  | Critical | `path`, `reason` (e.g., "insecure permissions … mode 640; previous store dropped") |
 
-Keys are never logged. Values are never logged. If a future change
-ever logs a key name, treat that as a regression.
+### What never leaks vs. what may appear
+
+- **Values never appear** anywhere — not in `audit.log`, not in
+  `tracing` output, not in `Debug` impls (`SecretsStore`'s `Debug`
+  redacts to `len` + `source`).
+- **Key names may appear in operational `tracing` warnings** —
+  duplicate-key warnings and notifier `env var ${KEY} is unset`
+  errors both include the key name on purpose, because they're
+  unactionable without it. Key names also appear in failed
+  `op://...` warnings (along with the reference path), since the
+  vault/item identifiers are operator-visible metadata, not the
+  secret itself.
+- **The audit log itself never includes key names** — only counts.
+
+If you treat key names as sensitive, route the daemon's `tracing`
+output to a sink you trust (the daemon's `logs/daemon/*.log` inherits
+the umask of whoever started it — set `umask 077` in the launchd /
+systemd unit's environment if you want owner-only).
 
 ## Agent subprocess isolation
 
