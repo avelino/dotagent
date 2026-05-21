@@ -114,7 +114,7 @@ disable_notification = false             # optional: silent send
   send time, never logged, and `Debug` redacts it. A literal token also
   works but committing it to the manifest is **not** recommended.
 - When `parse_mode = "MarkdownV2"`, dotagent auto-escapes the 18
-  characters Telegram reserves (`_*[]()~\`>#+-=|{}.!`). Pass an
+  characters Telegram reserves (``_*[]()~`>#+-=|{}.!``). Pass an
   already-escaped body if you need formatting (asterisks, links, etc.) —
   in that case use raw HTML or build the body yourself before handing it
   to the notifier.

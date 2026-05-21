@@ -60,6 +60,16 @@ impl fmt::Debug for TelegramConfig {
 /// referenced variable is unset — failing fast beats sending requests
 /// authenticated as the literal string `"${TELEGRAM_BOT_TOKEN}"`.
 fn expand_env(input: &str) -> std::result::Result<String, String> {
+    expand_env_with(input, |k| std::env::var(k).ok())
+}
+
+/// Inner form that takes a `getter`, so tests can pass a closure and
+/// avoid touching `std::env` (mutation across threads is UB under the
+/// modern `set_var` contract).
+fn expand_env_with<F>(input: &str, getter: F) -> std::result::Result<String, String>
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
     while let Some(start) = rest.find("${") {
@@ -72,14 +82,39 @@ fn expand_env(input: &str) -> std::result::Result<String, String> {
         if name.is_empty() {
             return Err("empty `${}` placeholder".into());
         }
-        match std::env::var(name) {
-            Ok(v) => out.push_str(&v),
-            Err(_) => return Err(format!("env var ${{{name}}} is unset")),
+        match getter(name) {
+            Some(v) => out.push_str(&v),
+            None => return Err(format!("env var ${{{name}}} is unset")),
         }
         rest = &after[end + 1..];
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Convert a `reqwest::Error` into a short, URL-free message. The default
+/// `Display` includes the request URL for many failure modes, and our URL
+/// embeds the bot token (`api.telegram.org/bot<token>/sendMessage`), so we
+/// must never let the raw error reach `tracing`.
+fn sanitize_reqwest_err(e: &reqwest::Error) -> String {
+    let kind = if e.is_timeout() {
+        "timeout"
+    } else if e.is_connect() {
+        "connect"
+    } else if e.is_request() {
+        "request"
+    } else if e.is_body() {
+        "body"
+    } else if e.is_decode() {
+        "decode"
+    } else {
+        "http"
+    };
+    if let Some(status) = e.status() {
+        format!("telegram transport error ({kind}, status {status})")
+    } else {
+        format!("telegram transport error ({kind})")
+    }
 }
 
 /// Escape per Telegram MarkdownV2 reserved characters.
@@ -157,13 +192,20 @@ impl Notifier for TelegramConfig {
             payload["disable_notification"] = json!(true);
         }
 
-        // URL embeds the token; never log it. We log status only on failure.
+        // URL embeds the token; never log it. Both the URL and the
+        // request-side `reqwest::Error::Display` carry the token, so we
+        // convert transport errors into a sanitized `Backend` message
+        // before they can reach `tracing` via `error = %e`.
         let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-        let res = reqwest::Client::new()
+        let res = match reqwest::Client::new()
             .post(&url)
             .json(&payload)
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return Err(NotifyError::Backend(sanitize_reqwest_err(&e))),
+        };
         let status = res.status();
         if !status.is_success() {
             return Err(NotifyError::Backend(format!("telegram returned {status}")));
@@ -192,33 +234,54 @@ mod tests {
         assert!(dbg.contains("<redacted>"));
     }
 
+    // Tests use `expand_env_with` with an in-memory map so they never
+    // touch `std::env`. Mutating process env from tests is UB under the
+    // modern `set_var` contract because Cargo runs tests in parallel.
+
     #[test]
     fn expand_env_replaces_var() {
-        // SAFETY: tests run single-threaded for env mutation isolation only
-        // because this var is unique to this test. Cargo's default test
-        // harness is multi-threaded but each name is scoped per-test here.
-        unsafe { std::env::set_var("DOTAGENT_TEST_TG_TOKEN_A", "abc123") };
-        let out = expand_env("${DOTAGENT_TEST_TG_TOKEN_A}").unwrap();
+        let env = |k: &str| (k == "TG_TOKEN_A").then_some("abc123".to_string());
+        let out = expand_env_with("${TG_TOKEN_A}", env).unwrap();
         assert_eq!(out, "abc123");
-        unsafe { std::env::remove_var("DOTAGENT_TEST_TG_TOKEN_A") };
+    }
+
+    #[test]
+    fn expand_env_replaces_multiple_vars() {
+        let env = |k: &str| match k {
+            "A" => Some("alpha".into()),
+            "B" => Some("beta".into()),
+            _ => None,
+        };
+        let out = expand_env_with("prefix-${A}-mid-${B}-end", env).unwrap();
+        assert_eq!(out, "prefix-alpha-mid-beta-end");
     }
 
     #[test]
     fn expand_env_preserves_literal() {
-        let out = expand_env("plain-literal-token").unwrap();
+        let env = |_: &str| None;
+        let out = expand_env_with("plain-literal-token", env).unwrap();
         assert_eq!(out, "plain-literal-token");
     }
 
     #[test]
     fn expand_env_errors_on_missing_var() {
-        let err = expand_env("${THIS_DOES_NOT_EXIST_DOTAGENT_XYZ}").unwrap_err();
+        let env = |_: &str| None;
+        let err = expand_env_with("${MISSING}", env).unwrap_err();
         assert!(err.contains("unset"), "{err}");
     }
 
     #[test]
     fn expand_env_errors_on_unterminated() {
-        let err = expand_env("${UNCLOSED").unwrap_err();
+        let env = |_: &str| None;
+        let err = expand_env_with("${UNCLOSED", env).unwrap_err();
         assert!(err.contains("unterminated"), "{err}");
+    }
+
+    #[test]
+    fn expand_env_errors_on_empty_placeholder() {
+        let env = |_: &str| None;
+        let err = expand_env_with("foo${}bar", env).unwrap_err();
+        assert!(err.contains("empty"), "{err}");
     }
 
     #[test]
