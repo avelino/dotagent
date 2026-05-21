@@ -13,6 +13,7 @@
 * [Architecture](concepts/architecture.md)
 * [Agents](concepts/agents.md)
 * [Notifications](concepts/notifications.md)
+* [Secrets](concepts/secrets.md)
 * [Plugins](concepts/plugins.md)
 
 ## Guides

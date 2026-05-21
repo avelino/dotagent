@@ -13,7 +13,7 @@ pub mod security;
 pub mod state;
 
 pub use audit::{AuditEntry, AuditEvent, Severity, GENESIS_HASH};
-pub use config::{Config, LoggingConfig, TelemetryConfig};
+pub use config::{Config, LoggingConfig, SecretsConfig, TelemetryConfig};
 pub use error::{Error, Result};
 pub use heartbeat::Heartbeat;
 pub use manifest::{

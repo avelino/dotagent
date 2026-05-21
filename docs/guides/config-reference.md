@@ -48,6 +48,29 @@ service_name = "dotagent"
 # Resource attributes attached to every span/log.
 "deployment.environment" = "production"
 "host.name" = "avelino-igloo"
+
+[secrets]
+file = ""                          # empty = default path or DOTAGENT_SECRETS_FILE
+```
+
+---
+
+## `[secrets]`
+
+Override the path to the daemon-loaded secrets file. The default
+(empty `file`) resolves to `$DOTAGENT_HOME/secrets.env`, with the
+`DOTAGENT_SECRETS_FILE` env var as second-tier override.
+
+| Field   | Type   | Default | Notes                                                                 |
+|---------|--------|---------|-----------------------------------------------------------------------|
+| `file`  | string | `""`    | Absolute path to the `KEY=VALUE` secrets file. Must be mode `0600`.   |
+
+See [`concepts/secrets.md`](../concepts/secrets.md) for the file
+format, posture, and which notifier configs honor `${VAR}` today.
+
+```toml
+[secrets]
+file = "/run/secrets/dotagent.env"   # populated by a secret manager
 ```
 
 ---

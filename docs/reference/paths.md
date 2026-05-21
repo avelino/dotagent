@@ -35,6 +35,7 @@ $DOTAGENT_HOME/
 ├── agents/                       # YOUR manifests (or symlinks to them)
 ├── plugins/                      # YOUR custom plugin binaries (optional)
 ├── config.toml                   # global config (optional)
+├── secrets.env                   # daemon-loaded KEY=VALUE secrets (optional, 0600)
 ├── state/                        # daemon state (read-write, machine-managed)
 ├── logs/                         # operational logs (rotated)
 └── audit.log                     # append-only hash-chained event log
@@ -45,6 +46,7 @@ $DOTAGENT_HOME/
 | `agents/`        | **you**            | daemon, CLI         | Manifests OR symlinks to manifests living elsewhere (e.g., dotfiles).  |
 | `plugins/`       | **you**            | `PluginClient`      | Per-user plugin binaries. Skip if you install plugins via brew / cargo. |
 | `config.toml`    | **you** (optional) | daemon              | Schema in [`config-reference.md`](../guides/config-reference.md).      |
+| `secrets.env`    | **you** (optional) | daemon              | KEY=VALUE secrets for `${VAR}` interpolation in notifier configs. **Must be mode 0600.** See [`concepts/secrets.md`](../concepts/secrets.md). |
 | `state/`         | daemon, runner     | daemon, CLI         | **Don't edit by hand.**                                                |
 | `logs/`          | daemon             | you (via `dotagent logs` / `tail`) | Rotated daily, gzipped after 1d, deleted after retention horizon. |
 | `audit.log`      | daemon             | you (`tail`, `jq`)  | Append-only, hash-chained. **NEVER rotated.**                          |
@@ -311,6 +313,8 @@ Audit events emitted by dotagent:
 | `phantom_agent_detected`  | Discovered agent not in `known_manifests.json`                              | critical      |
 | `audit_chain_broken`      | Hash chain verification failed at line N                                    | critical      |
 | `config_reloaded`         | SIGHUP picked up changes to `config.toml`                                   | notice        |
+| `secrets_loaded`          | Daemon read `secrets.env`; payload has `path`, `key_count`, `unresolved_references` (no values, no `op://` paths) | notice |
+| `secrets_refused`         | Daemon rejected `secrets.env` (insecure mode, parse, or IO)                 | critical      |
 
 `Critical` severity drives out-of-band notifier dispatch. Defined in
 [`crates/dotagent-core/src/audit.rs`](../../crates/dotagent-core/src/audit.rs).

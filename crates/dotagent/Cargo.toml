@@ -18,6 +18,7 @@ dotagent-scheduler.workspace = true
 dotagent-runner.workspace = true
 dotagent-state.workspace = true
 dotagent-plugin.workspace = true
+dotagent-secrets.workspace = true
 dotagent-telemetry.workspace = true
 dotagent-unit-gen.workspace = true
 

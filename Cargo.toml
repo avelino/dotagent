@@ -8,6 +8,7 @@ members = [
   "crates/dotagent-state",
   "crates/dotagent-plugin",
   "crates/dotagent-notify",
+  "crates/dotagent-secrets",
   "crates/dotagent-telemetry",
   "crates/dotagent-unit-gen",
   "plugins/preflight-warp",
@@ -35,6 +36,7 @@ dotagent-runner = { path = "crates/dotagent-runner", version = "0.1.1" }
 dotagent-state = { path = "crates/dotagent-state", version = "0.1.1" }
 dotagent-plugin = { path = "crates/dotagent-plugin", version = "0.1.1" }
 dotagent-notify = { path = "crates/dotagent-notify", version = "0.1.1" }
+dotagent-secrets = { path = "crates/dotagent-secrets", version = "0.1.1" }
 dotagent-telemetry = { path = "crates/dotagent-telemetry", version = "0.1.1" }
 dotagent-unit-gen = { path = "crates/dotagent-unit-gen", version = "0.1.1" }
 
