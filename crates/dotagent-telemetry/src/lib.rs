@@ -23,7 +23,7 @@ use dotagent_core::config::{Config, TelemetryConfig};
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 use thiserror::Error;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -43,7 +43,7 @@ pub enum TelemetryError {
 /// Drop this when the daemon exits to flush buffered logs + spans.
 pub struct Guard {
     _file_guard: WorkerGuard,
-    tracer_provider: Option<TracerProvider>,
+    tracer_provider: Option<SdkTracerProvider>,
 }
 
 impl Drop for Guard {
@@ -102,7 +102,7 @@ pub fn init(config: &Config, log_dir_override: Option<PathBuf>) -> Result<Guard,
 
 fn build_otel_tracer(
     cfg: &TelemetryConfig,
-) -> Result<(opentelemetry_sdk::trace::Tracer, TracerProvider), TelemetryError> {
+) -> Result<(opentelemetry_sdk::trace::Tracer, SdkTracerProvider), TelemetryError> {
     let mut attrs = vec![
         KeyValue::new("service.name", cfg.service_name.clone()),
         KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
@@ -110,7 +110,7 @@ fn build_otel_tracer(
     for (k, v) in &cfg.resource {
         attrs.push(KeyValue::new(k.clone(), v.clone()));
     }
-    let resource = Resource::new(attrs);
+    let resource = Resource::builder().with_attributes(attrs).build();
 
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
@@ -118,8 +118,8 @@ fn build_otel_tracer(
         .build()
         .map_err(|e| TelemetryError::Otel(e.to_string()))?;
 
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
 
