@@ -16,12 +16,12 @@ use chrono::Local;
 use dotagent_core::{audit::AuditEvent, AgentManifest, Heartbeat};
 use dotagent_plugin::PluginClient;
 use dotagent_state::{slug_from_args, AuditLog, StateStore};
+use dotagent_supervisor::{ProcessKind, ProcessOwner, SpawnSpec, Supervisor, SupervisorError};
 use serde::Serialize;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::info;
 
 pub type Result<T> = std::result::Result<T, RunnerError>;
 
@@ -71,6 +71,7 @@ pub struct RunSpec<'a> {
 // (full stdout for sinks, tail for notifies) is a future refactor.
 const TAIL_LINES: usize = 500;
 const SIGKILL_GRACE_SECONDS: u64 = 5;
+const TIMED_OUT_EXIT_CODE: i32 = 124;
 
 /// Aggregate context for `run_with_hooks`. Caller passes the orchestrator's
 /// shared state (audit log + plugin client) so the runner can fire lifecycle
@@ -79,6 +80,11 @@ pub struct RunContext<'a> {
     pub state: &'a StateStore,
     pub plugins: Option<&'a PluginClient>,
     pub audit: Option<&'a AuditLog>,
+    /// Shared subprocess supervisor. When `None`, the runner creates a
+    /// per-call supervisor — convenient for ad-hoc `dotagent run`, but the
+    /// daemon should always pass its singleton so `status`/`doctor` can see
+    /// the live agent.
+    pub supervisor: Option<&'a Supervisor>,
 }
 
 /// Outcome variants produced by `run_with_hooks`.
@@ -143,7 +149,7 @@ pub async fn run_with_hooks(
     }
 
     // 2) Spawn (consumes `spec`, but we kept the refs we still need)
-    let outcome = run(spec, ctx.state).await?;
+    let outcome = run(spec, ctx.state, ctx.supervisor).await?;
 
     // 3) Audit
     if let Some(log) = ctx.audit {
@@ -211,7 +217,15 @@ pub async fn run_with_hooks(
 /// Run the agent with timeout, stdio capture, heartbeat lifecycle. Returns the
 /// outcome — the caller is responsible for deciding what notifications to
 /// emit.
-pub async fn run(spec: RunSpec<'_>, state: &StateStore) -> Result<RunOutcome> {
+///
+/// When `supervisor` is `None`, a one-shot supervisor is created for this
+/// call. Pass the daemon's singleton to make the agent visible in
+/// `dotagent status`/`doctor` and to share the kill-on-shutdown machinery.
+pub async fn run(
+    spec: RunSpec<'_>,
+    state: &StateStore,
+    supervisor: Option<&Supervisor>,
+) -> Result<RunOutcome> {
     let name = spec.manifest.agent.name.clone();
     let slug = slug_from_args(spec.args);
 
@@ -270,9 +284,31 @@ pub async fn run(spec: RunSpec<'_>, state: &StateStore) -> Result<RunOutcome> {
     info!(agent = %name, schedule = %spec.schedule_id, slug = %slug, "running agent");
 
     let timeout_sec = spec.manifest.agent.timeout_seconds;
-    let mut child = cmd.spawn().map_err(|e| RunnerError::Spawn(e.to_string()))?;
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
+    let owned_supervisor;
+    let sup = match supervisor {
+        Some(s) => s,
+        None => {
+            owned_supervisor = Supervisor::with_grace(Duration::from_secs(SIGKILL_GRACE_SECONDS));
+            &owned_supervisor
+        }
+    };
+    let spawn_spec = SpawnSpec {
+        kind: ProcessKind::Agent,
+        owner: ProcessOwner {
+            agent: name.clone(),
+            schedule: Some(spec.schedule_id.to_string()),
+            hook_event: None,
+            plugin: None,
+        },
+        deadline: Duration::from_secs(timeout_sec),
+        label: format!("{name}.{}", spec.schedule_id),
+    };
+    let mut handle = sup
+        .spawn_supervised(cmd, spawn_spec)
+        .await
+        .map_err(|e| RunnerError::Spawn(e.to_string()))?;
+    let mut stdout = handle.take_stdout().expect("piped stdout");
+    let mut stderr = handle.take_stderr().expect("piped stderr");
 
     // Per-agent log file: tee everything stdout+stderr writes into
     // `$DOTAGENT_HOME/logs/agents/<name>/<name>.log.YYYY-MM-DD`. Keeping
@@ -324,20 +360,10 @@ pub async fn run(spec: RunSpec<'_>, state: &StateStore) -> Result<RunOutcome> {
         buf
     });
 
-    let (status, timed_out) = match timeout(Duration::from_secs(timeout_sec), child.wait()).await {
-        Ok(status) => (status?, false),
-        Err(_elapsed) => {
-            warn!(agent = %name, "timeout after {timeout_sec}s — SIGTERM");
-            #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                let _ = nix_send_signal(pid, libc_sigterm());
-                tokio::time::sleep(Duration::from_secs(SIGKILL_GRACE_SECONDS)).await;
-            }
-            // child.kill() sends SIGKILL on Unix and TerminateProcess on Windows.
-            let _ = child.kill().await;
-            let status = child.wait().await?;
-            (status, true)
-        }
+    let (status_opt, timed_out) = match handle.wait_status().await {
+        Ok((status, timed_out)) => (Some(status), timed_out),
+        Err(SupervisorError::Io(e)) => return Err(RunnerError::Io(e)),
+        Err(e) => return Err(RunnerError::Spawn(e.to_string())),
     };
 
     let stdout_buf = stdout_task.await.unwrap_or_default();
@@ -345,7 +371,11 @@ pub async fn run(spec: RunSpec<'_>, state: &StateStore) -> Result<RunOutcome> {
 
     let finish = Local::now();
     let duration = (finish - start).num_seconds();
-    let exit_code = status.code().unwrap_or(if timed_out { 124 } else { -1 });
+    let exit_code = status_opt.and_then(|s| s.code()).unwrap_or(if timed_out {
+        TIMED_OUT_EXIT_CODE
+    } else {
+        -1
+    });
 
     if !spec.dry_run {
         let mut hb = state
@@ -411,20 +441,4 @@ fn tail_lines(s: &str, n: usize) -> (String, usize) {
     let total = lines.len();
     let start = total.saturating_sub(n);
     (lines[start..].join("\n"), start)
-}
-
-#[cfg(unix)]
-fn libc_sigterm() -> i32 {
-    15
-}
-
-#[cfg(unix)]
-fn nix_send_signal(pid: u32, sig: i32) -> std::io::Result<()> {
-    // SAFETY: kill(2) with a known PID and signal number is a stable syscall.
-    let rc = unsafe { libc::kill(pid as i32, sig) };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
 }

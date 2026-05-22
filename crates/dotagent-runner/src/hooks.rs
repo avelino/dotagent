@@ -47,7 +47,13 @@ pub async fn run_preflight(
             message: None,
             config: pref.config.clone(),
         };
-        let result = client.invoke(&pref.plugin, &payload).await;
+        let result = client
+            .invoke_with(
+                &pref.plugin,
+                &payload,
+                pref.timeout_seconds.map(std::time::Duration::from_secs),
+            )
+            .await;
         let (ok, response) = match &result {
             Ok(r) => (r.ok, Some(r)),
             Err(e) => {
@@ -157,7 +163,14 @@ async fn fire_hooks(
             message: Some(message.into()),
             config: hook.config.clone(),
         };
-        let resp: PluginResponse = match client.invoke(&hook.plugin, &payload).await {
+        let resp: PluginResponse = match client
+            .invoke_with(
+                &hook.plugin,
+                &payload,
+                hook.timeout_seconds.map(std::time::Duration::from_secs),
+            )
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 warn!(plugin = %hook.plugin, error = %e, "hook plugin invocation failed");

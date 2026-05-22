@@ -8,6 +8,7 @@ use chrono::{Local, TimeZone};
 use dotagent_core::{AgentManifest, Heartbeat, Schedule};
 use dotagent_scheduler::{health_state, HealthState, ResolvedPolicy};
 use dotagent_state::{slug_from_args, StateStore};
+use dotagent_supervisor::ProcessInfo;
 
 use crate::discovery::{self, DiscoveredAgent};
 
@@ -39,7 +40,50 @@ pub async fn run() -> Result<()> {
     }
 
     print_dashboard(&rows, now);
+    if let Some(snap) = read_supervisor_snapshot() {
+        print_live_subprocesses(&snap);
+    }
     Ok(())
+}
+
+/// Read the daemon's last-written supervisor snapshot. Returns `None` if the
+/// daemon isn't running (file missing) or the file is unreadable.
+pub fn read_supervisor_snapshot() -> Option<Vec<ProcessInfo>> {
+    let path = dotagent_state::paths::supervisor_snapshot_file();
+    let raw = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
+
+fn print_live_subprocesses(snap: &[ProcessInfo]) {
+    if snap.is_empty() {
+        return;
+    }
+    println!();
+    println!("─── Live subprocesses ({} running) ───", snap.len());
+    println!(
+        "{:<10} {:<8} {:<14} {:<30} AGE / DEADLINE",
+        "KIND", "PID", "OWNER", "LABEL"
+    );
+    let sep = "─".repeat(100);
+    println!("{sep}");
+    // Sort: highest deadline_pct first — surfaces near-deadline processes.
+    let mut sorted: Vec<&ProcessInfo> = snap.iter().collect();
+    sorted.sort_by_key(|p| std::cmp::Reverse(p.deadline_pct));
+    for p in sorted {
+        let icon = if p.deadline_pct >= 100 {
+            "🔴"
+        } else if p.deadline_pct >= 80 {
+            "⚠️ "
+        } else {
+            "  "
+        };
+        let kind = format!("{:?}", p.kind).to_lowercase();
+        let owner = p.owner.agent.as_str();
+        println!(
+            "{icon} {kind:<8} {:<8} {:<14} {:<30} {}s / {}s ({}%)",
+            p.pid, owner, p.label, p.age_seconds, p.deadline_seconds, p.deadline_pct
+        );
+    }
 }
 
 fn compute_row(

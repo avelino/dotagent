@@ -184,6 +184,12 @@ pub struct PluginRef {
     /// `["given_up", "recovered"]`). Empty means "all events".
     #[serde(default)]
     pub events: Vec<String>,
+    /// Optional per-hook deadline override (seconds). When set, the
+    /// supervisor uses it instead of the global default for the plugin
+    /// client's `invoke` verb. Useful for hooks that legitimately need
+    /// more time (e.g. a sink writing many blocks to a slow upstream API).
+    #[serde(default)]
+    pub timeout_seconds: Option<u64>,
 }
 
 impl AgentManifest {

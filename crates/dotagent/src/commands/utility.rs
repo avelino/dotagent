@@ -179,6 +179,13 @@ pub async fn reload() -> Result<()> {
 /// manual triggering after a failure. Uses the schedule's `args` if a
 /// schedule id is provided; otherwise uses the first declared schedule's
 /// args.
+///
+/// Visibility note: `run-now` runs in its OWN process and instantiates its
+/// OWN supervisor — separate from the daemon's. If a daemon is also
+/// running, `dotagent status` only reflects the daemon's supervisor; the
+/// subprocess tree spawned by this call won't appear there. Tracked as a
+/// follow-up to issue #36 (unify via per-PID snapshot files or a real
+/// daemon-side IPC).
 pub async fn run_now(agent_name: String, schedule: Option<String>, format: Format) -> Result<()> {
     let agent = discovery::find_by_name(&agent_name)?;
     let sched = match schedule {
@@ -208,6 +215,7 @@ pub async fn run_now(agent_name: String, schedule: Option<String>, format: Forma
         state: &state,
         plugins: Some(&plugins),
         audit: Some(&audit),
+        supervisor: Some(plugins.supervisor()),
     };
     let started = Local::now();
     let outcome = run_with_hooks(spec, &ctx).await?;

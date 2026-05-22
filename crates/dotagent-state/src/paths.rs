@@ -78,6 +78,12 @@ pub fn daemon_pid_file() -> PathBuf {
     state_dir().join("daemon.pid")
 }
 
+/// Live snapshot of subprocesses tracked by the supervisor. The daemon
+/// rewrites this file on a tick; `dotagent status`/`doctor` read it.
+pub fn supervisor_snapshot_file() -> PathBuf {
+    state_dir().join("supervisor.json")
+}
+
 pub fn logs_dir() -> PathBuf {
     home().join("logs")
 }
