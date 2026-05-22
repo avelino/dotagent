@@ -68,6 +68,10 @@ args = []
 [[preflight]]
 plugin = "preflight-warp"
 config = { connect_command = "warp-cli connect" }
+# Optional per-hook deadline (seconds). Default: 30s for preflight,
+# 300s for on_success/on_failure invocations. The supervisor kills the
+# whole process group (TERM → 5s grace → KILL) when exceeded.
+# timeout_seconds = 60
 
 # Optional: notifications (built into the daemon, no plugin subprocess)
 [[notifiers]]
@@ -86,6 +90,7 @@ events = ["given_up"]
 [[on_success]]
 plugin = "sink-file"
 config = { path = "/tmp/last-success.txt", mode = "overwrite" }
+# timeout_seconds = 600                # override default 300s for slow sinks
 
 # Optional: security intent (schema-only in v0 — see threat-model)
 [security]
@@ -117,6 +122,13 @@ These two arrays still drive the plugin protocol (`dotagent-plugin-<name>`
 binaries). They are reserved for **sink-style** hooks (persist output,
 publish to Roam, etc.). For notifications, prefer `[[notifiers]]` — it's
 faster, has fewer moving parts, and ships with the daemon.
+
+| Field             | Type                | Default | Notes                                                                                  |
+|-------------------|---------------------|---------|----------------------------------------------------------------------------------------|
+| `plugin`          | `string`            | —       | Short name; resolved to `dotagent-plugin-<plugin>` via the plugin client.              |
+| `config`          | `object`            | `{}`    | Opaque JSON forwarded to the plugin's `invoke` verb.                                   |
+| `events`          | `string[]`          | `[]`    | Filter (empty = all). For `on_failure`: `attempt_failed`, `given_up`, `recovered`.    |
+| `timeout_seconds` | `integer` (>0)      | `300`   | Per-hook deadline. Supervisor kills the process group on overrun. Same field on `[[preflight]]` (default `30`). |
 
 ### Schedule types
 

@@ -18,7 +18,9 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::time::Duration;
 
+use dotagent_supervisor::{ProcessKind, ProcessOwner, SpawnSpec, Supervisor, SupervisorError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -41,6 +43,59 @@ pub enum PluginError {
         code: i32,
         stderr: String,
     },
+    #[error("plugin {plugin}.{verb} exceeded {deadline_seconds}s — killed")]
+    TimedOut {
+        plugin: String,
+        verb: String,
+        deadline_seconds: u64,
+    },
+    #[error("supervisor error: {0}")]
+    Supervisor(#[from] SupervisorError),
+}
+
+/// Per-verb + per-kind deadlines enforced by the supervisor. Sensible
+/// defaults; can be overridden via `PluginClient::with_timeouts` (e.g. when
+/// the daemon reads a global config) or per-hook via the manifest's
+/// `[[on_success]] timeout_seconds = …`.
+#[derive(Debug, Clone)]
+pub struct PluginTimeouts {
+    pub info: Duration,
+    pub validate: Duration,
+    /// Generic invoke fallback — used when `invoke_with` is called without a
+    /// resolvable `PluginKind` (today none of the call sites hit this, but
+    /// keep it for forward-compat with future verbs).
+    pub invoke: Duration,
+    /// `[[preflight]]` invocations — short by design; preflight is a guard.
+    pub preflight: Duration,
+    /// `[[on_success]]` sinks — generous; sinks do real work (HTTP, file IO).
+    pub sink: Duration,
+    /// `[[on_failure]]` and notifier-via-plugin — fast, fire-and-forget.
+    pub notify: Duration,
+}
+
+impl Default for PluginTimeouts {
+    fn default() -> Self {
+        Self {
+            info: Duration::from_secs(10),
+            validate: Duration::from_secs(30),
+            invoke: Duration::from_secs(300),
+            preflight: Duration::from_secs(30),
+            sink: Duration::from_secs(300),
+            notify: Duration::from_secs(15),
+        }
+    }
+}
+
+impl PluginTimeouts {
+    /// Resolve the default deadline for a `PluginKind`. Used by `invoke_with`
+    /// when the caller didn't pass an explicit override.
+    pub fn for_kind(&self, kind: PluginKind) -> Duration {
+        match kind {
+            PluginKind::Preflight => self.preflight,
+            PluginKind::Sink => self.sink,
+            PluginKind::Notify => self.notify,
+        }
+    }
 }
 
 /// What kind of role a plugin plays.
@@ -92,13 +147,28 @@ pub struct InvokePayload {
     pub config: serde_json::Value,
 }
 
-/// Resolves a plugin short name to a binary path.
+/// Resolves a plugin short name to a binary path and runs the protocol verbs
+/// under the supervisor's deadline + kill-tree semantics.
+#[derive(Clone)]
 pub struct PluginClient {
     search_paths: Vec<PathBuf>,
+    supervisor: Supervisor,
+    timeouts: PluginTimeouts,
+}
+
+impl std::fmt::Debug for PluginClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginClient")
+            .field("search_paths", &self.search_paths)
+            .field("timeouts", &self.timeouts)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PluginClient {
-    /// Build the client from the standard discovery order.
+    /// Build the client from the standard discovery order with an in-process
+    /// supervisor and default timeouts. The daemon should call
+    /// `with_supervisor` to pass its singleton supervisor instead.
     pub fn from_environment() -> Self {
         let mut paths = Vec::new();
         if let Ok(env_path) = std::env::var("DOTAGENT_PLUGIN_PATH") {
@@ -114,13 +184,36 @@ impl PluginClient {
         paths.push(PathBuf::from("/usr/local/lib/dotagent/plugins"));
         Self {
             search_paths: paths,
+            supervisor: Supervisor::new(),
+            timeouts: PluginTimeouts::default(),
         }
     }
 
     pub fn with_search_paths(paths: Vec<PathBuf>) -> Self {
         Self {
             search_paths: paths,
+            supervisor: Supervisor::new(),
+            timeouts: PluginTimeouts::default(),
         }
+    }
+
+    /// Use a shared supervisor (e.g. the daemon's singleton) instead of a
+    /// per-client one. Required for `dotagent status`/`doctor` to see plugin
+    /// processes spawned by hooks.
+    #[must_use]
+    pub fn with_supervisor(mut self, supervisor: Supervisor) -> Self {
+        self.supervisor = supervisor;
+        self
+    }
+
+    #[must_use]
+    pub fn with_timeouts(mut self, timeouts: PluginTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    pub fn timeouts(&self) -> &PluginTimeouts {
+        &self.timeouts
     }
 
     /// Resolve `<short_name>` to a binary path. Falls back to looking up
@@ -142,7 +235,31 @@ impl PluginClient {
 
     pub async fn info(&self, short_name: &str) -> Result<PluginInfo> {
         let bin = self.resolve(short_name)?;
-        let output = Command::new(&bin).arg("info").output().await?;
+        let mut cmd = Command::new(&bin);
+        cmd.arg("info");
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let spec = SpawnSpec {
+            kind: ProcessKind::PluginInfo,
+            owner: ProcessOwner {
+                agent: "system".into(),
+                plugin: Some(short_name.into()),
+                ..Default::default()
+            },
+            deadline: self.timeouts.info,
+            label: format!("{short_name}.info"),
+        };
+        let handle = self.supervisor.spawn_supervised(cmd, spec).await?;
+        let output = match handle.wait_with_output().await {
+            Ok(o) => o,
+            Err(SupervisorError::TimedOut { deadline, .. }) => {
+                return Err(PluginError::TimedOut {
+                    plugin: short_name.into(),
+                    verb: "info".into(),
+                    deadline_seconds: deadline.as_secs(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
         if !output.status.success() {
             return Err(PluginError::Failed {
                 plugin: short_name.into(),
@@ -158,15 +275,60 @@ impl PluginClient {
         short_name: &str,
         config: &serde_json::Value,
     ) -> Result<PluginResponse> {
-        self.run_with_stdin(short_name, "validate", config).await
+        let owner = ProcessOwner {
+            agent: "system".into(),
+            plugin: Some(short_name.into()),
+            ..Default::default()
+        };
+        self.run_with_stdin(
+            short_name,
+            "validate",
+            config,
+            owner,
+            ProcessKind::PluginValidate,
+            self.timeouts.validate,
+        )
+        .await
     }
 
+    /// Invoke the `invoke` verb with the default invoke timeout.
     pub async fn invoke(
         &self,
         short_name: &str,
         payload: &InvokePayload,
     ) -> Result<PluginResponse> {
-        self.run_with_stdin(short_name, "invoke", payload).await
+        self.invoke_with(short_name, payload, None).await
+    }
+
+    /// Invoke the `invoke` verb with an optional per-call deadline override.
+    /// Used by manifest hooks that declare `timeout_seconds` on the
+    /// `[[on_success]]` / `[[preflight]]` entry.
+    pub async fn invoke_with(
+        &self,
+        short_name: &str,
+        payload: &InvokePayload,
+        deadline_override: Option<Duration>,
+    ) -> Result<PluginResponse> {
+        let kind = match payload.kind {
+            PluginKind::Notify => ProcessKind::Notify,
+            PluginKind::Preflight => ProcessKind::Preflight,
+            PluginKind::Sink => ProcessKind::Sink,
+        };
+        let owner = ProcessOwner {
+            agent: payload.agent.clone(),
+            schedule: Some(payload.schedule.clone()),
+            hook_event: Some(payload.event.clone()),
+            plugin: Some(short_name.into()),
+        };
+        self.run_with_stdin(
+            short_name,
+            "invoke",
+            payload,
+            owner,
+            kind,
+            deadline_override.unwrap_or_else(|| self.timeouts.for_kind(payload.kind)),
+        )
+        .await
     }
 
     async fn run_with_stdin<T: Serialize>(
@@ -174,24 +336,44 @@ impl PluginClient {
         short_name: &str,
         verb: &str,
         payload: &T,
+        owner: ProcessOwner,
+        kind: ProcessKind,
+        deadline: Duration,
     ) -> Result<PluginResponse> {
         let bin = self.resolve(short_name)?;
-        debug!(?bin, %verb, plugin = %short_name, "invoking plugin");
+        debug!(?bin, %verb, plugin = %short_name, deadline_secs = deadline.as_secs(), "invoking plugin");
 
-        let mut child = Command::new(&bin)
-            .arg(verb)
+        let mut cmd = Command::new(&bin);
+        cmd.arg(verb)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
+            .stderr(Stdio::piped());
 
-        if let Some(mut stdin) = child.stdin.take() {
+        let spec = SpawnSpec {
+            kind,
+            owner,
+            deadline,
+            label: format!("{short_name}.{verb}"),
+        };
+        let mut handle = self.supervisor.spawn_supervised(cmd, spec).await?;
+
+        if let Some(mut stdin) = handle.take_stdin() {
             let bytes = serde_json::to_vec(payload)?;
             stdin.write_all(&bytes).await?;
             stdin.shutdown().await?;
         }
 
-        let output = child.wait_with_output().await?;
+        let output = match handle.wait_with_output().await {
+            Ok(o) => o,
+            Err(SupervisorError::TimedOut { deadline, .. }) => {
+                return Err(PluginError::TimedOut {
+                    plugin: short_name.into(),
+                    verb: verb.into(),
+                    deadline_seconds: deadline.as_secs(),
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
         if !output.status.success() {
             return Err(PluginError::Failed {
                 plugin: short_name.into(),
@@ -200,6 +382,12 @@ impl PluginClient {
             });
         }
         Ok(serde_json::from_slice(&output.stdout)?)
+    }
+
+    /// Borrow the underlying supervisor — used by `dotagent status`/`doctor`
+    /// to enumerate live subprocesses regardless of who spawned them.
+    pub fn supervisor(&self) -> &Supervisor {
+        &self.supervisor
     }
 }
 

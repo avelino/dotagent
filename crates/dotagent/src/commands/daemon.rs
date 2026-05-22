@@ -29,6 +29,7 @@ use dotagent_state::{
     manifest_cache::{hash_manifest_file, KnownManifest, ManifestCache},
     slug_from_args, StateStore,
 };
+use dotagent_supervisor::{Supervisor, DEFAULT_REAPER_TICK};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 
@@ -66,7 +67,19 @@ impl Drop for PidGuard {
 pub async fn run() -> Result<()> {
     let state = StateStore::from_home().context("opening state store")?;
     let audit = AuditLog::from_home().context("opening audit log")?;
-    let plugins = PluginClient::from_environment();
+    // Singleton supervisor: every plugin invocation (preflight / on_success /
+    // on_failure / notify-via-plugin) AND every agent spawn goes through it,
+    // so `dotagent status`/`doctor` can see the live subprocess tree and
+    // `shutdown` can reap everything on SIGTERM.
+    let supervisor = Supervisor::new();
+    let _reaper = supervisor.start_reaper(DEFAULT_REAPER_TICK);
+    // Periodic snapshot dump so `dotagent status` and `dotagent doctor`
+    // (separate processes) can see what the daemon is supervising.
+    let _snapshot_writer = supervisor.start_snapshot_writer(
+        dotagent_state::paths::supervisor_snapshot_file(),
+        Duration::from_secs(2),
+    );
+    let plugins = PluginClient::from_environment().with_supervisor(supervisor.clone());
     let cache = ManifestCache::from_home().context("opening manifest cache")?;
 
     // Write our PID so `dotagent reload` / `dotagent status` can find us.
@@ -164,6 +177,20 @@ pub async fn run() -> Result<()> {
     };
 
     info!(reason = exit_reason, "daemon stopping");
+    // Graceful supervisor shutdown — SIGTERM every live subprocess, wait
+    // grace, SIGKILL stragglers. Without this, daemon exit would orphan
+    // long-running plugin invocations.
+    let pre_shutdown_live = supervisor.snapshot().len();
+    if pre_shutdown_live > 0 {
+        info!(
+            live_subprocesses = pre_shutdown_live,
+            "supervisor: reaping live subprocesses before exit"
+        );
+    }
+    supervisor.shutdown(Duration::from_secs(5)).await;
+    // Clear the snapshot so downstream CLIs don't show stale entries after
+    // the daemon exits.
+    let _ = std::fs::remove_file(dotagent_state::paths::supervisor_snapshot_file());
     audit.append(AuditEvent::DaemonStopped {
         reason: exit_reason.into(),
     })?;
@@ -576,6 +603,7 @@ async fn dispatch_one(
         state,
         plugins: Some(plugins),
         audit: Some(audit),
+        supervisor: Some(plugins.supervisor()),
     };
 
     let outcome = match run_with_hooks(spec, &ctx).await {

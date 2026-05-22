@@ -52,7 +52,8 @@ crates/                  # orchestrator (workspace de crates)
   dotagent-runner/       # spawn + timeout + heartbeat lifecycle + env injection
   dotagent-state/        # filesystem state (atomic write + flock) + paths
   dotagent-notify/       # notifiers built-in (desktop / imessage / slack / ntfy / pushover)
-  dotagent-plugin/       # PluginClient (subprocess + JSON)
+  dotagent-plugin/       # PluginClient (subprocess + JSON) — goes through supervisor
+  dotagent-supervisor/   # subprocess lifecycle: deadlines, kill-tree (POSIX pgroup), live registry
   dotagent-telemetry/    # tracing + JSON file rotation + OTLP export + retention
   dotagent-unit-gen/     # launchd plist + systemd unit generation
 
@@ -77,7 +78,9 @@ docs/
 | Novo tipo compartilhado | `dotagent-core` |
 | Função de tempo / agendamento | `dotagent-scheduler` (sem IO!) |
 | IO de filesystem (state) | `dotagent-state` |
-| Spawn de subprocess | `dotagent-runner` |
+| Spawn de subprocess (agent) | `dotagent-runner` (chama `dotagent-supervisor`) |
+| Spawn de subprocess (plugin) | `dotagent-plugin` (chama `dotagent-supervisor`) |
+| Process-group / kill-tree / deadline | `dotagent-supervisor` (NUNCA spawnar `Command` direto fora dele) |
 | Geração de plist/systemd | `dotagent-unit-gen` |
 | Setup de logs / OTel / retention | `dotagent-telemetry` |
 | Novo subcomando CLI | `crates/dotagent/src/commands/` |

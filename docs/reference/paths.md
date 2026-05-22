@@ -128,8 +128,47 @@ state/
 ├── plugins/<plugin>/<key>.json
 ├── notify/<driver>/<slug>.json
 ├── known_manifests.json
+├── supervisor.json                 # live subprocess registry (daemon → CLI)
 └── daemon.pid
 ```
+
+### `state/supervisor.json`
+
+Snapshot of every subprocess the daemon is supervising right now (agents
++ plugin invocations). The daemon rewrites this file every 2s; out-of-
+process consumers (`dotagent status`, `dotagent doctor`) read it to
+surface live processes with age vs deadline. Cleared on daemon exit.
+
+```jsonc
+[
+  {
+    "id": 42,
+    "pid": 3980,
+    "kind": "sink",
+    "owner": {
+      "agent": "databricks-cost-daily",
+      "schedule": "weekly",
+      "hook_event": "success",
+      "plugin": "sink-roam"
+    },
+    "label": "sink-roam.invoke",
+    "started_at": "2026-05-21T15:00:00-0300",
+    "deadline_seconds": 300,
+    "age_seconds": 47,
+    "deadline_pct": 15
+  }
+]
+```
+
+Missing file ⇒ daemon not running. Stale file (>5s) ⇒ daemon may have
+crashed without graceful shutdown; treat with suspicion.
+
+> **Scope**: `supervisor.json` reflects ONLY the daemon's supervisor.
+> `dotagent run-now` / `dotagent run` invoked standalone instantiate their
+> own short-lived supervisor and do NOT publish to this file — they
+> aren't visible in `dotagent status`. Follow-up to issue #36 will
+> either emit per-PID snapshot files (`supervisor-<pid>.json`) or move
+> to a real IPC channel.
 
 ### `state/agents/<name>/<slug>.heartbeat.json`
 

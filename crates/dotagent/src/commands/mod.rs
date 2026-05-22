@@ -39,7 +39,9 @@ pub async fn run(name: String, schedule: String, dry_run: bool) -> Result<()> {
         dry_run,
         manifest_sha256: None,
     };
-    let outcome = runner_run(spec, &state).await.context("runner failed")?;
+    let outcome = runner_run(spec, &state, None)
+        .await
+        .context("runner failed")?;
 
     if !outcome.stdout_tail.is_empty() {
         println!("{}", outcome.stdout_tail);
@@ -236,6 +238,32 @@ pub async fn doctor() -> Result<()> {
                         &entry.sha256[..12.min(entry.sha256.len())],
                         &sha[..12.min(sha.len())]
                     );
+                    warnings += 1;
+                }
+            }
+        }
+    }
+    // Supervisor health — flag any live subprocess past 80% of its deadline.
+    if let Some(snap) = crate::commands::status::read_supervisor_snapshot() {
+        let mut hot = snap.iter().filter(|p| p.deadline_pct >= 80).peekable();
+        if hot.peek().is_some() {
+            println!();
+            println!("supervisor: subprocess(es) approaching deadline");
+            for p in hot {
+                let icon = if p.deadline_pct >= 100 { "✗" } else { "⚠" };
+                let kind = format!("{:?}", p.kind).to_lowercase();
+                println!(
+                    "    {icon} {kind}.{} pid={} agent={} age={}s deadline={}s ({}%)",
+                    p.label,
+                    p.pid,
+                    p.owner.agent,
+                    p.age_seconds,
+                    p.deadline_seconds,
+                    p.deadline_pct
+                );
+                if p.deadline_pct >= 100 {
+                    errors += 1;
+                } else {
                     warnings += 1;
                 }
             }
