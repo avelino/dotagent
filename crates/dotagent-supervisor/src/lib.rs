@@ -65,6 +65,20 @@ pub enum ProcessKind {
     Notify,
 }
 
+impl std::fmt::Display for ProcessKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            ProcessKind::Agent => "agent",
+            ProcessKind::PluginInfo => "plugin_info",
+            ProcessKind::PluginValidate => "plugin_validate",
+            ProcessKind::Preflight => "preflight",
+            ProcessKind::Sink => "sink",
+            ProcessKind::Notify => "notify",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Who is responsible for this process. All fields are best-effort labels —
 /// the supervisor never inspects them, but they show up in audit + status.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -419,8 +433,13 @@ fn project_info(
 // SupervisedHandle
 // ---------------------------------------------------------------------------
 
-/// Handle returned by `spawn_supervised`. Dropping without calling
-/// `wait_with_output` leaves the child to the reaper.
+/// Handle returned by `spawn_supervised`. Dropping without awaiting
+/// `wait_with_output` / `wait_status` deregisters the entry synchronously
+/// — the supervisor stops tracking it and the reaper will NOT enforce the
+/// deadline anymore. The underlying child is dropped with the handle and
+/// tokio reaps the process in the background; the caller has effectively
+/// opted out of supervised kill semantics. This trade-off exists to avoid
+/// `killpg`ing a pgid the OS may have reused for an unrelated process.
 pub struct SupervisedHandle {
     id: ProcId,
     child: Option<Child>,

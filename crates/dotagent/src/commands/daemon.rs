@@ -188,8 +188,11 @@ pub async fn run() -> Result<()> {
         );
     }
     supervisor.shutdown(Duration::from_secs(5)).await;
-    // Clear the snapshot so downstream CLIs don't show stale entries after
-    // the daemon exits.
+    // Abort the snapshot writer + reaper BEFORE removing the file — without
+    // this, the writer's next tick could recreate the file we just deleted,
+    // leaving a stale snapshot for the next CLI read.
+    drop(_snapshot_writer);
+    drop(_reaper);
     let _ = std::fs::remove_file(dotagent_state::paths::supervisor_snapshot_file());
     audit.append(AuditEvent::DaemonStopped {
         reason: exit_reason.into(),

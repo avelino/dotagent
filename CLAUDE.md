@@ -80,7 +80,7 @@ docs/
 | IO de filesystem (state) | `dotagent-state` |
 | Spawn de subprocess (agent) | `dotagent-runner` (chama `dotagent-supervisor`) |
 | Spawn de subprocess (plugin) | `dotagent-plugin` (chama `dotagent-supervisor`) |
-| Process-group / kill-tree / deadline | `dotagent-supervisor` (NUNCA spawnar `Command` direto fora dele) |
+| Process-group / kill-tree / deadline | `dotagent-supervisor` (todo subprocess **orquestrado** — agent, plugin, hook — passa por ele; helpers ad-hoc como `osascript` num driver de notify ficam livres) |
 | Geração de plist/systemd | `dotagent-unit-gen` |
 | Setup de logs / OTel / retention | `dotagent-telemetry` |
 | Novo subcomando CLI | `crates/dotagent/src/commands/` |

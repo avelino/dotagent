@@ -77,7 +77,7 @@ fn print_live_subprocesses(snap: &[ProcessInfo]) {
         } else {
             "  "
         };
-        let kind = format!("{:?}", p.kind).to_lowercase();
+        let kind = p.kind.to_string();
         let owner = p.owner.agent.as_str();
         println!(
             "{icon} {kind:<8} {:<8} {:<14} {:<30} {}s / {}s ({}%)",
