@@ -189,12 +189,14 @@ env_passthrough = ["PATH", "HOME", "LANG"]
 | `[[schedules]]`| `args`                 | `string[]`      | no       | `[]`                   |
 | `[[preflight]]`| `plugin`               | string          | yes      | —                      |
 | `[[preflight]]`| `config`               | table           | no       | `{}`                   |
+| `[[preflight]]`| `timeout_seconds`      | int             | no       | `30`                   |
 | `[[notifiers]]`| `driver`               | string          | yes      | —                      |
 | `[[notifiers]]`| `events`               | `string[]`      | no       | (all events)           |
 | `[[notifiers]]`| (driver-specific)      | varies          | varies   | varies                 |
-| `[[on_success]]`/`[[on_failure]]` | `plugin`    | string | yes      | —                      |
-| `[[on_success]]`/`[[on_failure]]` | `config`    | table  | no       | `{}`                   |
-| `[[on_success]]`/`[[on_failure]]` | `events`    | `string[]` | no  | (all events)           |
+| `[[on_success]]`/`[[on_failure]]` | `plugin`           | string     | yes | —                |
+| `[[on_success]]`/`[[on_failure]]` | `config`           | table      | no  | `{}`             |
+| `[[on_success]]`/`[[on_failure]]` | `events`           | `string[]` | no  | (all events)     |
+| `[[on_success]]`/`[[on_failure]]` | `timeout_seconds`  | int        | no  | `300` / `15`     |
 
 ---
 

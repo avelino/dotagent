@@ -152,7 +152,7 @@ surface live processes with age vs deadline. Cleared on daemon exit.
       "plugin": "sink-roam"
     },
     "label": "sink-roam.invoke",
-    "started_at": "2026-05-21T15:00:00-0300",
+    "started_at": "2026-05-21T15:00:00.123456-03:00",
     "deadline_seconds": 300,
     "age_seconds": 47,
     "deadline_pct": 15

@@ -107,35 +107,44 @@ async fn timeout_reaps_grandchildren_via_process_group() {
     );
 }
 
-/// Defense-in-depth: the per-handle timeout is bypassed when the handle is
-/// dropped without awaiting `wait_with_output`. The reaper must still kill
-/// the child within deadline + grace + tick.
+/// Defense-in-depth: when a handle is leaked via `mem::forget`, Drop never
+/// runs, so the synchronous deregister never fires. The reaper must still
+/// enforce the deadline. (Plain `drop` deregisters and is exercised by
+/// `drop_without_await_clears_registry`.)
 #[tokio::test(flavor = "current_thread")]
-async fn reaper_kills_handle_dropped_without_await() {
+async fn reaper_kills_forgotten_handle_via_deadline() {
     let sup = Supervisor::with_grace(Duration::from_millis(150));
     let _reaper = sup.start_reaper(Duration::from_millis(100));
 
     let handle = sup
-        .spawn_supervised(sh("sleep 30"), spec("dropped", 300))
+        .spawn_supervised(sh("sleep 30 & wait"), spec("forgotten", 300))
         .await
         .expect("spawn");
-    let pid = handle.pid().expect("pid") as i32;
-    drop(handle);
+    let pgid = handle.pid().expect("pid") as i32;
+    // Bypass Drop so the supervisor is forced to lean on the reaper.
+    std::mem::forget(handle);
 
-    // deadline(300) + grace(150) + tick(100) + slack
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    // deadline(300) + grace(150) + tick(100) + generous slack
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
 
     assert!(
         sup.snapshot().is_empty(),
         "reaper should have removed the entry"
     );
-
-    // SAFETY: kill(pid, 0) only probes existence; no mutation.
-    let alive_rc = unsafe { libc::kill(pid, 0) };
-    assert_ne!(
-        alive_rc, 0,
-        "pid {pid} should be gone after reaper sweep, but kill(0) succeeded"
-    );
+    // After killpg, every member of the group must be gone or zombie —
+    // never still running (S/R). Using `ps -g` keeps the check stable
+    // against macOS pid reuse.
+    let ps = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-g", &pgid.to_string()])
+        .output()
+        .expect("ps");
+    let stats = String::from_utf8_lossy(&ps.stdout);
+    for stat in stats.lines().map(str::trim).filter(|s| !s.is_empty()) {
+        assert!(
+            stat.starts_with('Z'),
+            "process group {pgid} still has a non-zombie entry stat={stat:?}"
+        );
+    }
 }
 
 /// Shutdown reaps everything live. Used by the daemon on SIGTERM.
@@ -207,6 +216,7 @@ async fn snapshot_reports_age_and_deadline_pct() {
         .spawn_supervised(sh("sleep 5"), spec("snap", 1_000))
         .await
         .expect("spawn");
+    let pid = handle.pid().expect("pid") as i32;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let snap = sup.snapshot();
@@ -214,11 +224,10 @@ async fn snapshot_reports_age_and_deadline_pct() {
     assert!(snap[0].deadline_pct > 0);
     assert!(snap[0].deadline_pct < 100);
 
-    drop(handle); // release; child will be reaped only if we run a reaper —
-                  // in this test we don't, so we kill it manually to clean up.
-    let _ = std::process::Command::new("pkill")
-        .args(["-P", &std::process::id().to_string()])
-        .output();
+    drop(handle); // release; we kill the specific pgroup we spawned —
+                  // never `pkill -P $$` because cargo test runs in parallel.
+                  // SAFETY: kill with a captured pid is a stable syscall.
+    let _ = unsafe { libc::killpg(pid, libc::SIGTERM) };
 }
 
 /// Issue #36 corrigir-1: race between handle's per-deadline timeout and the

@@ -251,7 +251,7 @@ pub async fn doctor() -> Result<()> {
             println!("supervisor: subprocess(es) approaching deadline");
             for p in hot {
                 let icon = if p.deadline_pct >= 100 { "✗" } else { "⚠" };
-                let kind = format!("{:?}", p.kind).to_lowercase();
+                let kind = p.kind.to_string();
                 println!(
                     "    {icon} {kind}.{} pid={} agent={} age={}s deadline={}s ({}%)",
                     p.label,
