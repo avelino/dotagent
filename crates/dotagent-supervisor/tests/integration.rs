@@ -139,50 +139,63 @@ async fn reaper_kills_handle_dropped_without_await() {
 }
 
 /// Shutdown reaps everything live. Used by the daemon on SIGTERM.
+///
+/// The handles are kept (not dropped) — `SupervisedHandle::Drop` now
+/// deregisters synchronously, which is correct semantics but would defeat
+/// `shutdown` if the test dropped them first. Concrete daemon code keeps
+/// its handles in `tokio::spawn`ed tasks; we mirror that here.
+///
+/// Validation is done at the **process-group** level. `ps -p <pid>` against
+/// individual pids was flaky on macOS CI because freed pids get reused by
+/// system processes (we'd see `stat="S<"` from an unrelated kernel helper).
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_signals_every_live_entry() {
-    let sup = Supervisor::with_grace(Duration::from_millis(150));
+    let sup = Supervisor::with_grace(Duration::from_millis(100));
+    // `sleep & wait` keeps the shell alive as pgroup leader with one child.
     let h1 = sup
-        .spawn_supervised(sh("sleep 30"), spec("a", 60_000))
+        .spawn_supervised(sh("sleep 30 & wait"), spec("a", 60_000))
         .await
         .expect("spawn a");
     let h2 = sup
-        .spawn_supervised(sh("sleep 30"), spec("b", 60_000))
+        .spawn_supervised(sh("sleep 30 & wait"), spec("b", 60_000))
         .await
         .expect("spawn b");
-    let p1 = h1.pid().unwrap() as i32;
-    let p2 = h2.pid().unwrap() as i32;
-    // Drop (don't forget!) so tokio's internal child-reaping task can
-    // waitpid() once the process is dead. mem::forget would leave the
-    // processes zombified — visible to `kill(pid, 0)` as alive.
-    drop(h1);
-    drop(h2);
+    let pg1 = h1.pid().expect("pid a") as i32;
+    let pg2 = h2.pid().expect("pid b") as i32;
 
-    sup.shutdown(Duration::from_millis(150)).await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Trigger shutdown in parallel with the waits. The handles stay alive
+    // (their wait_status owns them) so the registry remains populated when
+    // shutdown reads it.
+    let sup_for_shutdown = sup.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        sup_for_shutdown.shutdown(Duration::from_millis(100)).await;
+    });
 
-    for p in [p1, p2] {
+    let (st1, _) = h1.wait_status().await.expect("wait a");
+    let (st2, _) = h2.wait_status().await.expect("wait b");
+    assert!(
+        !st1.success(),
+        "child a should have been killed by shutdown"
+    );
+    assert!(
+        !st2.success(),
+        "child b should have been killed by shutdown"
+    );
+
+    // Give the OS a beat to clear the process group bookkeeping.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for pgid in [pg1, pg2] {
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "pid=", "-g", &pgid.to_string()])
+            .output()
+            .expect("ps");
+        let stdout = String::from_utf8_lossy(&ps.stdout);
         assert!(
-            is_dead_or_zombie(p),
-            "pid {p} should be dead or zombie after shutdown (stat={:?})",
-            proc_stat(p)
+            stdout.trim().is_empty(),
+            "process group {pgid} should be empty after shutdown, ps stdout=\n{stdout}"
         );
     }
-}
-
-/// Returns `true` when `pid` is no longer running. A zombie (`Z`) counts as
-/// dead — the process has exited and is only waiting for waitpid().
-fn is_dead_or_zombie(pid: i32) -> bool {
-    let stat = proc_stat(pid);
-    stat.is_empty() || stat.starts_with('Z')
-}
-
-fn proc_stat(pid: i32) -> String {
-    let out = std::process::Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "stat="])
-        .output()
-        .expect("ps");
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// Snapshot exposes `age_seconds` and `deadline_pct` so `dotagent status`
