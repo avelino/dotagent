@@ -17,6 +17,7 @@
 mod mcp;
 mod publish;
 mod sanitize;
+mod translate;
 
 use std::io::Read;
 use std::path::PathBuf;

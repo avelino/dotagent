@@ -118,24 +118,33 @@ fn parse_roam_ordinal_daily(s: &str) -> Option<String> {
 
 /// Convert the 2-level `Tree` (root + sections of L1 headers with L2 children)
 /// into Outl's tree shape: `{text, children: [{text, children: [{text}]}]}`.
+/// Every text node is passed through [`crate::translate::roam_to_outl`] so
+/// Roam-flavor constructs (`{{[[TODO]]}}`, ordinal dailies, …) render
+/// natively on the Outl side.
 fn tree_to_outl(tree: &Tree) -> Value {
     let sections: Vec<Value> = tree
         .sections
         .iter()
         .map(|s| {
-            let children: Vec<Value> = s.children.iter().map(|c| json!({ "text": c })).collect();
+            let children: Vec<Value> = s
+                .children
+                .iter()
+                .map(|c| json!({ "text": crate::translate::roam_to_outl(c) }))
+                .collect();
+            let header = crate::translate::roam_to_outl(&s.header);
             if children.is_empty() {
-                json!({ "text": s.header })
+                json!({ "text": header })
             } else {
-                json!({ "text": s.header, "children": children })
+                json!({ "text": header, "children": children })
             }
         })
         .collect();
 
+    let root = crate::translate::roam_to_outl(&tree.root);
     if sections.is_empty() {
-        json!({ "text": tree.root })
+        json!({ "text": root })
     } else {
-        json!({ "text": tree.root, "children": sections })
+        json!({ "text": root, "children": sections })
     }
 }
 
