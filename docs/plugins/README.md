@@ -31,6 +31,7 @@ Run AFTER a successful agent run. Persist the captured stdout somewhere.
 | Plugin                          | Platforms       | When to pick                                                            |
 |---------------------------------|-----------------|-------------------------------------------------------------------------|
 | [`sink-roam`](sink-roam.md)     | macOS + Linux   | Output is hierarchical markdown destined for Roam Research.             |
+| [`sink-outl`](sink-outl.md)     | macOS + Linux   | Output is hierarchical markdown destined for Outl (single batched call).|
 | [`sink-file`](sink-file.md)     | macOS + Linux   | Output is a single file (overwrite or append).                          |
 
 ## Discovery

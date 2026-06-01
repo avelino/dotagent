@@ -41,6 +41,7 @@
 * Sink
   * [sink-file](plugins/sink-file.md)
   * [sink-roam](plugins/sink-roam.md)
+  * [sink-outl](plugins/sink-outl.md)
 
 ## Security
 

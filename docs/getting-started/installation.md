@@ -147,6 +147,7 @@ cargo install --path crates/dotagent
 cargo install --path plugins/preflight-warp
 cargo install --path plugins/preflight-cmd
 cargo install --path plugins/sink-roam
+cargo install --path plugins/sink-outl
 cargo install --path plugins/sink-file
 ```
 

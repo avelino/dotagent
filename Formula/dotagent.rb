@@ -18,6 +18,7 @@
 #     bin/dotagent-plugin-preflight-warp
 #     bin/dotagent-plugin-preflight-cmd
 #     bin/dotagent-plugin-sink-roam
+#     bin/dotagent-plugin-sink-outl
 #     bin/dotagent-plugin-sink-file
 #     LICENSE
 #     README.md

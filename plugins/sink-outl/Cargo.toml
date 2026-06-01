@@ -1,0 +1,21 @@
+[package]
+name = "dotagent-plugin-sink-outl"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "dotagent plugin: publish agent output to Outl (via mcp CLI)."
+
+[[bin]]
+name = "dotagent-plugin-sink-outl"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+regex.workspace = true
+dirs.workspace = true
+chrono.workspace = true

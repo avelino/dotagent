@@ -235,6 +235,7 @@ These ship with the Homebrew install and live under
 | `preflight-warp`               | preflight   | Checks `warp-cli status` reports "Connected".                 |
 | `preflight-cmd`                | preflight   | Generic: runs an arbitrary command, checks exit code + stdout.|
 | `sink-roam`                    | sink        | Publishes hierarchical content to Roam Research via `mcp` CLI.|
+| `sink-outl`                    | sink        | Publishes hierarchical content to Outl via `mcp outl_batch`.   |
 | `sink-file`                    | sink        | Writes the message to a file (overwrite or append).           |
 
 > Notifications (`desktop`, `imessage`, `slack`, `ntfy`, `pushover`,
@@ -254,6 +255,9 @@ config = { connect_command = "warp-cli connect" }
 config = { command = "gh", args = ["auth", "status"], expect_exit = 0 }
 
 # sink-roam
+config = { page = "today", marker_regex = "#DORA.*2026-05-19" }
+
+# sink-outl
 config = { page = "today", marker_regex = "#DORA.*2026-05-19" }
 
 # sink-file

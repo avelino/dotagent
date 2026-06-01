@@ -481,6 +481,25 @@ Stdin expected format (parsed as hierarchy):
 Notes after `---` separator are cut.
 ```
 
+### `sink-outl` — publish agent stdout to an Outl page (via `mcp` CLI)
+
+Twin of `sink-roam` with identical config shape. Internally uses
+`outl_batch` so the delete + write happens in a single round-trip.
+
+```toml
+[[on_success]]
+plugin = "sink-outl"
+config = {
+  page = "today",                        # or "2026-06-01" / "April 22nd, 2026" / "acme/tech/aws"
+  marker_regex = "#DORA.*yesterday",     # idempotent replace (deletes match, re-creates)
+  mcp_binary = "~/.cargo/bin/mcp"        # default
+}
+```
+
+Outl-specific: daily slug is **ISO** (`2026-06-01`); the plugin also
+accepts Roam's ordinal form and normalizes it. Same stdin hierarchy
+convention as `sink-roam` (root + L1/L2, fences stripped, `---` cuts).
+
 ---
 
 ## 8. Events

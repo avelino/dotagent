@@ -40,11 +40,13 @@ phone only on `given_up`), and rate-limit semantics.
 
 ## Make output go somewhere
 
-A *sink plugin* persists the agent's stdout. Two come pre-installed:
+A *sink plugin* persists the agent's stdout. Three come pre-installed:
 
 - **`sink-file`** — write to a file (overwrite or append).
 - **`sink-roam`** — publish hierarchical content to Roam Research,
   idempotent via `marker_regex`.
+- **`sink-outl`** — same shape as `sink-roam` but targets Outl, with
+  a single batched delete + write call.
 
 ```toml
 [[on_success]]
@@ -53,7 +55,8 @@ config = { path = "/Users/me/reports/daily.md", mode = "overwrite" }
 ```
 
 → **Read**: [`docs/plugins/sink-file.md`](../plugins/sink-file.md),
-[`docs/plugins/sink-roam.md`](../plugins/sink-roam.md), and the
+[`docs/plugins/sink-roam.md`](../plugins/sink-roam.md),
+[`docs/plugins/sink-outl.md`](../plugins/sink-outl.md), and the
 overview at [`concepts/plugins.md`](../concepts/plugins.md).
 
 ---
