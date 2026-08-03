@@ -420,7 +420,7 @@ webhook_url = "https://discord.com/api/webhooks/..."
 
 Plugins are external binaries (`dotagent-plugin-<name>`) speaking JSON
 over stdio. The dotagent install (via Homebrew or release tarball)
-ships these four first-party plugins.
+ships these five first-party plugins.
 
 ### `preflight-warp` — abort if Cloudflare WARP is disconnected
 

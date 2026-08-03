@@ -4,7 +4,7 @@
 > `dotagent doctor` reporting "no agents discovered" (which is the
 > healthy state before you write your first agent).
 
-dotagent ships as a single Rust binary plus four first-party plugin
+dotagent ships as a single Rust binary plus five first-party plugin
 binaries. There's nothing to compile at runtime, nothing to install in
 a language ecosystem (no `node_modules`, no `pip`, no `pyenv`). Pick:
 
