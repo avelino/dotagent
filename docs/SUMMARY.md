@@ -22,6 +22,7 @@
 * [Troubleshooting](guides/troubleshooting.md)
 * [Config reference (`config.toml`)](guides/config-reference.md)
 * [Observability](guides/observability.md)
+* [LLM agents (`claude -p`)](guides/llm-agents.md)
 * [Migrating from the Fish framework](guides/migrating-from-fish.md)
 
 ## Reference

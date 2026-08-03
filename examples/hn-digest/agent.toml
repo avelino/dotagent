@@ -1,0 +1,77 @@
+# hn-digest — example LLM agent (bash + `claude -p`).
+#
+# Demonstrates:
+#   - the collect → prompt → run → render pipeline, in plain bash
+#   - `claude -p -` reading the user prompt from stdin, system prompt from
+#     a file next to the manifest
+#   - a script-level timeout that fires *before* the daemon's, so failures
+#     arrive as a clean error instead of a kill
+#   - retry policy tuned for LLM calls (transient failures are common,
+#     but each retry costs tokens)
+#
+# Full reasoning and the headless gotchas: docs/guides/llm-agents.md
+#
+# Install:
+#   ln -s "$PWD" ~/.config/dotagent/agents/hn-digest
+#   dotagent doctor
+#   dotagent run-now hn-digest
+
+[agent]
+name = "hn-digest"
+description = "Top Hacker News stories → claude -p → daily digest file."
+monitor = true
+# Generous, because the run is mostly spent waiting on the model. The
+# script's own timeout (HN_CLAUDE_TIMEOUT) is the one that should fire.
+timeout_seconds = 420
+
+[run]
+command = "bash"
+args = ["./agent.sh"]
+
+[env]
+inherit = true
+
+[env.extra]
+HN_STORY_COUNT = "20"
+HN_CLAUDE_MODEL = "sonnet"
+# Keep below [agent].timeout_seconds. The script then reports "claude
+# exited 142" instead of the supervisor killing the whole process group,
+# which tells you *which* step hung.
+HN_CLAUDE_TIMEOUT = "300"
+
+# An agent that hands data to a model deserves a declared blast radius more
+# than most: the model chooses what to do with the tools you granted it.
+# Enforcement is still landing (see docs/security/threat-model.md), so today
+# this documents intent and gives `doctor` something to audit.
+[security]
+allowed_commands = ["bash", "curl", "jq", "perl", "sed", "date", "claude"]
+allowed_plugins = ["sink-file"]
+network = ["hacker-news.firebaseio.com", "api.anthropic.com"]
+filesystem_writable = ["/tmp"]
+
+[defaults]
+# LLM calls fail transiently (rate limit, network). Two retries absorb
+# that. A third failure is something real, and each attempt costs tokens.
+max_retries = 2
+retry_backoff_minutes = [5, 15]
+stale_after_minutes = 1440
+
+[[schedules]]
+id = "weekday-morning"
+type = "cron"
+weekdays = [1, 2, 3, 4, 5]
+hours = [8]
+minute = 0
+
+# Overwritten each run. Swap for sink-roam / sink-outl to publish into a
+# knowledge base instead — same stdout, same hierarchy, no script change.
+[[on_success]]
+plugin = "sink-file"
+config = { path = "/tmp/hn-digest.md" }
+
+# Only page once retries are exhausted. One failed LLM call is noise.
+[[notifiers]]
+driver = "desktop"
+title = "hn-digest"
+subtitle = "digest failed"
+events = ["given_up"]

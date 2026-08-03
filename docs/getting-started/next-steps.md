@@ -145,6 +145,9 @@ dotagent reload                  # daemon picks up the new one on next tick
 For inspiration:
 
 - **`examples/disk-alert/`** — pure-shell agent with tiered notifications
+- **`examples/hn-digest/`** — bash agent that calls `claude -p`, with the
+  guards an LLM step needs (see
+  [`guides/llm-agents.md`](../guides/llm-agents.md))
 - **`examples/hello-{fish,python,go,rust}/`** — minimal "hello"
   variants per language
 - **The fish framework's gallery** — 9 production agents listed in

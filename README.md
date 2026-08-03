@@ -181,6 +181,7 @@ Canonical raw URL for `WebFetch`:
 - [Agents](docs/concepts/agents.md) — patterns, extending, connecting
 - [Plugins](docs/concepts/plugins.md) — declaring, using, building
 - [Notifications](docs/concepts/notifications.md) — built-in drivers
+- [LLM agents](docs/guides/llm-agents.md) — calling `claude -p` from an agent
 
 **Reference:**
 

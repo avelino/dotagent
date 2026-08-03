@@ -278,9 +278,15 @@ flowchart LR
 ```
 
 **Examples:** hourly-briefing (hourly CTO briefing), team-standup.
+Runnable in this repo: [`examples/hn-digest/`](../../examples/hn-digest/).
 
 **When to pick this:** the input is noisy (50 issues, 10 Slack channels),
 you want 3 bullets. Cheap model (haiku) handles it.
+
+**Before you write one:** [`guides/llm-agents.md`](../guides/llm-agents.md)
+covers the headless gotchas (`claude -p` doesn't inherit your MCP config,
+there's no human to approve a tool call) and the failure modes that don't
+look like failures (empty output with a zero exit).
 
 ### Pattern 3 — Triage / classifier
 
@@ -560,6 +566,10 @@ real-world wiring of the patterns above.
 
 For the **simplest possible agent**, see [`examples/hello-fish/`](../examples/hello-fish/)
 in this repo (and the parallel `hello-python/`, `hello-go/`, `hello-rust/`).
+
+For a **complete agent that calls a model**, see
+[`examples/hn-digest/`](../../examples/hn-digest/) — collect with `curl`,
+one `claude -p` call for the judgment, deterministic render into a sink.
 
 ---
 

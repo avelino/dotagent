@@ -835,11 +835,13 @@ dotagent completions <shell>     # bash|zsh|fish|elvish|powershell — tab-compl
 - Troubleshooting (sintoma → cause): `docs/guides/troubleshooting.md`
 - Observability (logs, OTel, vendor recipes): `docs/guides/observability.md`
 - Config reference (`config.toml`): `docs/guides/config-reference.md`
+- LLM agents (`claude -p`, headless gotchas): `docs/guides/llm-agents.md`
 - Threat model: `docs/security/threat-model.md`
 - Migrating from Fish framework: `docs/guides/migrating-from-fish.md`
 - Per-plugin docs: `docs/plugins/<name>.md`
 - Worked examples: `examples/hello-fish/`, `examples/hello-python/`,
-  `examples/hello-go/`, `examples/hello-rust/`, `examples/disk-alert/`
+  `examples/hello-go/`, `examples/hello-rust/`, `examples/disk-alert/`,
+  `examples/hn-digest/` (bash + `claude -p`)
 
 ---
 
