@@ -174,6 +174,17 @@ inherited parent environment, unless `env.inherit = false`):
 The agent's positional arguments are `args` from `[run]` followed by `args`
 from the schedule.
 
+Runs started by a [trigger](../concepts/triggers.md) rather than a schedule get
+four more, applied *before* the block above so a payload can never redefine
+`AGENT_NAME` or `AGENT_HEARTBEAT_FILE`:
+
+| Variable                 | Value                                                    |
+|--------------------------|----------------------------------------------------------|
+| `AGENT_TRIGGER_SOURCE`   | `telegram`, `mcp`, `cli`                                  |
+| `AGENT_TRIGGER_ACTOR`    | who asked, as the source can attest it                    |
+| `AGENT_TRIGGER_REPLY_TO` | opaque handle for the conversation to answer              |
+| `AGENT_TRIGGER_PAYLOAD`  | source-specific JSON body                                 |
+
 ## Heartbeat & state
 
 dotagent writes a heartbeat file before and after every (non-dry-run) execution:

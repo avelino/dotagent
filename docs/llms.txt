@@ -114,7 +114,10 @@ max_retries = 3                    # 0 = no retry
 retry_backoff_minutes = [5, 15, 30]
 stale_after_minutes = 120          # window older than this → state=stale
 
-# ─── [[schedules]] — REQUIRED, at least one ───────────────────────────
+# ─── [[schedules]] — at least one, UNLESS trigger-only ────────────────
+# An agent that only ever runs because something asked (a Telegram
+# message, an MCP tools/call) may declare zero schedules. dotagent gives
+# it the synthetic schedule id "trigger". See section 19.
 [[schedules]]
 id = "daily"                       # REQUIRED. Unique within manifest.
 type = "cron"                      # "cron" | "interval" | "expression"
@@ -222,6 +225,22 @@ of the inherited parent env (unless `env.inherit = false`).
 > Do NOT have your agent write to that path — you'll race with the
 > daemon. If you need to persist arbitrary state, use `AGENT_HOME` or
 > a sink plugin.
+
+Runs started by a **trigger** (a Telegram message, an MCP `tools/call`)
+instead of a schedule get four more. They are applied BEFORE the block
+above, so a payload can never redefine `AGENT_NAME` or
+`AGENT_HEARTBEAT_FILE`.
+
+| Variable                 | Type   | Example                                    |
+|--------------------------|--------|--------------------------------------------|
+| `AGENT_TRIGGER_SOURCE`   | string | `telegram` \| `mcp` \| `cli`               |
+| `AGENT_TRIGGER_ACTOR`    | string | `123456789` (Telegram numeric user id)     |
+| `AGENT_TRIGGER_REPLY_TO` | string | `123456789` (chat id to answer)            |
+| `AGENT_TRIGGER_PAYLOAD`  | JSON   | `{"text":"how's disk?","chat_id":1,"user_id":2}` |
+
+The message body travels in `AGENT_TRIGGER_PAYLOAD`, never in argv.
+Whatever a triggered agent prints on stdout is sent back to whoever
+asked; log to stderr.
 
 ### Slug derivation
 
@@ -803,6 +822,8 @@ dotagent uninstall               # remove launchd plist / systemd unit
 dotagent plugin list             # list resolved plugin binaries
 dotagent inspect <name>          # heartbeat + windows + schedule resolution
 dotagent daily-summary           # ad-hoc daily roll-up
+dotagent run-now <name>          # force a run now, ignoring schedule windows
+dotagent mcp                     # serve every agent as an MCP tool over stdio
 dotagent completions <shell>     # bash|zsh|fish|elvish|powershell — tab-completes agent names
 ```
 
@@ -820,7 +841,80 @@ dotagent completions <shell>     # bash|zsh|fish|elvish|powershell — tab-compl
 
 ---
 
-## 19. Deep dives (when this digest isn't enough)
+## 19. Triggers — runs caused by an event, not the clock
+
+A run can start because something asked: a Telegram message arrived, an
+MCP client called a tool. A triggered run keeps everything a scheduled
+one has (supervisor, heartbeat, audit, hooks, notifiers) and differs in
+two ways: it has **no window state** (no attempts counter, never
+consumes a retry, never marks a cron window given up) and it uses its
+**own slug** (`trigger-telegram`, `trigger-mcp`) so it can't overwrite
+`last_success_at` for a window that never fired.
+
+### MCP server — every agent as a tool
+
+```bash
+dotagent mcp     # JSON-RPC 2.0 over stdio, one object per line
+```
+
+```json
+{ "mcpServers": { "dotagent": { "command": "dotagent", "args": ["mcp"] } } }
+```
+
+Methods: `initialize`, `tools/list`, `tools/call`, `ping`. One tool per
+discovered agent, named `run-<sanitized-agent-name>`. Tool description
+comes from `agent.description` — write a good one, it's what a model
+uses to choose. Arguments: `{"schedule": "daily", "args": ["--flag"]}`,
+both optional.
+
+An agent that FAILS returns a normal result with `isError: true` and the
+exit code in the text, NOT a JSON-RPC error. JSON-RPC errors mean
+protocol faults (unknown method, unknown tool, bad params).
+
+Agents run in the `dotagent mcp` process, like `run-now` — not through
+the daemon — so they don't appear in `dotagent status`.
+
+### Telegram ingress — talk to your agents from a chat
+
+Daemon-level config, NOT per-manifest (Telegram allows one `getUpdates`
+consumer per bot token):
+
+```toml
+# ~/.config/dotagent/config.toml
+[telegram]
+bot_token        = "${TELEGRAM_BOT_TOKEN}"
+allowed_user_ids = [123456789]     # numeric ids; EMPTY MEANS NOBODY
+dispatcher_agent = "telegram-assistant"
+```
+
+Off unless both `bot_token` and a non-empty `allowed_user_ids` are set.
+An empty allowlist is treated as misconfiguration, not as "allow
+everyone" — the other reading turns a typo into an open
+remote-execution endpoint.
+
+Every accepted message runs `dispatcher_agent` with the body in
+`AGENT_TRIGGER_PAYLOAD`; that agent's stdout is sent back to the chat.
+The dispatcher is an ordinary agent — dotagent interprets nothing and
+there is no model in the daemon.
+
+Security: this is the one path where someone with NO access to the
+machine can cause a local process to run. Read V8 in
+`docs/security/threat-model.md` before enabling.
+
+### A broken manifest does not stop the others
+
+An `agent.toml` that fails to parse or validate is skipped, reported by
+`dotagent doctor`, and audited as `manifest_invalid` (Critical, so it
+fires out-of-band notification). The healthy agents keep running.
+
+`dotagent mcp`'s `tools/list` is the exception: it returns an error
+naming the broken files instead of a partial catalog, because a model
+handed a list that quietly lost entries would answer confidently and
+wrongly about what it can do.
+
+---
+
+## 20. Deep dives (when this digest isn't enough)
 
 - Full schema: `docs/reference/agent-spec.md`
 - Env vars (every detail): `docs/reference/env-vars.md`
@@ -836,16 +930,20 @@ dotagent completions <shell>     # bash|zsh|fish|elvish|powershell — tab-compl
 - Observability (logs, OTel, vendor recipes): `docs/guides/observability.md`
 - Config reference (`config.toml`): `docs/guides/config-reference.md`
 - LLM agents (`claude -p`, headless gotchas): `docs/guides/llm-agents.md`
+- Triggers (event-caused runs): `docs/concepts/triggers.md`
+- Telegram (inbound chat): `docs/concepts/telegram.md`
+- MCP server (agents as tools): `docs/reference/mcp.md`
 - Threat model: `docs/security/threat-model.md`
 - Migrating from Fish framework: `docs/guides/migrating-from-fish.md`
 - Per-plugin docs: `docs/plugins/<name>.md`
 - Worked examples: `examples/hello-fish/`, `examples/hello-python/`,
   `examples/hello-go/`, `examples/hello-rust/`, `examples/disk-alert/`,
-  `examples/hn-digest/` (bash + `claude -p`)
+  `examples/hn-digest/` (bash + `claude -p`),
+  `examples/telegram-assistant/` (trigger + MCP + `claude -p`)
 
 ---
 
-## 20. Sanity check before reporting "done"
+## 21. Sanity check before reporting "done"
 
 When you, the LLM, generate an `agent.toml`, verify against this digest:
 

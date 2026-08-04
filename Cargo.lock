@@ -565,6 +565,8 @@ dependencies = [
  "clap_complete",
  "dirs",
  "dotagent-core",
+ "dotagent-mcp",
+ "dotagent-notify",
  "dotagent-plugin",
  "dotagent-runner",
  "dotagent-scheduler",
@@ -576,6 +578,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",
@@ -593,6 +596,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "toml",
+]
+
+[[package]]
+name = "dotagent-mcp"
+version = "0.1.4"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -694,6 +705,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
 ]
 

@@ -114,6 +114,16 @@ enum Command {
         json: bool,
     },
 
+    /// Serve every discovered agent as an MCP tool over stdio.
+    ///
+    /// Speaks JSON-RPC 2.0, one object per line. Point any MCP client at it:
+    ///
+    ///   {"mcpServers": {"dotagent": {"command": "dotagent", "args": ["mcp"]}}}
+    ///
+    /// Runs agents in this process, like `run-now` — not through the daemon,
+    /// so the subprocess tree does not appear in `dotagent status`.
+    Mcp,
+
     /// Print a shell completion script.
     ///
     /// Includes dynamic completion of agent names (via `dotagent _list-agents`)
@@ -206,6 +216,7 @@ async fn main() -> Result<()> {
             };
             commands::utility::run_now(name, schedule, format).await
         }
+        Command::Mcp => commands::mcp::run().await,
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             commands::completions::print(shell, &mut cmd);

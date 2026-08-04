@@ -181,12 +181,15 @@ Canonical raw URL for `WebFetch`:
 - [Agents](docs/concepts/agents.md) — patterns, extending, connecting
 - [Plugins](docs/concepts/plugins.md) — declaring, using, building
 - [Notifications](docs/concepts/notifications.md) — built-in drivers
+- [Triggers](docs/concepts/triggers.md) — runs caused by an event, not the clock
+- [Telegram](docs/concepts/telegram.md) — talk to your agents from a chat
 - [LLM agents](docs/guides/llm-agents.md) — calling `claude -p` from an agent
 
 **Reference:**
 
 - [Agent spec](docs/reference/agent-spec.md) — `agent.toml` schema
 - [Plugin protocol](docs/reference/plugin-protocol.md) — formal spec
+- [MCP server](docs/reference/mcp.md) — every agent as a callable tool
 - [Environment variables](docs/reference/env-vars.md) — injected + read
 - [Filesystem layout](docs/reference/paths.md) — where every file lives
 

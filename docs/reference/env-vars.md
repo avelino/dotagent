@@ -27,6 +27,10 @@ SDK to import.
 | `AGENT_START_EPOCH`    | int      | `1700000000`                                       | Always — unix epoch of `started_at`. |
 | `AGENT_ARGV`           | JSON array | `["--period","dia-anterior"]`                    | Always — the schedule's `args` as JSON. |
 | `AGENT_HEARTBEAT_FILE` | abs path | `~/.config/dotagent/state/agents/.../slug.heartbeat.json` | Set when NOT dry-run.        |
+| `AGENT_TRIGGER_SOURCE` | string   | `telegram`                                         | Only on [triggered](../concepts/triggers.md) runs. One of `telegram`, `mcp`, `cli`. |
+| `AGENT_TRIGGER_ACTOR`  | string   | `123456789`                                        | Triggered runs, when the source can attest an identity. Telegram: numeric user id. |
+| `AGENT_TRIGGER_REPLY_TO` | string | `123456789`                                        | Triggered runs, when the source can be answered. Telegram: chat id. |
+| `AGENT_TRIGGER_PAYLOAD` | JSON object | `{"text":"how's disk?","chat_id":1,"user_id":2}` | Triggered runs. Body travels here, never in argv. |
 
 The positional `argv` of your process is `[run].command` + `[run].args`
 + schedule's `args`, so most scripts don't actually need `AGENT_ARGV`

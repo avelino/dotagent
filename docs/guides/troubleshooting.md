@@ -377,6 +377,120 @@ Your `marker_regex` doesn't match the old root block. See
 
 ---
 
+## A manifest is broken
+
+### One agent stopped running and nothing said why
+
+Check for a parse failure:
+
+```bash
+dotagent doctor 2>&1 | grep '✗'
+grep manifest_invalid ~/.config/dotagent/state/audit.log | tail -5
+```
+
+A manifest that fails to parse or validate is skipped, audited as
+`manifest_invalid` (Critical, so it fires out-of-band notification), and
+the other agents keep running.
+
+> Before this behavior existed, one broken file aborted the entire scan:
+> the daemon saw **zero** agents, dispatched nothing, and the only trace
+> was a single `warn!` line. If you are on an older build and everything
+> stopped at once, look for a manifest you edited recently.
+
+---
+
+## Inbound Telegram
+
+### The bot never answers
+
+Check whether the ingress even started:
+
+```bash
+dotagent doctor | grep -i telegram
+```
+
+`telegram ingress: OFF — bot_token set but allowed_user_ids is empty` is
+the most common cause. An empty allowlist means **nobody**, never
+everybody. Add your numeric user id (from
+[@userinfobot](https://t.me/userinfobot)) — a `@username` will not work,
+it is not an authorization input.
+
+If the ingress is on, your message may be getting refused:
+
+```bash
+grep trigger_rejected ~/.config/dotagent/state/audit.log | tail -5
+```
+
+`reason: "user id not in allowed_user_ids"` means the id in
+`config.toml` is not the one that sent the message. `reason: "rate limit
+exceeded"` means you passed `rate_limit_per_minute` (default 10).
+
+### `telegram poll failed` repeating in the log
+
+Transport problem — network down, or a revoked/wrong token. The backoff
+doubles to a 60-second ceiling, so this will not spin. Verify the token
+resolves:
+
+```bash
+dotagent doctor | grep -A3 "secrets file"
+```
+
+An unresolved `${TELEGRAM_BOT_TOKEN}` shows up there as an unresolved
+reference.
+
+### The run happens but no reply arrives
+
+The dispatcher printed nothing on stdout, or logged to stdout instead of
+stderr and the agent then failed. stdout **is** the reply:
+
+```bash
+dotagent logs telegram-assistant -n 50
+```
+
+### The reply is cut off mid-sentence
+
+Telegram caps a message at 4096 characters. Longer output is trimmed
+with a `[truncated]` marker; the full text is in `dotagent logs`.
+
+### `dispatcher agent '<name>' not found`
+
+`doctor` says this when `dispatcher_agent` in `config.toml` does not
+match any installed agent. Every accepted message would fail after
+passing the allowlist.
+
+---
+
+## MCP server
+
+### `tools/list` returns an error instead of tools
+
+One or more `agent.toml` files failed to load. The healthy agents are
+fine — the daemon still runs them — but the MCP catalog refuses to be
+served incomplete, because a model handed a list that quietly lost
+entries would answer confidently and wrongly about what it can do.
+
+The error names each failing path. `dotagent doctor` shows the same
+list with the parse messages.
+
+### An agent is missing from `tools/list`
+
+Two agent names can sanitize to the same tool name (`a.b` and `a/b` both
+become `run-a-b`). The first one discovered wins and the log says:
+
+```
+tool name collides with an earlier agent — skipping
+```
+
+Rename one of them.
+
+### Runs started via MCP don't show in `dotagent status`
+
+Expected. `dotagent mcp` runs agents in its own process, like `run-now`;
+`status` reflects only the daemon's supervisor. Their heartbeats live
+under the `trigger-mcp` slug, visible via `dotagent inspect`.
+
+---
+
 ## Logs
 
 ### `dotagent logs <name>` says "no logs found"

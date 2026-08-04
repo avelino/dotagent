@@ -1,0 +1,57 @@
+# telegram-assistant — the dispatcher behind an inbound Telegram bot.
+#
+# Demonstrates:
+#   - an agent triggered by a message instead of a clock (no [[schedules]])
+#   - `claude -p` with dotagent's own MCP server attached, so the model
+#     picks from a closed catalog of agents instead of composing a command
+#   - stdout as the reply: whatever this prints goes back to the chat
+#
+# Wiring lives in ~/.config/dotagent/config.toml, not here — one bot means
+# one getUpdates consumer, so the token and allowlist are daemon-level:
+#
+#   [telegram]
+#   bot_token        = "${TELEGRAM_BOT_TOKEN}"
+#   allowed_user_ids = [123456789]
+#   dispatcher_agent = "telegram-assistant"
+#
+# Install:
+#   ln -s "$PWD" ~/.config/dotagent/agents/telegram-assistant
+#   dotagent doctor
+#
+# Full reasoning: docs/concepts/telegram.md
+
+[agent]
+name = "telegram-assistant"
+description = "Routes an inbound Telegram message to whichever agent handles it."
+# Nothing scheduled here to monitor — health is "did the reply arrive",
+# which the chat itself tells you.
+monitor = false
+# Covers the model call plus whichever agent it picks. The target agent has
+# its own timeout; this one only needs to outlast the slowest reasonable
+# combination.
+timeout_seconds = 600
+
+[run]
+command = "bash"
+args = ["./agent.sh"]
+
+[env]
+inherit = true
+
+[env.extra]
+TELEGRAM_ASSISTANT_MODEL = "sonnet"
+# Keep below [agent].timeout_seconds so the script reports "claude exited
+# 142" instead of the supervisor killing the whole process group.
+TELEGRAM_ASSISTANT_CLAUDE_TIMEOUT = "540"
+
+# No [[schedules]]. This agent only ever runs because a message arrived;
+# dotagent gives it the synthetic schedule id "trigger".
+
+# An agent that hands untrusted chat text to a model deserves an explicit
+# blast radius more than most. Enforcement is still landing (see
+# docs/security/threat-model.md), so today this documents intent and gives
+# `doctor` something to audit.
+[security]
+allowed_commands = ["bash", "jq", "claude", "dotagent", "perl"]
+network = ["api.anthropic.com"]
+filesystem_writable = ["/tmp"]

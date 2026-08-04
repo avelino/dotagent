@@ -53,6 +53,8 @@ crates/                  # orchestrator (workspace de crates)
   dotagent-state/        # filesystem state (atomic write + flock) + paths
   dotagent-notify/       # notifiers built-in (desktop / imessage / slack / ntfy / pushover)
   dotagent-plugin/       # PluginClient (subprocess + JSON) — goes through supervisor
+  dotagent-mcp/          # JSON-RPC 2.0 + MCP wire types (agents as tools) — sem IO
+  dotagent-secrets/      # loader de secrets.env (crate própria pra evitar ciclo core → notify)
   dotagent-supervisor/   # subprocess lifecycle: deadlines, kill-tree (POSIX pgroup), live registry
   dotagent-telemetry/    # tracing + JSON file rotation + OTLP export + retention
   dotagent-unit-gen/     # launchd plist + systemd unit generation
@@ -85,6 +87,9 @@ docs/
 | Setup de logs / OTel / retention | `dotagent-telemetry` |
 | Novo subcomando CLI | `crates/dotagent/src/commands/` |
 | Novo notifier built-in (driver) | `dotagent-notify/src/drivers/` |
+| Ingress (receber evento externo) | `dotagent-notify/src/<source>_inbound.rs` (transporte) + política no daemon |
+| Tipo do protocolo MCP | `dotagent-mcp/src/lib.rs` + `docs/reference/mcp.md` |
+| Novo campo em `[telegram]` | `dotagent-core/src/config.rs` + `docs/guides/config-reference.md` + `docs/concepts/telegram.md` |
 | Novo preflight/sink | novo crate em `plugins/` |
 | Novo notifier de terceiro (não built-in) | novo crate em `plugins/` (kind = `notify`) |
 | Mudança no shape do `agent.toml` | `dotagent-core/src/manifest.rs` + `docs/reference/agent-spec.md` |
@@ -243,12 +248,25 @@ escreverá plugins em Go/Python/Bash assumindo essa interface. Se mudar:
 fora de testes. Tudo recebe `now: DateTime<Local>` como argumento. Isso é o
 que faz o teste de "weekday off" + "BSD-date edge cases" caber em milissegundos.
 
-### 4. dotagent não substitui o `mcp` CLI
+### 4. dotagent **serve** MCP, mas não **consome** MCP
 
-`mcp` é um proxy MCP separado (em Rust, já existe — `~/.cargo/bin/mcp`).
-Agents continuam chamando `mcp` diretamente. dotagent NÃO importa `mcp`,
-NÃO embute MCP, NÃO substitui MCP. Reaproveite quando o plugin precisar
-(ex: `sink-roam` chama `mcp roam_publish ...`).
+Duas direções, e só uma mudou.
+
+**Consumir (inalterado):** `mcp` é um proxy MCP separado (em Rust, já
+existe — `~/.cargo/bin/mcp`). Agents continuam chamando `mcp` diretamente.
+dotagent NÃO importa `mcp`, NÃO embute cliente MCP, NÃO substitui o proxy.
+Reaproveite quando o plugin precisar (ex: `sink-roam` chama
+`mcp roam_publish ...`).
+
+**Servir (novo, issue #40):** `dotagent mcp` expõe cada agent como tool via
+JSON-RPC sobre stdio (`crates/dotagent-mcp` + `commands/mcp.rs`).
+Justificativa: um modelo que **escolhe** de um catálogo fechado não precisa
+que alguém lembre de validar o que ele compôs — nome que não existe não é
+chamável. Isso vale além do Telegram: Claude Code, Claude Desktop e o
+próprio proxy `mcp` enxergam o mesmo catálogo.
+
+Isso não reabre a decisão de cima. Servir não implica consumir, e os
+`sink-*` continuam fazendo shell-out pro CLI `mcp`.
 
 ### 5. Nunca `{:?}` em output user-facing do CLI
 

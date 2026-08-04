@@ -122,15 +122,106 @@ A malicious manifest sets `max_retries = 1000000` with
 - Hard clamp `retry_backoff_minutes[i] >= 1` in the runtime.
 - Concurrent run cap (default 10 daemon-wide, 1 per agent).
 
+### V8 — Untrusted inbound message causes a local run
+
+**This vector is different in kind from V1–V7, and it is worth saying so
+plainly.** Every other threat here assumes an attacker who already has
+user-equivalent access to the machine. Inbound Telegram
+([`concepts/telegram.md`](../concepts/telegram.md)) is the first path where
+someone with **no access at all** can cause a local process to run. The premise
+above still holds for everything else; this section is the exception carved out
+of it.
+
+The exposure exists only when `[telegram]` is configured. It is off by default,
+and dotagent opens no inbound path you did not ask for.
+
+**What an attacker needs:** the bot token (leaked from `secrets.env`, a backup,
+a screenshot) or the ability to message a bot they discovered. Telegram bots are
+enumerable, so assume discovery is free.
+
+**Mitigations:**
+
+- **Numeric allowlist.** `allowed_user_ids` gates every message. `@username` is
+  changeable and therefore never used for authorization.
+- **Empty means nobody.** A token configured with an empty allowlist leaves the
+  ingress off and logs why. Reading empty as "no restriction" would turn one
+  forgotten line into an open remote-execution endpoint.
+- **The message never supplies a command.** It selects among agents already
+  installed on disk. An agent name that does not resolve is refused, and nothing
+  from a trigger reaches a shell — the message body travels in
+  `AGENT_TRIGGER_PAYLOAD`, not argv.
+- **Trigger env cannot shadow runner env.** Per-invocation variables are applied
+  before the `AGENT_*` block, so a payload cannot redefine `AGENT_NAME` or
+  `AGENT_HEARTBEAT_FILE`.
+- **Rate limit per sender**, default 10/minute, so one sender cannot occupy the
+  daemon indefinitely.
+- **Audit.** Accepted messages emit `trigger_received` then `agent_triggered`;
+  refusals emit `trigger_rejected` at `Critical`, which fires out-of-band
+  notification. An unlisted sender means somebody found your bot, and you should
+  hear about it from a different device.
+- **No message text in the audit log.** It records the sender id and chat id.
+  Bodies are content, not attribution, and a chat can contain anything you
+  pasted into it.
+
+**Not mitigated:**
+
+- An allowlisted account that is itself compromised (stolen Telegram session)
+  can run any installed agent. The allowlist authenticates an account, not a
+  person.
+- A dispatcher agent that ignores the catalog and interprets message text
+  itself re-opens everything this section closes. The
+  [`telegram-assistant` example](https://github.com/avelino/dotagent/tree/main/examples/telegram-assistant)
+  routes only through MCP tools for exactly this reason.
+
+### V9 — MCP client reaches the agent catalog
+
+`dotagent mcp` ([`reference/mcp.md`](../reference/mcp.md)) exposes every
+installed agent as a callable tool.
+
+**Mitigations:**
+- stdio transport only. No port, no listener, nothing reachable from another
+  machine. The server inherits the trust of whatever spawned it, and a local
+  MCP client already runs as you.
+- The catalog is the boundary: an agent that is not installed cannot be run.
+- Arguments are a token list, never a shell string — same rule as V5.
+
+**Not mitigated:** any local process that can spawn `dotagent mcp` can run any
+installed agent. That is user-equivalent capability, which the premise above
+already places outside the boundary.
+
 ## Defenses shipped in v0 (with the daemon engine)
 
 | Defense | Status | Scope |
 |---|---|---|
 | Audit log (hash-chained, append-only) | ✅ v0 | All `agent_run`, `agent_failed`, `agent_recovered`, `manifest_*`, `plugin_*` events |
 | Out-of-band notification on critical events | ✅ v0 | `given_up`, `phantom_agent_detected`, `manifest_drift_detected`, `audit_chain_broken` |
-| `[security]` schema in manifest | ✅ v0 schema-only | Parses + `doctor` warns on inconsistency. **Enforcement is post-v0.** |
+| `[security]` schema in manifest | ✅ v0 schema-only | Parses + `doctor` warns on inconsistency. **Enforcement is post-v0** — see below. |
 | Manifest drift detection | ✅ v0 | sha256 cache + notify on mismatch |
 | Phantom agent detection | ✅ v0 | first-seen detection + notify |
+| Broken manifest does not hide healthy agents | ✅ | A failed parse is skipped and audited as `manifest_invalid` (Critical). Previously one bad file aborted the whole scan, leaving the daemon with zero agents and nothing but a log line. |
+| Trigger env cannot shadow runner env | ✅ | Per-invocation variables are applied before the `AGENT_*` block, so an untrusted payload cannot redefine `AGENT_NAME` or `AGENT_HEARTBEAT_FILE`. |
+
+### The `[security]` gap, stated plainly
+
+`[security]` is **declared intent, not enforcement**. `allowed_commands`,
+`filesystem_writable`, `network` and `env_passthrough` are parsed, reported by
+`doctor`, and otherwise ignored by the runner. An agent that declares
+`allowed_commands = ["jq"]` and then runs `curl` is not stopped.
+
+That was a reasonable trade while every agent was code you wrote for yourself.
+It reads differently since **V8**: there is now a path where a message from the
+internet chooses *which* declared agent runs. The choice is still confined to
+what you installed — that part is real — but the blast radius of the agent it
+picks is bounded by nothing except what that agent's own code does.
+
+Concretely, `examples/telegram-assistant` declares
+`allowed_commands = ["bash", "jq", "claude", "dotagent", "perl"]`. Today that
+list is a comment. Treat it as documentation of what the author intended to
+need, not as a control that holds.
+
+Until enforcement lands, the honest mitigations are the ones outside dotagent:
+outbound firewall, disk encryption, and not installing an agent you have not
+read.
 
 ## Defenses deferred (with rationale)
 

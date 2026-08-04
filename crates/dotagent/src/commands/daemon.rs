@@ -18,9 +18,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, TimeZone};
-use dotagent_core::{audit::AuditEvent, AgentManifest, Heartbeat, Schedule, WindowState};
+use dotagent_core::{
+    audit::AuditEvent, AgentManifest, Heartbeat, Schedule, TriggerRequest, TriggerSource,
+    WindowState, TRIGGER_SCHEDULE_ID,
+};
 use dotagent_plugin::PluginClient;
-use dotagent_runner::{run_with_hooks, RunContext, RunSpec};
+use dotagent_runner::{run_with_hooks, OrchestratedOutcome, RunContext, RunSpec};
 use dotagent_scheduler::{
     compute_next_event, expected_at, is_stale, should_retry, AgentSchedulePair, ResolvedPolicy,
 };
@@ -62,6 +65,293 @@ impl Drop for PidGuard {
             let _ = std::fs::remove_file(path);
         }
     }
+}
+
+/// The three handles every dispatch path needs.
+///
+/// Grouped because they always travel together and passing them individually
+/// pushed `give_up` past clippy's argument limit. All three are path handles or
+/// `Arc`s — cheap to hold, and sharing them is what keeps a run visible to
+/// `dotagent status` and reapable on SIGTERM.
+struct DaemonCtx<'a> {
+    state: &'a StateStore,
+    audit: &'a AuditLog,
+    plugins: &'a PluginClient,
+}
+
+/// How many pending triggers to hold before the producer blocks. Deep enough
+/// that a burst of chat messages survives one slow run, shallow enough that a
+/// wedged daemon applies backpressure instead of growing without bound.
+const TRIGGER_CHANNEL_DEPTH: usize = 64;
+
+/// Run an agent because something asked, not because a window came due.
+///
+/// Deliberately **not** routed through [`dispatch_one`]: its first four guards
+/// exist to answer "is this cron window due and retryable", and a trigger has
+/// no window. Forcing one would corrupt retry accounting for the schedule.
+///
+/// Mirrors `utility::run_now`, but reuses the daemon's `PluginClient` (and so
+/// its `Supervisor`), which keeps the run visible in `dotagent status` and
+/// reapable on SIGTERM. Window state is untouched on purpose — a triggered run
+/// has no attempts counter and can never mark a cron window as given up.
+pub(crate) async fn run_triggered(
+    req: &TriggerRequest,
+    state: &StateStore,
+    audit: &AuditLog,
+    plugins: &PluginClient,
+) -> Result<OrchestratedOutcome> {
+    let agent = discovery::find_by_name(&req.agent)
+        .with_context(|| format!("trigger names unknown agent '{}'", req.agent))?;
+
+    let (schedule_id, mut args) = match &req.schedule {
+        Some(id) => {
+            let sched = discovery::schedule_by_id(&agent.manifest, id)?;
+            (sched.id().to_string(), sched.args().to_vec())
+        }
+        None => match agent.manifest.schedules.first() {
+            Some(sched) => (sched.id().to_string(), sched.args().to_vec()),
+            None => (TRIGGER_SCHEDULE_ID.to_string(), Vec::new()),
+        },
+    };
+    args.extend(req.args.iter().cloned());
+
+    let manifest_sha256 = hash_manifest_file(&agent.dir.join("agent.toml")).ok();
+    let slug = req.slug();
+    let extra_env = trigger_env(req);
+
+    let _ = audit.append(AuditEvent::AgentTriggered {
+        source: req.source.to_string(),
+        actor: req.actor.clone(),
+        agent: agent.manifest.agent.name.clone(),
+        schedule: schedule_id.clone(),
+    });
+
+    info!(
+        agent = %agent.manifest.agent.name,
+        schedule = %schedule_id,
+        source = %req.source,
+        "dispatching triggered run"
+    );
+
+    let spec = RunSpec {
+        manifest: &agent.manifest,
+        manifest_dir: &agent.dir,
+        schedule_id: &schedule_id,
+        args: &args,
+        dry_run: false,
+        manifest_sha256,
+        slug_override: Some(&slug),
+        extra_env: &extra_env,
+    };
+    let ctx = RunContext {
+        state,
+        plugins: Some(plugins),
+        audit: Some(audit),
+        supervisor: Some(plugins.supervisor()),
+    };
+    run_with_hooks(spec, &ctx).await.map_err(Into::into)
+}
+
+/// Run one trigger and send whatever it produced back to whoever asked.
+///
+/// Never propagates an error: a malformed or hostile trigger must not be able
+/// to stop the daemon. Failures are logged and, when the source gave us a way
+/// to answer, reported back to it.
+async fn handle_trigger(
+    req: TriggerRequest,
+    state: &StateStore,
+    audit: &AuditLog,
+    plugins: &PluginClient,
+) {
+    let reply = match run_triggered(&req, state, audit, plugins).await {
+        Ok(OrchestratedOutcome::Ran(outcome)) if outcome.exit_code == 0 => {
+            if outcome.stdout_tail.trim().is_empty() {
+                format!("{} finished with no output.", req.agent)
+            } else {
+                outcome.stdout_tail
+            }
+        }
+        Ok(OrchestratedOutcome::Ran(outcome)) => {
+            warn!(
+                agent = %req.agent,
+                exit_code = outcome.exit_code,
+                timed_out = outcome.timed_out,
+                "triggered run failed"
+            );
+            let what = if outcome.timed_out {
+                "timed out".to_string()
+            } else {
+                format!("exited {}", outcome.exit_code)
+            };
+            format!("{} {what}.\n{}", req.agent, outcome.stderr_tail)
+        }
+        Ok(OrchestratedOutcome::PreflightFailed { plugin, suggest }) => {
+            let hint = suggest.map(|s| format!(": {s}")).unwrap_or_default();
+            format!("{} blocked by preflight {plugin}{hint}", req.agent)
+        }
+        Err(e) => {
+            warn!(agent = %req.agent, error = %e, "trigger could not run");
+            format!("Could not run {}: {e}", req.agent)
+        }
+    };
+
+    deliver_reply(&req, &reply).await;
+}
+
+/// Deliver a trigger's answer back to its origin. No-op when the source is
+/// fire-and-forget (no `reply_to`).
+async fn deliver_reply(req: &TriggerRequest, body: &str) {
+    let Some(reply_to) = &req.reply_to else {
+        return;
+    };
+    match req.source {
+        TriggerSource::Telegram => {
+            let cfg = dotagent_core::Config::load(dotagent_state::paths::config_file())
+                .unwrap_or_default();
+            let Ok(chat_id) = reply_to.parse::<i64>() else {
+                warn!(reply_to = %reply_to, "telegram reply_to is not a chat id");
+                return;
+            };
+            if let Err(e) =
+                dotagent_notify::telegram_inbound::reply(&cfg.telegram.bot_token, chat_id, body)
+                    .await
+            {
+                // `NotifyError` from this path is already token-sanitized.
+                warn!(error = %e, "could not deliver telegram reply");
+            }
+        }
+        // Nothing to answer: the CLI already printed, MCP returned inline.
+        TriggerSource::Cli | TriggerSource::Mcp => {}
+    }
+}
+
+/// Long-poll Telegram and feed accepted messages into the trigger channel.
+///
+/// Runs as its own task rather than inside the main loop, which sleeps up to
+/// [`MAX_SLEEP_MINUTES`] and would make the bot answer half an hour late.
+/// Policy lives here (allowlist, rate limit, audit) while
+/// `dotagent_notify::telegram_inbound` stays pure transport.
+fn spawn_telegram_ingress(
+    cfg: dotagent_core::TelegramIngressConfig,
+    tx: tokio::sync::mpsc::Sender<TriggerRequest>,
+    audit: AuditLog,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut poller = dotagent_notify::telegram_inbound::Poller::new(
+            cfg.bot_token.clone(),
+            cfg.poll_timeout_seconds,
+            dotagent_state::paths::telegram_offset_file(),
+        );
+        let mut limiter =
+            dotagent_notify::telegram_inbound::RateLimiter::new(cfg.rate_limit_per_minute);
+
+        info!(
+            allowed_users = cfg.allowed_user_ids.len(),
+            dispatcher = %cfg.dispatcher_agent,
+            "telegram ingress started"
+        );
+
+        // Backs off on transport failure so a dropped network does not turn
+        // into a tight retry loop against the Bot API.
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            let messages = match poller.poll().await {
+                Ok(m) => {
+                    backoff = Duration::from_secs(1);
+                    m
+                }
+                Err(e) => {
+                    warn!(error = %e, backoff_secs = backoff.as_secs(), "telegram poll failed");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                    continue;
+                }
+            };
+
+            for msg in messages {
+                let actor = msg.user_id.to_string();
+                match screen(&msg, &cfg, &mut limiter) {
+                    Err(reason) => {
+                        warn!(user_id = msg.user_id, reason, "telegram message refused");
+                        let _ = audit.append(AuditEvent::TriggerRejected {
+                            source: TriggerSource::Telegram.to_string(),
+                            actor,
+                            reason: reason.into(),
+                        });
+                    }
+                    Ok(req) => {
+                        let _ = audit.append(AuditEvent::TriggerReceived {
+                            source: TriggerSource::Telegram.to_string(),
+                            actor,
+                            reply_to: msg.chat_id.to_string(),
+                        });
+                        if tx.send(req).await.is_err() {
+                            info!("trigger channel closed — stopping telegram ingress");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// Decide whether one inbound message may cause a run, and shape it if so.
+///
+/// The whole authorization decision lives here, deliberately away from IO: the
+/// allowlist is the only thing standing between a bot token and local
+/// execution, and it should be testable without a network.
+fn screen(
+    msg: &dotagent_notify::telegram_inbound::InboundMessage,
+    cfg: &dotagent_core::TelegramIngressConfig,
+    limiter: &mut dotagent_notify::telegram_inbound::RateLimiter,
+) -> std::result::Result<TriggerRequest, &'static str> {
+    if !cfg.allows(msg.user_id) {
+        // Someone found the bot.
+        return Err("user id not in allowed_user_ids");
+    }
+    if !limiter.check(msg.user_id) {
+        return Err("rate limit exceeded");
+    }
+    Ok(TriggerRequest {
+        source: TriggerSource::Telegram,
+        agent: cfg.dispatcher_agent.clone(),
+        schedule: None,
+        args: Vec::new(),
+        // The body reaches the agent through AGENT_TRIGGER_PAYLOAD, never argv.
+        payload: Some(serde_json::json!({
+            "text": msg.text,
+            "chat_id": msg.chat_id,
+            "user_id": msg.user_id,
+        })),
+        actor: Some(msg.user_id.to_string()),
+        reply_to: Some(msg.chat_id.to_string()),
+    })
+}
+
+/// Trigger context handed to the agent process.
+///
+/// `AGENT_TRIGGER_PAYLOAD` carries the source-specific body as JSON. It rides
+/// in the environment rather than a file because every current producer is
+/// bounded (a Telegram message caps at 4096 characters, far under `ARG_MAX`).
+/// A source with unbounded payloads should switch to a file in `AGENT_TMPDIR`
+/// rather than grow this variable.
+fn trigger_env(req: &TriggerRequest) -> Vec<(String, String)> {
+    let mut env = vec![("AGENT_TRIGGER_SOURCE".into(), req.source.to_string())];
+    if let Some(actor) = &req.actor {
+        env.push(("AGENT_TRIGGER_ACTOR".into(), actor.clone()));
+    }
+    if let Some(reply_to) = &req.reply_to {
+        env.push(("AGENT_TRIGGER_REPLY_TO".into(), reply_to.clone()));
+    }
+    if let Some(payload) = &req.payload {
+        // A payload that won't serialize is a bug in the producer, not a
+        // reason to drop the run — the agent sees an absent variable.
+        if let Ok(json) = serde_json::to_string(payload) {
+            env.push(("AGENT_TRIGGER_PAYLOAD".into(), json));
+        }
+    }
+    env
 }
 
 pub async fn run() -> Result<()> {
@@ -117,6 +407,30 @@ pub async fn run() -> Result<()> {
     // and fix permissions without losing scheduled runs.
     load_secrets_at_startup(&app_config, &audit);
 
+    // Inbound triggers. Consumed by an arm of the `select!` below rather than
+    // a spawned task, so a triggered run is serialized against the tick loop.
+    // Concurrency here would race two known hazards that stay dormant while
+    // execution is serial: the heartbeat read-modify-write in
+    // `dotagent-runner` and the lockfile unlink in `dotagent-state`.
+    let (trigger_tx, mut trigger_rx) =
+        tokio::sync::mpsc::channel::<TriggerRequest>(TRIGGER_CHANNEL_DEPTH);
+
+    // Inbound chat. Off unless `[telegram]` names both a token and at least
+    // one allowed user id — an empty allowlist is misconfiguration, not
+    // permission to run anything for anyone.
+    let _telegram = if app_config.telegram.is_enabled() {
+        Some(spawn_telegram_ingress(
+            app_config.telegram.clone(),
+            trigger_tx.clone(),
+            audit.clone(),
+        ))
+    } else {
+        if !app_config.telegram.bot_token.is_empty() {
+            warn!("telegram bot_token set but allowed_user_ids is empty — ingress stays off");
+        }
+        None
+    };
+
     let mut last_summary_date: Option<chrono::NaiveDate> = None;
     let mut last_retention_date: Option<chrono::NaiveDate> = None;
     let exit_reason = loop {
@@ -169,6 +483,10 @@ pub async fn run() -> Result<()> {
                 let reloaded = dotagent_core::Config::load(dotagent_state::paths::config_file())
                     .unwrap_or_default();
                 load_secrets_at_startup(&reloaded, &audit);
+                continue;
+            }
+            Some(req) = trigger_rx.recv() => {
+                handle_trigger(req, &state, &audit, &plugins).await;
                 continue;
             }
             _ = sigterm.recv() => break "SIGTERM",
@@ -317,13 +635,18 @@ pub async fn tick_once(
     cache: &ManifestCache,
     now: DateTime<Local>,
 ) -> TickResult {
-    let agents = match discovery::discover_all() {
-        Ok(a) => a,
-        Err(e) => {
-            warn!(error = ?e, "discovery failed");
-            vec![]
-        }
-    };
+    let found = discovery::discover();
+    // A broken manifest used to abort the whole scan, leaving the daemon with
+    // an empty agent list and nothing but a log line to show for it. Now the
+    // healthy agents keep running and each failure is auditable.
+    for bad in &found.invalid {
+        warn!(path = %bad.path.display(), error = %bad.error, "manifest failed to load");
+        let _ = audit.append(AuditEvent::ManifestInvalid {
+            path: bad.path.display().to_string(),
+            error: bad.error.clone(),
+        });
+    }
+    let agents = found.agents;
 
     if let Err(e) = check_cache(&agents, cache, audit) {
         warn!(error = ?e, "manifest cache check failed");
@@ -522,6 +845,11 @@ async fn dispatch_one(
     plugins: &PluginClient,
     now: DateTime<Local>,
 ) -> bool {
+    let dctx = DaemonCtx {
+        state,
+        audit,
+        plugins,
+    };
     let last_success = last_success_for(&agent.manifest, sched, state);
     let Some(expected) = expected_at(sched, now, last_success) else {
         return false;
@@ -576,7 +904,7 @@ async fn dispatch_one(
     // 3. max_retries gate. If we've already burned them, mark given_up and
     //    fire on_failure(given_up).
     if window.attempts >= policy.max_retries {
-        give_up(agent, sched, &mut window, audit, plugins, &slug, expected).await;
+        give_up(agent, sched, &mut window, &dctx, &slug, expected).await;
         return false;
     }
 
@@ -601,6 +929,8 @@ async fn dispatch_one(
         args: &args,
         dry_run: false,
         manifest_sha256,
+        slug_override: None,
+        extra_env: &[],
     };
     let ctx = RunContext {
         state,
@@ -654,7 +984,7 @@ async fn dispatch_one(
                 )
                 .await;
             } else if ro.exit_code != 0 && window.attempts >= policy.max_retries {
-                give_up(agent, sched, &mut window, audit, plugins, &slug, expected).await;
+                give_up(agent, sched, &mut window, &dctx, &slug, expected).await;
                 return true;
             }
         }
@@ -670,11 +1000,11 @@ async fn give_up(
     agent: &DiscoveredAgent,
     sched: &Schedule,
     window: &mut WindowState,
-    audit: &AuditLog,
-    plugins: &PluginClient,
+    ctx: &DaemonCtx<'_>,
     slug: &str,
     expected: DateTime<Local>,
 ) {
+    let (state, audit, plugins) = (ctx.state, ctx.audit, ctx.plugins);
     window.given_up = true;
     window.given_up_at = Some(Local::now().timestamp());
 
@@ -704,10 +1034,12 @@ async fn give_up(
     )
     .await;
 
-    if let Ok(store) = StateStore::from_home() {
-        if let Err(e) = store.write_window(window, slug, expected) {
-            warn!(error = %e, "writing given_up window state failed");
-        }
+    // Use the caller's store, not `StateStore::from_home()`. Re-deriving the
+    // root here silently ignored an injected one, so a daemon (or a test)
+    // running against a non-default `DOTAGENT_HOME` wrote the give-up marker
+    // somewhere the rest of the run never looks.
+    if let Err(e) = state.write_window(window, slug, expected) {
+        warn!(error = %e, "writing given_up window state failed");
     }
 }
 
@@ -796,4 +1128,187 @@ fn check_cache(agents: &[DiscoveredAgent], cache: &ManifestCache, audit: &AuditL
         cache.save(&known)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(source: TriggerSource) -> TriggerRequest {
+        TriggerRequest {
+            source,
+            agent: "a".into(),
+            schedule: None,
+            args: vec![],
+            payload: None,
+            actor: None,
+            reply_to: None,
+        }
+    }
+
+    fn get<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn trigger_env_always_carries_the_source() {
+        let env = trigger_env(&req(TriggerSource::Telegram));
+        assert_eq!(get(&env, "AGENT_TRIGGER_SOURCE"), Some("telegram"));
+    }
+
+    #[test]
+    fn trigger_env_omits_absent_optional_fields() {
+        // An agent should see the variable missing rather than empty, so
+        // `${VAR:-default}` in a shell script behaves predictably.
+        let env = trigger_env(&req(TriggerSource::Cli));
+        assert!(get(&env, "AGENT_TRIGGER_ACTOR").is_none());
+        assert!(get(&env, "AGENT_TRIGGER_REPLY_TO").is_none());
+        assert!(get(&env, "AGENT_TRIGGER_PAYLOAD").is_none());
+    }
+
+    #[test]
+    fn trigger_env_carries_actor_and_reply_to() {
+        let mut r = req(TriggerSource::Telegram);
+        r.actor = Some("123".into());
+        r.reply_to = Some("456".into());
+        let env = trigger_env(&r);
+        assert_eq!(get(&env, "AGENT_TRIGGER_ACTOR"), Some("123"));
+        assert_eq!(get(&env, "AGENT_TRIGGER_REPLY_TO"), Some("456"));
+    }
+
+    #[test]
+    fn trigger_env_serializes_payload_as_json() {
+        let mut r = req(TriggerSource::Telegram);
+        r.payload = Some(serde_json::json!({"text": "hi", "chat_id": 7}));
+        let env = trigger_env(&r);
+        let raw = get(&env, "AGENT_TRIGGER_PAYLOAD").expect("payload must be present");
+        let parsed: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(parsed["text"], "hi");
+        assert_eq!(parsed["chat_id"], 7);
+    }
+
+    #[test]
+    fn trigger_env_keeps_message_text_out_of_argv() {
+        // The body must only ever reach the agent through the environment.
+        // Shell metacharacters in a chat message are then just bytes.
+        let mut r = req(TriggerSource::Telegram);
+        r.payload = Some(serde_json::json!({"text": "; rm -rf / #"}));
+        let env = trigger_env(&r);
+        assert!(r.args.is_empty(), "args must stay empty");
+        let raw = get(&env, "AGENT_TRIGGER_PAYLOAD").unwrap();
+        assert!(raw.contains("rm -rf"), "payload carries it verbatim: {raw}");
+    }
+
+    #[test]
+    fn trigger_env_never_emits_agent_reserved_keys() {
+        // trigger_env only produces AGENT_TRIGGER_* names. The runner also
+        // defends by ordering, but producing a reserved key here would be
+        // a bug worth catching at the source.
+        let mut r = req(TriggerSource::Telegram);
+        r.actor = Some("1".into());
+        r.reply_to = Some("2".into());
+        r.payload = Some(serde_json::json!({}));
+        for (k, _) in trigger_env(&r) {
+            assert!(
+                k.starts_with("AGENT_TRIGGER_"),
+                "unexpected key produced: {k}"
+            );
+        }
+    }
+
+    fn inbound(user_id: i64) -> dotagent_notify::telegram_inbound::InboundMessage {
+        dotagent_notify::telegram_inbound::InboundMessage {
+            update_id: 1,
+            user_id,
+            chat_id: 999,
+            text: "how's disk?".into(),
+        }
+    }
+
+    fn cfg(allowed: Vec<i64>) -> dotagent_core::TelegramIngressConfig {
+        dotagent_core::TelegramIngressConfig {
+            bot_token: "t".into(),
+            allowed_user_ids: allowed,
+            ..Default::default()
+        }
+    }
+
+    fn limiter() -> dotagent_notify::telegram_inbound::RateLimiter {
+        dotagent_notify::telegram_inbound::RateLimiter::new(10)
+    }
+
+    // --- screen(): the allowlist is the only thing between a leaked bot
+    // token and local execution. Deny cases dominate on purpose. ---
+
+    #[test]
+    fn screen_refuses_an_unlisted_user() {
+        let err = screen(&inbound(7), &cfg(vec![1, 2]), &mut limiter()).unwrap_err();
+        assert_eq!(err, "user id not in allowed_user_ids");
+    }
+
+    #[test]
+    fn screen_refuses_everyone_when_the_allowlist_is_empty() {
+        // Empty must mean nobody. Reading it as "no restriction" would turn a
+        // forgotten config line into an open execution endpoint.
+        assert!(screen(&inbound(7), &cfg(vec![]), &mut limiter()).is_err());
+        assert!(screen(&inbound(0), &cfg(vec![]), &mut limiter()).is_err());
+    }
+
+    #[test]
+    fn screen_refuses_a_negated_id() {
+        assert!(screen(&inbound(-7), &cfg(vec![7]), &mut limiter()).is_err());
+    }
+
+    #[test]
+    fn screen_refuses_past_the_rate_limit() {
+        let c = cfg(vec![7]);
+        let mut rl = dotagent_notify::telegram_inbound::RateLimiter::new(2);
+        assert!(screen(&inbound(7), &c, &mut rl).is_ok());
+        assert!(screen(&inbound(7), &c, &mut rl).is_ok());
+        let err = screen(&inbound(7), &c, &mut rl).unwrap_err();
+        assert_eq!(err, "rate limit exceeded");
+    }
+
+    #[test]
+    fn screen_checks_the_allowlist_before_spending_rate_budget() {
+        // Otherwise an unlisted flooder could exhaust a listed user's quota.
+        let c = cfg(vec![7]);
+        let mut rl = dotagent_notify::telegram_inbound::RateLimiter::new(1);
+        assert!(screen(&inbound(99), &c, &mut rl).is_err());
+        assert!(
+            screen(&inbound(7), &c, &mut rl).is_ok(),
+            "the listed user's budget must be untouched"
+        );
+    }
+
+    #[test]
+    fn screen_accepts_a_listed_user_and_targets_the_dispatcher() {
+        let req = screen(&inbound(7), &cfg(vec![7]), &mut limiter()).unwrap();
+        assert_eq!(req.agent, "telegram-assistant");
+        assert_eq!(req.source, TriggerSource::Telegram);
+        assert_eq!(req.actor.as_deref(), Some("7"));
+        assert_eq!(req.reply_to.as_deref(), Some("999"));
+    }
+
+    #[test]
+    fn screen_never_puts_the_message_body_in_argv() {
+        let req = screen(&inbound(7), &cfg(vec![7]), &mut limiter()).unwrap();
+        assert!(req.args.is_empty(), "body must travel in the payload only");
+        assert_eq!(req.payload.unwrap()["text"], "how's disk?");
+    }
+
+    #[test]
+    fn screen_ignores_the_message_when_choosing_the_agent() {
+        // The message selects nothing: the dispatcher is operator config.
+        let mut msg = inbound(7);
+        msg.text = "run disk-alert; rm -rf /".into();
+        let req = screen(&msg, &cfg(vec![7]), &mut limiter()).unwrap();
+        assert_eq!(req.agent, "telegram-assistant");
+    }
+
+    #[test]
+    fn slug_is_namespaced_per_source() {
+        assert_eq!(req(TriggerSource::Telegram).slug(), "trigger-telegram");
+        assert_eq!(req(TriggerSource::Mcp).slug(), "trigger-mcp");
+    }
 }

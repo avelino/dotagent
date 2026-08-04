@@ -51,7 +51,44 @@ service_name = "dotagent"
 
 [secrets]
 file = ""                          # empty = default path or DOTAGENT_SECRETS_FILE
+
+[telegram]
+bot_token = "${TELEGRAM_BOT_TOKEN}"  # empty = inbound Telegram off (default)
+allowed_user_ids = [123456789]       # numeric ids; empty = nobody
+dispatcher_agent = "telegram-assistant"
+poll_timeout_seconds = 30            # long-poll hold, capped at 50 by Telegram
+rate_limit_per_minute = 10           # accepted messages per sender
 ```
+
+---
+
+## `[telegram]`
+
+Inbound Telegram. **Off unless configured** — dotagent opens no inbound path
+you did not ask for. Outbound notifications are unrelated and live in the
+manifest's `[[notifiers]]`; see [Notifications](../concepts/notifications.md).
+
+| Field | Default | Meaning |
+|---|---|---|
+| `bot_token` | `""` | Bot API token. Accepts `${VAR}`, resolved against the secrets store at poll time. |
+| `allowed_user_ids` | `[]` | Numeric Telegram user ids allowed to trigger runs. |
+| `dispatcher_agent` | `"telegram-assistant"` | Agent every accepted message is handed to. |
+| `poll_timeout_seconds` | `30` | Seconds to hold `getUpdates` open. Telegram caps this at 50. |
+| `rate_limit_per_minute` | `10` | Accepted messages per sender per minute. |
+
+The ingress starts only when `bot_token` **and** at least one entry in
+`allowed_user_ids` are present. A token with an empty allowlist stays off and
+says so in the log: reading empty as "no restriction" would turn one forgotten
+line into an open remote-execution endpoint.
+
+This section is daemon-level rather than per-manifest because Telegram allows
+exactly one `getUpdates` consumer per bot token. N manifests each polling would
+compete for the same offset and silently drop each other's messages.
+
+Enabling this changes the threat model — a message from the public internet can
+cause a local process to run. Read
+[V8 in the threat model](../security/threat-model.md) before turning it on, and
+[Telegram](../concepts/telegram.md) for the full setup.
 
 ---
 
