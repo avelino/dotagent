@@ -54,37 +54,51 @@ Everything else in this doc is detail.
 
 ## Crate layout
 
-The workspace has eight crates. Each has one responsibility and a single
+The workspace has eleven crates. Each has one responsibility and a single
 direction of "depends on" — no cycles.
 
 ```mermaid
 flowchart TD
-    cli[dotagent<br/>CLI binary] --> core[dotagent-core<br/>types]
-    cli --> runner[dotagent-runner<br/>spawn + hooks]
+    cli[dotagent<br/>CLI binary] --> runner[dotagent-runner<br/>spawn + hooks]
     cli --> scheduler[dotagent-scheduler<br/>pure functions]
-    cli --> state[dotagent-state<br/>filesystem state]
-    cli --> notify[dotagent-notify<br/>built-in notifiers]
-    cli --> plugin[dotagent-plugin<br/>subprocess JSON]
-    cli --> telemetry[dotagent-telemetry<br/>tracing + OTel]
+    cli --> mcp[dotagent-mcp<br/>JSON-RPC + MCP types]
     cli --> unitgen[dotagent-unit-gen<br/>plist / service]
-    runner --> core
-    runner --> state
-    runner --> notify
-    runner --> plugin
+    runner --> core[dotagent-core<br/>types]
+    runner --> state[dotagent-state<br/>filesystem state]
+    runner --> plugin[dotagent-plugin<br/>subprocess JSON]
+    runner --> telemetry[dotagent-telemetry<br/>tracing + OTel]
+    runner --> supervisor[dotagent-supervisor<br/>process lifecycle]
     scheduler --> core
     state --> core
-    notify --> core
-    plugin --> core
+    telemetry --> core
+    telemetry --> state
+    plugin --> supervisor
+    core --> notify[dotagent-notify<br/>notifiers + ingress]
+    notify --> secrets[dotagent-secrets<br/>secrets.env loader]
 ```
+
+Two edges surprise people:
+
+**`core → notify`, not the other way.** The manifest re-exports
+`NotifierEntry`, so the type crate depends on the driver crate. It also
+means `cargo publish` has to publish `notify` *before* `core`.
+
+**`notify → secrets`, and nothing depends on `secrets`.** It exists as its
+own crate precisely to avoid a `core → notify → core` cycle: the Telegram
+driver needs `${VAR}` resolution, and putting that loader in `core` would
+close the loop.
 
 | Crate                 | Owns                                                                                            |
 |-----------------------|-------------------------------------------------------------------------------------------------|
-| `dotagent-core`       | Shared types: `AgentManifest`, `Schedule`, `Heartbeat`, `WindowState`, `Config`, `AuditEvent`.  |
+| `dotagent-core`       | Shared types: `AgentManifest`, `Schedule`, `Heartbeat`, `WindowState`, `Config`, `AuditEvent`, `TriggerRequest`. |
 | `dotagent-scheduler`  | **Pure** scheduling math. `compute_next_event`, `expected_at`, `should_retry`, `health_state`. No IO. |
 | `dotagent-runner`     | Spawn the agent subprocess. Timeout, env injection, stdio capture, heartbeat lifecycle, hook firing. |
 | `dotagent-state`      | Filesystem state: heartbeats, window state, audit log, plugin state, manifest cache.            |
-| `dotagent-notify`     | Built-in notifier drivers (`desktop`, `slack`, `ntfy`, `pushover`, `telegram`, `imessage`).     |
+| `dotagent-notify`     | Built-in notifier drivers (`desktop`, `slack`, `ntfy`, `pushover`, `telegram`, `imessage`) **and** inbound Telegram transport. |
+| `dotagent-secrets`    | Loader for `secrets.env`. Separate crate to keep `core → notify` acyclic.                       |
 | `dotagent-plugin`     | `PluginClient` — discover + spawn + JSON-stdio for preflight / sink / third-party notify.       |
+| `dotagent-mcp`        | JSON-RPC 2.0 + Model Context Protocol wire types. No IO, no agent knowledge.                     |
+| `dotagent-supervisor` | Subprocess lifecycle: deadlines, kill-tree via POSIX process groups, live registry.             |
 | `dotagent-telemetry`  | `tracing` setup, JSON file logging, daily rotation, retention sweep, optional OTLP export.      |
 | `dotagent-unit-gen`   | Render `daemon.plist` (macOS) / `daemon.service` (Linux) from templates.                        |
 | `dotagent` (binary)   | CLI subcommands. Wires the crates together.                                                     |
@@ -269,7 +283,9 @@ Two important properties:
   `mcp` CLI, or nothing at all.
 - **Replace the `mcp` CLI.** dotagent and `mcp` are independent
   projects. Agents that use Roam / Sentry / Grafana / etc. call `mcp`
-  directly the same way they did before dotagent existed.
+  directly the same way they did before dotagent existed. dotagent
+  *serves* MCP via `dotagent mcp` (agents as tools) but has no MCP
+  client of its own — see [`../reference/mcp.md`](../reference/mcp.md).
 - **Sandbox the agent.** The `[security]` block in `agent.toml` is v0
   schema-only — `doctor` reports inconsistency, but the runner doesn't
   yet enforce `allowed_commands` / `filesystem_writable` / network
@@ -283,6 +299,9 @@ Two important properties:
 - [`agents.md`](agents.md) — what an agent looks like from the author's side
 - [`plugins.md`](plugins.md) — how the plugin protocol works
 - [`notifications.md`](notifications.md) — why notifiers are NOT plugins
+- [`triggers.md`](triggers.md) — runs caused by an event, not the clock
+- [`telegram.md`](telegram.md) — inbound chat
+- [`../reference/mcp.md`](../reference/mcp.md) — agents as MCP tools
 - [`../reference/cli.md`](../reference/cli.md) — every CLI subcommand
 - [`../reference/agent-spec.md`](../reference/agent-spec.md) — full manifest schema
 - [`../reference/paths.md`](../reference/paths.md) — filesystem layout

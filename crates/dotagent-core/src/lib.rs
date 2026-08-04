@@ -11,9 +11,10 @@ pub mod heartbeat;
 pub mod manifest;
 pub mod security;
 pub mod state;
+pub mod trigger;
 
 pub use audit::{AuditEntry, AuditEvent, Severity, GENESIS_HASH};
-pub use config::{Config, LoggingConfig, SecretsConfig, TelemetryConfig};
+pub use config::{Config, LoggingConfig, SecretsConfig, TelegramIngressConfig, TelemetryConfig};
 pub use error::{Error, Result};
 pub use heartbeat::Heartbeat;
 pub use manifest::{
@@ -21,3 +22,4 @@ pub use manifest::{
 };
 pub use security::{NetworkMode, NetworkPolicy, SecurityConfig};
 pub use state::WindowState;
+pub use trigger::{TriggerRequest, TriggerSource, TRIGGER_SCHEDULE_ID};

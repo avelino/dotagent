@@ -42,6 +42,7 @@ pub mod ntfy;
 pub mod pushover;
 pub mod slack;
 pub mod telegram;
+pub mod telegram_inbound;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

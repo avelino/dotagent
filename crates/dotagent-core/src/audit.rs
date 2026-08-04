@@ -132,6 +132,43 @@ pub enum AuditEvent {
         path: String,
         reason: String,
     },
+    /// An inbound message was accepted and turned into a trigger.
+    ///
+    /// Records **who** and **where**, never the message text. Message bodies
+    /// are user content and can carry secrets the operator pasted; the audit
+    /// log is for attribution, not transcripts. Same posture as
+    /// [`AuditEvent::SecretsLoaded`].
+    TriggerReceived {
+        source: String,
+        /// Attested identity from the source (Telegram numeric user id).
+        actor: String,
+        /// Opaque conversation handle (Telegram chat id).
+        reply_to: String,
+    },
+    /// An inbound message was refused before anything ran. Not-on-the-allowlist
+    /// is the expected case, and it is `Critical` on purpose: someone found the
+    /// bot.
+    TriggerRejected {
+        source: String,
+        actor: String,
+        reason: String,
+    },
+    /// An `agent.toml` exists but failed to parse or validate.
+    ///
+    /// `Critical` because the effect is invisible by nature: the agent simply
+    /// never runs, and nothing else fires to tell you. Before this event, one
+    /// typo could stop the whole scan and the only trace was a log line.
+    ManifestInvalid {
+        path: String,
+        error: String,
+    },
+    /// A run started from a trigger rather than a schedule window.
+    AgentTriggered {
+        source: String,
+        actor: Option<String>,
+        agent: String,
+        schedule: String,
+    },
 }
 
 impl AuditEvent {
@@ -150,6 +187,8 @@ impl AuditEvent {
             | AuditEvent::ConfigReloaded { .. }
             | AuditEvent::AgentRecovered { .. }
             | AuditEvent::SecretsLoaded { .. }
+            | AuditEvent::TriggerReceived { .. }
+            | AuditEvent::AgentTriggered { .. }
             | AuditEvent::PluginInvoked { ok: false, .. } => Severity::Notice,
 
             AuditEvent::AgentRun { .. } /* non-zero exit */
@@ -158,6 +197,8 @@ impl AuditEvent {
             | AuditEvent::ManifestDriftDetected { .. }
             | AuditEvent::PhantomAgentDetected { .. }
             | AuditEvent::SecretsRefused { .. }
+            | AuditEvent::TriggerRejected { .. }
+            | AuditEvent::ManifestInvalid { .. }
             | AuditEvent::AuditChainBroken { .. } => Severity::Critical,
         }
     }

@@ -210,6 +210,8 @@ pub async fn run_now(agent_name: String, schedule: Option<String>, format: Forma
         args: &args,
         dry_run: false,
         manifest_sha256,
+        slug_override: None,
+        extra_env: &[],
     };
     let ctx = RunContext {
         state: &state,

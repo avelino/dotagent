@@ -291,6 +291,25 @@ dotagent doctor
 
 ---
 
+`doctor` also reports inbound Telegram when `[telegram]` is present in
+`config.toml` — whether the ingress is on, and the two ways it can be
+half-configured:
+
+```
+telegram ingress: on — 1 allowed user(s), dispatcher 'telegram-assistant'
+telegram ingress: OFF — bot_token set but allowed_user_ids is empty
+    ⚠ an empty allowlist means nobody, never everybody. Add your numeric user id.
+```
+
+It stays silent when the section is absent, since the ingress is off by
+default. A `dispatcher_agent` that does not resolve is a warning: every
+accepted message would fail after passing the allowlist.
+
+Manifests that fail to parse are listed with `✗` and counted as errors. They
+no longer abort the scan — the healthy agents are still reported below them.
+
+---
+
 ## `plugin list`
 
 List every plugin referenced by any discovered manifest, with its
@@ -463,6 +482,41 @@ Use this to:
   window).
 - Manually exercise the full plugin chain (preflight → spawn → sink →
   notify).
+
+---
+
+## `mcp`
+
+Serve every discovered agent as an MCP tool over stdio. JSON-RPC 2.0, one
+object per line.
+
+```bash
+dotagent mcp
+```
+
+Takes no flags — the catalog comes from the manifests already on disk. Point
+any MCP client at it:
+
+```json
+{ "mcpServers": { "dotagent": { "command": "dotagent", "args": ["mcp"] } } }
+```
+
+**Example** — list the catalog by hand:
+
+```bash
+printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | dotagent mcp
+# → {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"run-disk-alert",...}]}}
+```
+
+Agents run in **this** process, like `run-now` — not through the daemon — so
+the subprocess tree does not appear in `dotagent status`. State is keyed off
+the `trigger-mcp` slug so an on-demand run never overwrites the scheduled
+history of the same agent.
+
+stdout carries protocol only; logging goes to stderr, so `RUST_LOG=debug
+dotagent mcp` stays safe to run under a client.
+
+Full protocol reference: [MCP server](mcp.md).
 
 ---
 

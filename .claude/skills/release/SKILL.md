@@ -78,28 +78,52 @@ git tag -a vX.Y.Z -m "release X.Y.Z"
 
 A ordem é grafo de dependência: publicar primeiro o que ninguém depende.
 
+> Atenção: `dotagent-core` **não** é nível 0. Ele depende de
+> `dotagent-notify` (re-exporta `NotifierEntry` no manifest), que por sua
+> vez depende de `dotagent-secrets`. Publicar core primeiro falha.
+
 ```bash
 # Nível 0 — sem deps internas
-cargo publish -p dotagent-core
-cargo publish -p dotagent-plugin
+cargo publish -p dotagent-secrets
+cargo publish -p dotagent-supervisor
+cargo publish -p dotagent-unit-gen
+cargo publish -p dotagent-mcp
 
-# Nível 1 — dependem do core
-cargo publish -p dotagent-notify
+# Nível 1
+cargo publish -p dotagent-notify        # → secrets
+
+# Nível 2
+cargo publish -p dotagent-core          # → notify
+
+# Nível 3 — dependem do core
 cargo publish -p dotagent-scheduler
 cargo publish -p dotagent-state
-cargo publish -p dotagent-unit-gen
+cargo publish -p dotagent-plugin        # → supervisor
 
-# Nível 2 — dependem de state
-cargo publish -p dotagent-runner
+# Nível 4
+cargo publish -p dotagent-telemetry     # → core, state
 
-# Nível 3 — CLI
+# Nível 5
+cargo publish -p dotagent-runner        # → core, state, plugin, notify, supervisor, telemetry
+
+# Nível 6 — CLI
 cargo publish -p dotagent
 
-# Plugins (independentes — só preflight e sink agora)
+# Plugins (independentes — só preflight e sink)
 cargo publish -p dotagent-plugin-preflight-warp
 cargo publish -p dotagent-plugin-preflight-cmd
 cargo publish -p dotagent-plugin-sink-roam
+cargo publish -p dotagent-plugin-sink-outl
 cargo publish -p dotagent-plugin-sink-file
+```
+
+Pra reconferir o grafo depois de adicionar crate nova:
+
+```bash
+for c in crates/*/; do
+  printf "%-22s -> %s\n" "$(basename "$c")" \
+    "$(grep -oE '^dotagent-[a-z-]+\.workspace' "$c/Cargo.toml" | sed 's/\.workspace//' | tr '\n' ' ')"
+done
 ```
 
 Crates.io tem rate limit: deixa ~30s entre publishes.

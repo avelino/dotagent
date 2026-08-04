@@ -7,6 +7,7 @@ members = [
   "crates/dotagent-runner",
   "crates/dotagent-state",
   "crates/dotagent-plugin",
+  "crates/dotagent-mcp",
   "crates/dotagent-notify",
   "crates/dotagent-secrets",
   "crates/dotagent-supervisor",
@@ -37,6 +38,7 @@ dotagent-scheduler = { path = "crates/dotagent-scheduler", version = "0.1.4" }
 dotagent-runner = { path = "crates/dotagent-runner", version = "0.1.4" }
 dotagent-state = { path = "crates/dotagent-state", version = "0.1.4" }
 dotagent-plugin = { path = "crates/dotagent-plugin", version = "0.1.4" }
+dotagent-mcp = { path = "crates/dotagent-mcp", version = "0.1.4" }
 dotagent-notify = { path = "crates/dotagent-notify", version = "0.1.4" }
 dotagent-secrets = { path = "crates/dotagent-secrets", version = "0.1.4" }
 dotagent-supervisor = { path = "crates/dotagent-supervisor", version = "0.1.4" }
@@ -50,6 +52,8 @@ tokio = { version = "1", features = [
   "process",
   "fs",
   "io-util",
+  # stdin/stdout for the MCP server's line-delimited transport.
+  "io-std",
   "sync",
   "time",
   "signal",

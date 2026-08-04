@@ -66,7 +66,7 @@ impl fmt::Debug for TelegramConfig {
 /// Returns `Err` if a referenced variable is unset — failing fast beats
 /// sending requests authenticated as the literal string
 /// `"${TELEGRAM_BOT_TOKEN}"`.
-fn expand_env(input: &str) -> std::result::Result<String, String> {
+pub(crate) fn expand_env(input: &str) -> std::result::Result<String, String> {
     // `dotagent_secrets::lookup` already does store-first, env-fallback.
     expand_env_with(input, dotagent_secrets::lookup)
 }
@@ -104,7 +104,7 @@ where
 /// `Display` includes the request URL for many failure modes, and our URL
 /// embeds the bot token (`api.telegram.org/bot<token>/sendMessage`), so we
 /// must never let the raw error reach `tracing`.
-fn sanitize_reqwest_err(e: &reqwest::Error) -> String {
+pub(crate) fn sanitize_reqwest_err(e: &reqwest::Error) -> String {
     let kind = if e.is_timeout() {
         "timeout"
     } else if e.is_connect() {
@@ -167,59 +167,94 @@ impl Notifier for TelegramConfig {
         if self.chat_id.trim().is_empty() {
             return Err(NotifyError::Config("telegram: chat_id is required".into()));
         }
-        if self.bot_token.trim().is_empty() {
-            return Err(NotifyError::Config(
-                "telegram: bot_token is required".into(),
-            ));
-        }
-        let token = expand_env(&self.bot_token).map_err(NotifyError::Config)?;
-        if token.trim().is_empty() {
-            return Err(NotifyError::Config(
-                "telegram: bot_token resolved to empty string".into(),
-            ));
-        }
-
-        let body_text = match self.parse_mode {
-            Some(ParseMode::MarkdownV2) => escape_markdown_v2(ctx.message),
-            _ => ctx.message.to_string(),
-        };
-
-        let mut payload = json!({
-            "chat_id": self.chat_id,
-            "text": body_text,
-        });
-        if let Some(mode) = self.parse_mode {
-            let mode_str = match mode {
-                ParseMode::MarkdownV2 => "MarkdownV2",
-                ParseMode::Html => "HTML",
-                ParseMode::MarkdownLegacy => "Markdown",
-            };
-            payload["parse_mode"] = json!(mode_str);
-        }
-        if let Some(true) = self.disable_notification {
-            payload["disable_notification"] = json!(true);
-        }
-
-        // URL embeds the token; never log it. Both the URL and the
-        // request-side `reqwest::Error::Display` carry the token, so we
-        // convert transport errors into a sanitized `Backend` message
-        // before they can reach `tracing` via `error = %e`.
-        let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-        let res = match reqwest::Client::new()
-            .post(&url)
-            .json(&payload)
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return Err(NotifyError::Backend(sanitize_reqwest_err(&e))),
-        };
-        let status = res.status();
-        if !status.is_success() {
-            return Err(NotifyError::Backend(format!("telegram returned {status}")));
-        }
-        Ok(())
+        send_message(
+            &self.bot_token,
+            &self.chat_id,
+            ctx.message,
+            self.parse_mode,
+            self.disable_notification.unwrap_or(false),
+        )
+        .await
     }
+}
+
+/// Shared HTTP client.
+///
+/// Built once: the inbound poller holds a `getUpdates` connection open for up
+/// to 50 seconds per iteration, and rebuilding the TLS stack every time (which
+/// is what `Client::new()` per call did) is wasted work on a hot path. The
+/// timeout has to clear the longest long-poll, hence 90s rather than something
+/// tighter.
+pub(crate) fn client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(90))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+/// Post one message to an arbitrary chat.
+///
+/// Split out of [`Notifier::send`] so inbound replies can target the
+/// conversation that asked instead of the static `chat_id` in the manifest.
+/// `NotifyContext` carries no destination and the `Notifier` trait has no way
+/// to return one, so a reply path has to bypass the trait rather than bend it.
+pub(crate) async fn send_message(
+    bot_token: &str,
+    chat_id: &str,
+    text: &str,
+    parse_mode: Option<ParseMode>,
+    silent: bool,
+) -> Result<()> {
+    if bot_token.trim().is_empty() {
+        return Err(NotifyError::Config(
+            "telegram: bot_token is required".into(),
+        ));
+    }
+    let token = expand_env(bot_token).map_err(NotifyError::Config)?;
+    if token.trim().is_empty() {
+        return Err(NotifyError::Config(
+            "telegram: bot_token resolved to empty string".into(),
+        ));
+    }
+
+    let body_text = match parse_mode {
+        Some(ParseMode::MarkdownV2) => escape_markdown_v2(text),
+        _ => text.to_string(),
+    };
+
+    let mut payload = json!({
+        "chat_id": chat_id,
+        "text": body_text,
+    });
+    if let Some(mode) = parse_mode {
+        let mode_str = match mode {
+            ParseMode::MarkdownV2 => "MarkdownV2",
+            ParseMode::Html => "HTML",
+            ParseMode::MarkdownLegacy => "Markdown",
+        };
+        payload["parse_mode"] = json!(mode_str);
+    }
+    if silent {
+        payload["disable_notification"] = json!(true);
+    }
+
+    // URL embeds the token; never log it. Both the URL and the
+    // request-side `reqwest::Error::Display` carry the token, so we
+    // convert transport errors into a sanitized `Backend` message
+    // before they can reach `tracing` via `error = %e`.
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    let res = match client().post(&url).json(&payload).send().await {
+        Ok(r) => r,
+        Err(e) => return Err(NotifyError::Backend(sanitize_reqwest_err(&e))),
+    };
+    let status = res.status();
+    if !status.is_success() {
+        return Err(NotifyError::Backend(format!("telegram returned {status}")));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

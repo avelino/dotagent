@@ -153,6 +153,36 @@ LLM. This is intentional:
 See [`concepts/agents.md`](concepts/agents.md#the-dotagent-definition)
 for the philosophy.
 
+### Does dotagent speak MCP?
+
+It **serves** MCP; it does not **consume** it.
+
+`dotagent mcp` exposes every installed agent as a callable tool over
+JSON-RPC on stdio, so Claude Code, Claude Desktop or any MCP proxy can
+run your agents. The point is that a model picks from a closed catalog
+instead of composing a command — a tool name that does not exist is not
+callable, so "only run what the operator declared" is a property of the
+protocol rather than a check someone has to remember.
+
+In the other direction nothing changed: dotagent has no MCP client. An
+agent that wants to reach an MCP server spawns one, the same way it
+spawns `curl`. See [`reference/mcp.md`](reference/mcp.md).
+
+### Can a message start a run?
+
+Yes, with inbound Telegram configured. It is off by default.
+
+A message reaches a dispatcher agent you name, and that agent's stdout
+goes back to the chat. dotagent itself interprets nothing — there is no
+model, provider or prompt in the daemon. What the dispatcher does with
+the message is its business: hand it to `claude -p`, or match `/disk`
+with a `case` statement and spend no tokens at all.
+
+This is the one path where someone with no access to your machine can
+cause a local process to run, so read
+[V8 in the threat model](security/threat-model.md) before enabling it.
+See [`concepts/telegram.md`](concepts/telegram.md).
+
 ---
 
 ## Workflow
@@ -184,6 +214,11 @@ dotagent run-now <name> [--schedule <id>]
 
 This fires the agent now, ignoring schedule windows. Preflight, sinks,
 and notifiers all run as usual.
+
+From an MCP client (Claude Code, Claude Desktop) the same thing is a
+tool call against `dotagent mcp`. From a chat, it is a message — see
+[`concepts/triggers.md`](concepts/triggers.md) for how those differ from
+a scheduled run.
 
 ### How do I see what the daemon is about to do?
 

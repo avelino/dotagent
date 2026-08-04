@@ -18,6 +18,7 @@ pub mod completions;
 pub mod daemon;
 pub mod daily_summary;
 pub mod list_agents;
+pub mod mcp;
 pub mod output;
 pub mod status;
 pub mod utility;
@@ -38,6 +39,8 @@ pub async fn run(name: String, schedule: String, dry_run: bool) -> Result<()> {
         args: &args,
         dry_run,
         manifest_sha256: None,
+        slug_override: None,
+        extra_env: &[],
     };
     let outcome = runner_run(spec, &state, None)
         .await
@@ -159,10 +162,20 @@ pub async fn doctor() -> Result<()> {
     // warnings (insecure mode is a problem the operator should fix), never
     // toward errors (daemon still runs without secrets).
     let (mut errors, mut warnings) = report_secrets_status();
+    warnings += report_telegram_status();
 
-    let agents = discovery::discover_all()?;
+    let found = discovery::discover();
+    // Report unloadable manifests first: an agent that cannot parse never
+    // runs, and its absence from the list below is otherwise silent.
+    for bad in &found.invalid {
+        println!("✗ {}: {}", bad.path.display(), bad.error);
+        errors += 1;
+    }
+    let agents = found.agents;
     if agents.is_empty() {
-        println!("no agents discovered");
+        if errors == 0 {
+            println!("no agents discovered");
+        }
         return Ok(());
     }
     let client = PluginClient::from_environment();
@@ -342,6 +355,50 @@ pub async fn plugin_invoke(name: String, _payload: String) -> Result<()> {
 /// is fine (single-digit refs in practice). If a future CI gate calls
 /// `doctor` in a tight loop with many refs, cache inside this function
 /// rather than reaching for `snapshot()`.
+/// Report inbound Telegram status. Returns a warning count.
+///
+/// Silent when `[telegram]` is absent — the ingress is off by default and
+/// saying so on every `doctor` run would be noise. It speaks up in the two
+/// cases the operator needs to hear about: a half-configured section that
+/// silently does nothing, and a dispatcher agent that does not resolve.
+fn report_telegram_status() -> usize {
+    let config =
+        dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
+    let tg = &config.telegram;
+    if tg.bot_token.is_empty() && tg.allowed_user_ids.is_empty() {
+        return 0;
+    }
+
+    let mut warnings = 0usize;
+    if tg.is_enabled() {
+        println!(
+            "telegram ingress: on — {} allowed user(s), dispatcher '{}'",
+            tg.allowed_user_ids.len(),
+            tg.dispatcher_agent
+        );
+        // A dispatcher that does not resolve means every accepted message
+        // fails after passing the allowlist — worth catching here rather
+        // than in the chat.
+        if discovery::find_by_name(&tg.dispatcher_agent).is_err() {
+            println!(
+                "    ⚠ dispatcher agent '{}' not found — every message will fail",
+                tg.dispatcher_agent
+            );
+            warnings += 1;
+        }
+    } else if tg.allowed_user_ids.is_empty() {
+        println!("telegram ingress: OFF — bot_token set but allowed_user_ids is empty");
+        println!(
+            "    ⚠ an empty allowlist means nobody, never everybody. Add your numeric user id."
+        );
+        warnings += 1;
+    } else {
+        println!("telegram ingress: OFF — allowed_user_ids set but bot_token is empty");
+        warnings += 1;
+    }
+    warnings
+}
+
 fn report_secrets_status() -> (usize, usize) {
     let config =
         dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();

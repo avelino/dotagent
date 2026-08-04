@@ -1,0 +1,14 @@
+[package]
+name = "dotagent-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "JSON-RPC 2.0 and Model Context Protocol types for dotagent's MCP server."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

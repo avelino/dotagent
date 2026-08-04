@@ -23,7 +23,6 @@ use fs2::FileExt;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use thiserror::Error;
-use tracing::warn;
 
 pub type Result<T> = std::result::Result<T, StateError>;
 
@@ -167,10 +166,15 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     }
     fs::rename(&tmp, path)?;
 
-    // best-effort: drop lock file when done
-    if let Err(e) = fs::remove_file(&lock_path) {
-        warn!(?e, "failed to remove lock file");
-    }
+    // The lock file is deliberately left on disk.
+    //
+    // Unlinking it here — while still holding the lock — breaks mutual
+    // exclusion: another process that opens the same path afterwards gets a
+    // *fresh inode* and acquires its own "exclusive" lock, so two writers end
+    // up convinced they have the file to themselves. `AuditLog::append` uses
+    // the same flock idiom and never unlinks, for the same reason.
+    //
+    // An empty lock file per state file is cheap; a lost update is not.
     drop(lock);
     Ok(())
 }
@@ -189,6 +193,55 @@ mod tests {
     #[test]
     fn slug_default_for_empty_args() {
         assert_eq!(slug_from_args(&[]), "default");
+    }
+
+    #[test]
+    fn write_json_keeps_the_lock_file_on_disk() {
+        // Unlinking it while holding the lock would let the next writer open
+        // a fresh inode and acquire its own "exclusive" lock. The file staying
+        // put is what makes flock actually exclude.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("thing.json");
+        write_json(&path, &serde_json::json!({"a": 1})).unwrap();
+        assert!(
+            path.with_extension("lock").exists(),
+            "lock file must survive the write"
+        );
+    }
+
+    #[test]
+    fn concurrent_writers_never_produce_a_torn_file() {
+        // Each thread writes a distinct payload. Whoever wins, the file must
+        // parse — a truncated or interleaved write is the failure this guards.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hot.json");
+        let big: String = "x".repeat(64 * 1024);
+
+        std::thread::scope(|s| {
+            for i in 0..8 {
+                let path = path.clone();
+                let big = big.clone();
+                s.spawn(move || {
+                    for _ in 0..10 {
+                        let v = serde_json::json!({ "writer": i, "pad": big });
+                        write_json(&path, &v).expect("write must not fail");
+                    }
+                });
+            }
+        });
+
+        let raw = fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("file must be valid JSON after concurrent writes");
+        assert!(parsed.get("writer").is_some());
+    }
+
+    #[test]
+    fn write_json_leaves_no_temp_file_behind() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("thing.json");
+        write_json(&path, &serde_json::json!({"a": 1})).unwrap();
+        assert!(!path.with_extension("json.tmp").exists());
     }
 
     #[test]

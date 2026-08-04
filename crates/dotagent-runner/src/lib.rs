@@ -21,7 +21,7 @@ use serde::Serialize;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tracing::info;
+use tracing::{info, warn};
 
 pub type Result<T> = std::result::Result<T, RunnerError>;
 
@@ -61,6 +61,31 @@ pub struct RunSpec<'a> {
     /// sha256 of the manifest text — recorded in the audit log so forensics
     /// can correlate runs with a specific manifest revision.
     pub manifest_sha256: Option<String>,
+    /// Replaces the args-derived slug for heartbeat and window files.
+    ///
+    /// Scheduled runs leave this `None` and key their state off the schedule's
+    /// args. On-demand runs (trigger, MCP) set it so they never overwrite
+    /// `last_success_at` for a cron window that never actually fired — which
+    /// would make the scheduler believe a missed window had succeeded.
+    pub slug_override: Option<&'a str>,
+    /// Per-invocation environment, applied after the manifest's `[env.extra]`
+    /// and before the `AGENT_*` block.
+    ///
+    /// Carries trigger context (`AGENT_TRIGGER_*`) that varies per run and
+    /// therefore cannot live in the manifest. Keys starting with `AGENT_` that
+    /// collide with the injected block are overwritten by it — the runner's own
+    /// variables are not spoofable from here.
+    pub extra_env: &'a [(String, String)],
+}
+
+impl RunSpec<'_> {
+    /// Slug for this run's state files.
+    fn slug(&self) -> String {
+        match self.slug_override {
+            Some(s) => s.to_string(),
+            None => slug_from_args(self.args),
+        }
+    }
 }
 
 // stdout_tail is consumed by:
@@ -110,7 +135,7 @@ pub async fn run_with_hooks(
     // Hold on to references that outlive the `spec` move into `run()` below.
     let manifest_ref: &AgentManifest = spec.manifest;
     let schedule_id = spec.schedule_id.to_string();
-    let args_slug = slug_from_args(spec.args);
+    let args_slug = spec.slug();
     let manifest_sha256 = spec.manifest_sha256.clone().unwrap_or_default();
 
     // 1) Preflight (only if plugins are wired up)
@@ -227,7 +252,7 @@ pub async fn run(
     supervisor: Option<&Supervisor>,
 ) -> Result<RunOutcome> {
     let name = spec.manifest.agent.name.clone();
-    let slug = slug_from_args(spec.args);
+    let slug = spec.slug();
 
     // Heartbeat start
     let start = Local::now();
@@ -378,9 +403,40 @@ pub async fn run(
     });
 
     if !spec.dry_run {
-        let mut hb = state
-            .read_heartbeat(&name, &slug)?
-            .expect("heartbeat written above");
+        // The start heartbeat was written above, but it is a file on disk and
+        // another process (`run-now`, `dotagent mcp`, an operator with `rm`)
+        // can remove it while the agent runs. Reconstructing beats panicking:
+        // the run already happened, and losing its record to an `expect` would
+        // turn a cosmetic problem into a dead daemon.
+        let mut hb = match state.read_heartbeat(&name, &slug) {
+            Ok(Some(hb)) => hb,
+            Ok(None) => {
+                warn!(
+                    agent = %name,
+                    slug = %slug,
+                    "heartbeat vanished mid-run — rebuilding from this run"
+                );
+                Heartbeat {
+                    name: name.clone(),
+                    slug: slug.clone(),
+                    args: spec.args.to_vec(),
+                    started_at: start.timestamp(),
+                    started_at_iso: start.format("%Y-%m-%dT%H:%M:%S%z").to_string(),
+                    finished_at: None,
+                    finished_at_iso: None,
+                    exit_code: None,
+                    duration_seconds: None,
+                    // Unknown, and guessing would be worse: claiming a success
+                    // that never happened makes the scheduler skip a window.
+                    last_success_at: None,
+                    last_success_at_iso: None,
+                }
+            }
+            Err(e) => {
+                warn!(agent = %name, slug = %slug, error = %e, "heartbeat unreadable mid-run");
+                return Err(e.into());
+            }
+        };
         hb.finished_at = Some(finish.timestamp());
         hb.finished_at_iso = Some(finish.format("%Y-%m-%dT%H:%M:%S%z").to_string());
         hb.exit_code = Some(exit_code);
@@ -422,6 +478,11 @@ fn apply_env(
             cmd.env(k, v);
         }
     }
+    // Per-invocation env goes before the AGENT_* block on purpose: a trigger
+    // payload must never be able to redefine AGENT_NAME or AGENT_HEARTBEAT_FILE.
+    for (k, v) in spec.extra_env {
+        cmd.env(k, v);
+    }
     cmd.env("AGENT_NAME", name);
     cmd.env("AGENT_HOME", spec.manifest_dir);
     cmd.env("AGENT_TMPDIR", tmpdir);
@@ -441,4 +502,272 @@ fn tail_lines(s: &str, n: usize) -> (String, usize) {
     let total = lines.len();
     let start = total.saturating_sub(n);
     (lines[start..].join("\n"), start)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest(toml_src: &str) -> AgentManifest {
+        toml::from_str(toml_src).expect("fixture manifest must parse")
+    }
+
+    fn minimal() -> AgentManifest {
+        manifest(
+            r#"
+[agent]
+name = "x"
+[run]
+command = "true"
+"#,
+        )
+    }
+
+    fn spec_with<'a>(
+        m: &'a AgentManifest,
+        args: &'a [String],
+        slug_override: Option<&'a str>,
+        extra_env: &'a [(String, String)],
+    ) -> RunSpec<'a> {
+        RunSpec {
+            manifest: m,
+            manifest_dir: Path::new("/tmp"),
+            schedule_id: "daily",
+            args,
+            dry_run: false,
+            manifest_sha256: None,
+            slug_override,
+            extra_env,
+        }
+    }
+
+    /// Collect the env a `Command` would apply, as (key, value) strings.
+    fn env_of(cmd: &Command) -> Vec<(String, String)> {
+        cmd.as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_str()?.to_string(),
+                    v.and_then(|v| v.to_str()).unwrap_or_default().to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    fn lookup(cmd: &Command, key: &str) -> Option<String> {
+        env_of(cmd)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
+    #[test]
+    fn slug_defaults_to_args_derivation() {
+        let m = minimal();
+        let args = vec!["--period".to_string(), "yesterday".to_string()];
+        let spec = spec_with(&m, &args, None, &[]);
+        assert_eq!(spec.slug(), slug_from_args(&args));
+    }
+
+    #[test]
+    fn slug_override_wins_over_args() {
+        let m = minimal();
+        let args = vec!["--period".to_string(), "yesterday".to_string()];
+        let spec = spec_with(&m, &args, Some("trigger-telegram"), &[]);
+        assert_eq!(spec.slug(), "trigger-telegram");
+    }
+
+    #[test]
+    fn slug_override_keeps_triggered_state_off_the_scheduled_slug() {
+        // The whole point: an on-demand run must not write the heartbeat of
+        // the cron window, or the scheduler stops retrying a missed run.
+        let m = minimal();
+        let args = vec!["--period".to_string(), "yesterday".to_string()];
+        let scheduled = spec_with(&m, &args, None, &[]);
+        let triggered = spec_with(&m, &args, Some("trigger-telegram"), &[]);
+        assert_ne!(scheduled.slug(), triggered.slug());
+    }
+
+    #[test]
+    fn extra_env_reaches_the_command() {
+        let m = minimal();
+        let extra = vec![("AGENT_TRIGGER_SOURCE".to_string(), "telegram".to_string())];
+        let spec = spec_with(&m, &[], None, &extra);
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "x",
+            "slug",
+            &Local::now(),
+            Path::new("/tmp"),
+            Path::new("/tmp/hb.json"),
+        );
+        assert_eq!(
+            lookup(&cmd, "AGENT_TRIGGER_SOURCE").as_deref(),
+            Some("telegram")
+        );
+    }
+
+    #[test]
+    fn extra_env_cannot_override_agent_name() {
+        // A trigger payload is untrusted input. If it could redefine
+        // AGENT_NAME, an agent's own identity would be attacker-controlled.
+        let m = minimal();
+        let extra = vec![("AGENT_NAME".to_string(), "evil".to_string())];
+        let spec = spec_with(&m, &[], None, &extra);
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "real-name",
+            "slug",
+            &Local::now(),
+            Path::new("/tmp"),
+            Path::new("/tmp/hb.json"),
+        );
+        assert_eq!(lookup(&cmd, "AGENT_NAME").as_deref(), Some("real-name"));
+    }
+
+    #[test]
+    fn extra_env_cannot_override_heartbeat_file() {
+        // Redirecting the heartbeat would let a trigger corrupt scheduling
+        // state for an unrelated agent.
+        let m = minimal();
+        let extra = vec![(
+            "AGENT_HEARTBEAT_FILE".to_string(),
+            "/tmp/evil.json".to_string(),
+        )];
+        let spec = spec_with(&m, &[], None, &extra);
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "x",
+            "slug",
+            &Local::now(),
+            Path::new("/tmp"),
+            Path::new("/tmp/real.json"),
+        );
+        assert_eq!(
+            lookup(&cmd, "AGENT_HEARTBEAT_FILE").as_deref(),
+            Some("/tmp/real.json")
+        );
+    }
+
+    #[test]
+    fn extra_env_cannot_override_tmpdir_or_slug() {
+        let m = minimal();
+        let extra = vec![
+            ("AGENT_TMPDIR".to_string(), "/evil".to_string()),
+            ("AGENT_SLUG".to_string(), "evil".to_string()),
+            ("AGENT_DRY_RUN".to_string(), "true".to_string()),
+        ];
+        let spec = spec_with(&m, &[], None, &extra);
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "x",
+            "real-slug",
+            &Local::now(),
+            Path::new("/tmp/real"),
+            Path::new("/tmp/hb.json"),
+        );
+        assert_eq!(lookup(&cmd, "AGENT_TMPDIR").as_deref(), Some("/tmp/real"));
+        assert_eq!(lookup(&cmd, "AGENT_SLUG").as_deref(), Some("real-slug"));
+        assert_eq!(lookup(&cmd, "AGENT_DRY_RUN").as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn manifest_env_extra_still_applies() {
+        let m = manifest(
+            r#"
+[agent]
+name = "x"
+[run]
+command = "true"
+[env.extra]
+FOO = "bar"
+"#,
+        );
+        let spec = spec_with(&m, &[], None, &[]);
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "x",
+            "slug",
+            &Local::now(),
+            Path::new("/tmp"),
+            Path::new("/tmp/hb.json"),
+        );
+        assert_eq!(lookup(&cmd, "FOO").as_deref(), Some("bar"));
+    }
+
+    #[test]
+    fn extra_env_wins_over_manifest_env_extra() {
+        // Per-invocation context is more specific than the manifest's
+        // static block, so it is applied later.
+        let m = manifest(
+            r#"
+[agent]
+name = "x"
+[run]
+command = "true"
+[env.extra]
+FOO = "from-manifest"
+"#,
+        );
+        let extra = vec![("FOO".to_string(), "from-trigger".to_string())];
+        let spec = spec_with(&m, &[], None, &extra);
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "x",
+            "slug",
+            &Local::now(),
+            Path::new("/tmp"),
+            Path::new("/tmp/hb.json"),
+        );
+        assert_eq!(lookup(&cmd, "FOO").as_deref(), Some("from-trigger"));
+    }
+
+    #[test]
+    fn dry_run_omits_the_heartbeat_path() {
+        let m = minimal();
+        let mut spec = spec_with(&m, &[], None, &[]);
+        spec.dry_run = true;
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "x",
+            "slug",
+            &Local::now(),
+            Path::new("/tmp"),
+            Path::new("/tmp/hb.json"),
+        );
+        assert!(lookup(&cmd, "AGENT_HEARTBEAT_FILE").is_none());
+        assert_eq!(lookup(&cmd, "AGENT_DRY_RUN").as_deref(), Some("true"));
+    }
+
+    #[test]
+    fn tail_lines_keeps_the_last_n_and_reports_the_drop() {
+        let body = (1..=10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (tail, dropped) = tail_lines(&body, 3);
+        assert_eq!(tail, "8\n9\n10");
+        assert_eq!(dropped, 7);
+    }
+
+    #[test]
+    fn tail_lines_keeps_everything_when_under_the_limit() {
+        let (tail, dropped) = tail_lines("a\nb", 10);
+        assert_eq!(tail, "a\nb");
+        assert_eq!(dropped, 0);
+    }
 }

@@ -70,6 +70,18 @@ pub fn state_plugins_dir() -> PathBuf {
     state_dir().join("plugins")
 }
 
+/// Last acknowledged Telegram `update_id`.
+///
+/// Persisted so a daemon restart resumes instead of replaying the backlog —
+/// for a bot that runs agents, a replay would re-run whatever the last
+/// messages asked for.
+pub fn telegram_offset_file() -> PathBuf {
+    state_dir()
+        .join("notify")
+        .join("telegram")
+        .join("offset.json")
+}
+
 pub fn known_manifests_file() -> PathBuf {
     state_dir().join("known_manifests.json")
 }

@@ -356,6 +356,7 @@ inherited environment (unless `env.inherit = false` in the manifest):
 | `AGENT_SLUG`           | derived slug for the heartbeat (from args)            |
 | `AGENT_START_EPOCH`    | epoch seconds of `started_at`                         |
 | `AGENT_ARGV`           | JSON array of the schedule's `args`                   |
+| `AGENT_TRIGGER_*`      | only on [triggered](triggers.md) runs — source, actor, reply handle, payload |
 | `AGENT_HEARTBEAT_FILE` | path to the heartbeat file (empty if `dry_run`)       |
 
 Use them. Don't reinvent (no need for your own tempdir, no need to write

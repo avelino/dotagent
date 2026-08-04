@@ -15,6 +15,8 @@
 * [Notifications](concepts/notifications.md)
 * [Secrets](concepts/secrets.md)
 * [Plugins](concepts/plugins.md)
+* [Triggers](concepts/triggers.md)
+* [Telegram](concepts/telegram.md)
 
 ## Guides
 
@@ -30,6 +32,7 @@
 * [CLI](reference/cli.md)
 * [Agent spec (`agent.toml`)](reference/agent-spec.md)
 * [Plugin protocol](reference/plugin-protocol.md)
+* [MCP server](reference/mcp.md)
 * [Environment variables](reference/env-vars.md)
 * [Filesystem layout](reference/paths.md)
 

@@ -80,6 +80,32 @@ config = { command = "aws", args = ["sts", "get-caller-identity"], expect_exit =
 
 ---
 
+## Run it on demand, not only on schedule
+
+Every agent you install is already a callable tool:
+
+```bash
+dotagent mcp     # JSON-RPC over stdio, one tool per agent
+```
+
+Point Claude Code or Claude Desktop at it and you can ask for any agent
+by name:
+
+```json
+{ "mcpServers": { "dotagent": { "command": "dotagent", "args": ["mcp"] } } }
+```
+
+For a chat front end, inbound Telegram hands messages to a dispatcher
+agent whose stdout goes back to the conversation. Off until you
+configure it, and it changes the threat model — read
+[V8](../security/threat-model.md) first.
+
+→ **Read**: [`docs/reference/mcp.md`](../reference/mcp.md),
+[`docs/concepts/telegram.md`](../concepts/telegram.md),
+[`docs/concepts/triggers.md`](../concepts/triggers.md).
+
+---
+
 ## Schedule like a grown-up
 
 The tutorial used `type = "interval"` for speed. Production agents

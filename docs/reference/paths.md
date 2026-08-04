@@ -234,6 +234,29 @@ here. The `imessage` driver, for example, persists the last-send
 timestamp per `(agent, slug)` so `rate_limit_minutes` works across
 daemon restarts.
 
+### `<any state file>.lock`
+
+Empty file beside every JSON state file, held with `flock` during a write.
+
+It is **not** removed afterwards, on purpose. Unlinking it while still holding
+the lock lets the next writer open a fresh inode and take its own "exclusive"
+lock, so two processes end up writing the same file believing they have it to
+themselves. Safe to delete when nothing is running; it reappears on the next
+write.
+
+### `state/notify/telegram/offset.json`
+
+Last acknowledged Telegram `update_id`, written tmp-then-rename.
+
+```jsonc
+{ "offset": 481923771 }
+```
+
+Telegram redelivers every update until a higher `offset` acknowledges it.
+Without this file a daemon restart replays the backlog — and for a bot that
+runs agents, replay means re-running whatever the last messages asked for.
+Delivery is at-most-once on purpose. See [Telegram](../concepts/telegram.md).
+
 ### `state/known_manifests.json`
 
 Cache of `sha256(agent.toml)` for every loaded manifest. Drives
@@ -354,6 +377,10 @@ Audit events emitted by dotagent:
 | `config_reloaded`         | SIGHUP picked up changes to `config.toml`                                   | notice        |
 | `secrets_loaded`          | Daemon read `secrets.env`; payload has `path`, `key_count`, `unresolved_references` (no values, no `op://` paths) | notice |
 | `secrets_refused`         | Daemon rejected `secrets.env` (insecure mode, parse, or IO)                 | critical      |
+| `manifest_invalid`        | An `agent.toml` exists but failed to parse or validate; that agent is skipped, the rest keep running | critical |
+| `trigger_received`        | Inbound message accepted; records `actor` and `reply_to`, never the text    | notice        |
+| `trigger_rejected`        | Inbound message refused (allowlist, rate limit) before anything ran         | critical      |
+| `agent_triggered`         | A run started from a trigger rather than a schedule window                  | notice        |
 
 `Critical` severity drives out-of-band notifier dispatch. Defined in
 [`crates/dotagent-core/src/audit.rs`](../../crates/dotagent-core/src/audit.rs).
