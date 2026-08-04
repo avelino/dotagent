@@ -31,6 +31,51 @@ As tools, the list is the protocol. `tools/list` is the catalog, a name that is 
 
 Requests without an `id` are notifications and get no response. Unparseable input answers with `-32700` and a null id.
 
+## Introspection
+
+| Tool | Arguments | Behavior |
+|---|---|---|
+| `dotagent-status` | — | Health of every scheduled agent, same as `dotagent status`. |
+| `dotagent-logs` | `agent`, `lines` | Tail an agent's captured output. Default 40 lines, capped at 400. |
+| `dotagent-inspect` | `agent` | Heartbeat, window state, manifest hash. |
+| `dotagent-doctor` | — | Manifest validation, plugin resolution, secrets / Telegram / memory status. |
+| `dotagent-next-runs` | — | What the scheduler would dispatch now. A preview; nothing runs. |
+
+Always present, regardless of `[memory]`.
+
+**Read-only by selection, not by accident.** The CLI has commands that write —
+`install`, `uninstall`, `reload`, `daily-summary` — and none are exposed.
+`bootstrap` is refused most deliberately: it marks every window as ok, which
+silences a failure rather than fixing it, and an assistant that "resolves" an
+alert by deleting the signal is worse than one that cannot help.
+
+`run` and `run-now` are absent because they already exist as the `run-*` tools.
+
+Agent names are resolved through discovery rather than concatenated into a
+path, so `../` in a name is refused rather than followed.
+
+These re-execute the `dotagent` binary instead of reimplementing each command.
+Rendering lives in the CLI, and a second copy would drift — an assistant
+quoting a status that no longer matches `dotagent status` is worse than a
+subprocess.
+
+## Memory tools
+
+Three more tools sit beside the agent catalog when `[memory]` is enabled
+(the default). They are served in-process — nothing is spawned:
+
+| Tool | Arguments | Behavior |
+|---|---|---|
+| `memory-remember` | `text`, `topics[]` | Store a durable fact, linked to its topics. |
+| `memory-recall` | `query` or `topic` | Search text, or return everything linked to a topic. |
+| `memory-topics` | — | List the subjects memory knows about. |
+
+Facts live in an [outl](https://github.com/avelino/outl) workspace you can open
+and edit. See [Memory](../concepts/memory.md) for what belongs in it and why
+recall is substring rather than semantic.
+
+Turn them off with `[memory] enabled = false`.
+
 ## Tool naming
 
 MCP restricts tool names to `[a-zA-Z0-9_-]`, which agent names are not bound by. Each agent becomes `run-<sanitized-name>`:

@@ -244,6 +244,23 @@ lock, so two processes end up writing the same file believing they have it to
 themselves. Safe to delete when nothing is running; it reappears on the next
 write.
 
+### `outl/`
+
+Long-term agent memory, as an [outl](https://github.com/avelino/outl)
+workspace. Scaffolded when the daemon starts.
+
+```text
+outl/
+├── journals/YYYY-MM-DD.md      # the facts, one block each
+├── journals/YYYY-MM-DD.outl    # block identity sidecar
+├── ops/                        # op log — source of truth
+└── pages/ templates/ assets/
+```
+
+A normal outl workspace, on purpose: open it in the desktop app, read what an
+agent remembered, fix a wrong memory, delete a page. Relocate with
+`[memory] workspace` in `config.toml`. See [Memory](../concepts/memory.md).
+
 ### `state/notify/telegram/offset.json`
 
 Last acknowledged Telegram `update_id`, written tmp-then-rename.

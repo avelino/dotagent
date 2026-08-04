@@ -305,6 +305,15 @@ It stays silent when the section is absent, since the ingress is off by
 default. A `dispatcher_agent` that does not resolve is a warning: every
 accepted message would fail after passing the allowlist.
 
+It also prints where long-term memory lives:
+
+```
+memory: /Users/avelino/.config/dotagent/outl (default)
+```
+
+A path set in `[memory] workspace` that holds no outl workspace is a warning —
+the default path is scaffolded automatically, a configured one is not.
+
 Manifests that fail to parse are listed with `✗` and counted as errors. They
 no longer abort the scan — the healthy agents are still reported below them.
 

@@ -37,7 +37,18 @@ pub struct InboundMessage {
     pub user_id: i64,
     /// Conversation to answer in.
     pub chat_id: i64,
+    /// The message being answered. Replies quote it, so a chat with several
+    /// questions in flight shows which answer belongs to which.
+    pub message_id: i64,
     pub text: String,
+    /// Text of the message this one replies to, when the sender used
+    /// Telegram's reply.
+    ///
+    /// A bare "sim" carries no meaning on its own. Quoting the assistant's
+    /// question makes the intent explicit instead of leaving it to be inferred
+    /// from conversation history, which breaks the moment someone answers an
+    /// older message out of order.
+    pub reply_to_text: Option<String>,
 }
 
 // ---------------------------------------------------------------------
@@ -60,13 +71,25 @@ struct Update {
     message: Option<Message>,
 }
 
+/// Every field is optional on purpose, even the ones Telegram always sends.
+///
+/// A required field that a single update happens to lack fails
+/// `serde_json::from_*` for the **whole batch**, which in a long-poll means the
+/// offset never advances and that batch is redelivered forever. Optional plus
+/// a filter in [`extract`] drops the one bad update and keeps the rest.
 #[derive(Debug, Deserialize)]
 struct Message {
     #[serde(default)]
+    message_id: Option<i64>,
+    #[serde(default)]
     from: Option<User>,
-    chat: Chat,
+    #[serde(default)]
+    chat: Option<Chat>,
     #[serde(default)]
     text: Option<String>,
+    /// Boxed because `Message` would otherwise be infinitely sized.
+    #[serde(default)]
+    reply_to_message: Option<Box<Message>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,15 +111,26 @@ fn extract(updates: Vec<Update>) -> Vec<InboundMessage> {
         .filter_map(|u| {
             let msg = u.message?;
             let from = msg.from?;
+            let chat = msg.chat?;
             let text = msg.text?;
+            // No message_id means nothing to quote, and quoting id 0 would
+            // point at a message that does not exist.
+            let message_id = msg.message_id?;
             if text.trim().is_empty() {
                 return None;
             }
+            let reply_to_text = msg
+                .reply_to_message
+                .and_then(|r| r.text)
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
             Some(InboundMessage {
                 update_id: u.update_id,
                 user_id: from.id,
-                chat_id: msg.chat.id,
+                chat_id: chat.id,
+                message_id,
                 text,
+                reply_to_text,
             })
         })
         .collect()
@@ -205,20 +239,50 @@ impl Poller {
     }
 }
 
-/// Answer a conversation.
+/// Answer a conversation, quoting the message being answered.
 ///
 /// Sent as plain text on purpose: the body is agent output, and any parse mode
 /// would make an unescaped backtick or underscore in a log line turn into a
 /// Bot API 400. Correctness of delivery beats formatting.
-pub async fn reply(bot_token: &str, chat_id: i64, text: &str) -> Result<()> {
+///
+/// `reply_to` quotes the original message. Runs are asynchronous and a chat can
+/// have several questions in flight, so without the quote there is no telling
+/// which answer belongs to which.
+pub async fn reply(bot_token: &str, chat_id: i64, reply_to: Option<i64>, text: &str) -> Result<()> {
     send_message(
         bot_token,
         &chat_id.to_string(),
         &truncate(text),
         None,
         false,
+        reply_to,
     )
     .await
+}
+
+/// How often to re-send the typing indicator.
+///
+/// Telegram clears it after ~5s, so a run that takes 15 seconds needs the
+/// action repeated or the chat looks idle halfway through. Four seconds leaves
+/// margin without hammering the API.
+pub const TYPING_REFRESH: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Show "typing…" in the chat.
+///
+/// Best-effort by design: a failed indicator is cosmetic, and letting it
+/// interrupt the run would trade a working answer for a spinner.
+pub async fn typing(bot_token: &str, chat_id: i64) -> Result<()> {
+    let token = expand_env(bot_token).map_err(NotifyError::Config)?;
+    let url = format!("https://api.telegram.org/bot{token}/sendChatAction");
+    let body = serde_json::json!({ "chat_id": chat_id, "action": "typing" });
+    match client().post(&url).json(&body).send().await {
+        Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) => Err(NotifyError::Backend(format!(
+            "telegram sendChatAction returned {}",
+            r.status()
+        ))),
+        Err(e) => Err(NotifyError::Backend(sanitize_reqwest_err(&e))),
+    }
 }
 
 /// Trim to Telegram's limit, saying so rather than silently losing the tail.
@@ -287,7 +351,7 @@ mod tests {
     #[test]
     fn extracts_a_plain_text_message() {
         let raw = r#"{"ok":true,"result":[
-            {"update_id":10,"message":{"from":{"id":42},"chat":{"id":99},"text":"hello"}}
+            {"update_id":10,"message":{"message_id":7,"from":{"id":42},"chat":{"id":99},"text":"hello"}}
         ]}"#;
         let msgs = extract(updates_json(raw));
         assert_eq!(
@@ -296,15 +360,89 @@ mod tests {
                 update_id: 10,
                 user_id: 42,
                 chat_id: 99,
-                text: "hello".into()
+                message_id: 7,
+                text: "hello".into(),
+                reply_to_text: None
             }]
         );
     }
 
     #[test]
+    fn carries_the_quoted_text_when_the_sender_replied() {
+        // "sim" on its own is meaningless. This is what makes it resolvable
+        // without relying on conversation history.
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},
+             "text":"sim",
+             "reply_to_message":{"message_id":8,"from":{"id":99},"chat":{"id":2},
+              "text":"Confirmando: criar pagina. Posso criar?"}}}
+        ]}"#;
+        let m = &extract(updates_json(raw))[0];
+        assert_eq!(m.text, "sim");
+        assert_eq!(
+            m.reply_to_text.as_deref(),
+            Some("Confirmando: criar pagina. Posso criar?")
+        );
+    }
+
+    #[test]
+    fn a_message_without_a_reply_has_no_quoted_text() {
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},"text":"oi"}}
+        ]}"#;
+        assert!(extract(updates_json(raw))[0].reply_to_text.is_none());
+    }
+
+    #[test]
+    fn a_reply_to_a_photo_carries_no_quoted_text() {
+        // reply_to_message exists but has no text (sticker, photo, voice).
+        // An empty quote is worse than none: it would read as context.
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},
+             "text":"sim",
+             "reply_to_message":{"message_id":8,"chat":{"id":2}}}}
+        ]}"#;
+        assert!(extract(updates_json(raw))[0].reply_to_text.is_none());
+    }
+
+    #[test]
+    fn carries_the_message_id_for_quoting() {
+        // Runs are async and a chat can have several questions in flight, so
+        // the reply has to quote what it answers.
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":10,"message":{"message_id":4242,"from":{"id":42},"chat":{"id":99},"text":"hi"}}
+        ]}"#;
+        assert_eq!(extract(updates_json(raw))[0].message_id, 4242);
+    }
+
+    #[test]
+    fn an_update_without_message_id_is_skipped_not_defaulted() {
+        // Defaulting to 0 would make the reply quote a message that does not
+        // exist. Skipping is the honest answer.
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"from":{"id":42},"chat":{"id":99},"text":"hi"}}
+        ]}"#;
+        assert!(extract(updates_json(raw)).is_empty());
+    }
+
+    #[test]
+    fn one_malformed_update_does_not_drop_the_batch() {
+        // The failure this guards is nastier than a lost message: if parsing
+        // the batch fails, poll() errors, the offset never advances, and
+        // Telegram redelivers the same batch forever.
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"from":{"id":42},"text":"no chat"}},
+            {"update_id":2,"message":{"message_id":9,"from":{"id":7},"chat":{"id":8},"text":"ok"}}
+        ]}"#;
+        let msgs = extract(updates_json(raw));
+        assert_eq!(msgs.len(), 1, "the healthy update must survive");
+        assert_eq!(msgs[0].message_id, 9);
+    }
+
+    #[test]
     fn skips_updates_without_text() {
         let raw = r#"{"ok":true,"result":[
-            {"update_id":1,"message":{"from":{"id":42},"chat":{"id":99}}}
+            {"update_id":1,"message":{"message_id":1,"from":{"id":42},"chat":{"id":99}}}
         ]}"#;
         assert!(extract(updates_json(raw)).is_empty());
     }
@@ -313,7 +451,7 @@ mod tests {
     fn skips_updates_without_a_sender() {
         // Channel posts have no `from`, so there is no identity to authorize.
         let raw = r#"{"ok":true,"result":[
-            {"update_id":1,"message":{"chat":{"id":99},"text":"hi"}}
+            {"update_id":1,"message":{"message_id":1,"chat":{"id":99},"text":"hi"}}
         ]}"#;
         assert!(extract(updates_json(raw)).is_empty());
     }
@@ -321,7 +459,7 @@ mod tests {
     #[test]
     fn skips_whitespace_only_text() {
         let raw = r#"{"ok":true,"result":[
-            {"update_id":1,"message":{"from":{"id":42},"chat":{"id":99},"text":"   "}}
+            {"update_id":1,"message":{"message_id":1,"from":{"id":42},"chat":{"id":99},"text":"   "}}
         ]}"#;
         assert!(extract(updates_json(raw)).is_empty());
     }
@@ -329,8 +467,8 @@ mod tests {
     #[test]
     fn skips_unknown_update_kinds_without_failing_the_batch() {
         let raw = r#"{"ok":true,"result":[
-            {"update_id":1,"edited_message":{"from":{"id":42},"chat":{"id":99},"text":"x"}},
-            {"update_id":2,"message":{"from":{"id":7},"chat":{"id":8},"text":"ok"}}
+            {"update_id":1,"edited_message":{"message_id":1,"from":{"id":42},"chat":{"id":99},"text":"x"}},
+            {"update_id":2,"message":{"message_id":2,"from":{"id":7},"chat":{"id":8},"text":"ok"}}
         ]}"#;
         let msgs = extract(updates_json(raw));
         assert_eq!(msgs.len(), 1);

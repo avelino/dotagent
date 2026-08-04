@@ -173,6 +173,9 @@ impl Notifier for TelegramConfig {
             ctx.message,
             self.parse_mode,
             self.disable_notification.unwrap_or(false),
+            // A scheduled notification answers nothing — there is no inbound
+            // message to quote.
+            None,
         )
         .await
     }
@@ -207,6 +210,7 @@ pub(crate) async fn send_message(
     text: &str,
     parse_mode: Option<ParseMode>,
     silent: bool,
+    reply_to: Option<i64>,
 ) -> Result<()> {
     if bot_token.trim().is_empty() {
         return Err(NotifyError::Config(
@@ -239,6 +243,18 @@ pub(crate) async fn send_message(
     }
     if silent {
         payload["disable_notification"] = json!(true);
+    }
+    if let Some(message_id) = reply_to {
+        // `reply_parameters` is the current shape (Bot API 7.0+);
+        // `reply_to_message_id` is the deprecated spelling.
+        //
+        // `allow_sending_without_reply` matters: if the original message was
+        // deleted while the agent ran, the answer still gets delivered instead
+        // of failing with a 400 and leaving the sender waiting.
+        payload["reply_parameters"] = json!({
+            "message_id": message_id,
+            "allow_sending_without_reply": true,
+        });
     }
 
     // URL embeds the token; never log it. Both the URL and the

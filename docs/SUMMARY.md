@@ -17,6 +17,7 @@
 * [Plugins](concepts/plugins.md)
 * [Triggers](concepts/triggers.md)
 * [Telegram](concepts/telegram.md)
+* [Memory](concepts/memory.md)
 
 ## Guides
 

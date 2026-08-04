@@ -70,6 +70,16 @@ pub fn state_plugins_dir() -> PathBuf {
     state_dir().join("plugins")
 }
 
+/// Long-term agent memory, as an outl workspace.
+///
+/// Scaffolded on first use, so memory works without anyone writing config.
+/// It is a normal outl workspace: open it in the desktop app, read what the
+/// assistant remembered, edit a bad memory, delete a page. Override with
+/// `[memory] workspace` in `config.toml`.
+pub fn memory_workspace_dir() -> PathBuf {
+    home().join("outl")
+}
+
 /// Last acknowledged Telegram `update_id`.
 ///
 /// Persisted so a daemon restart resumes instead of replaying the backlog —

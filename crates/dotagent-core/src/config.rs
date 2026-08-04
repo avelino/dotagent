@@ -46,6 +46,54 @@ pub struct Config {
     pub secrets: SecretsConfig,
     #[serde(default)]
     pub telegram: TelegramIngressConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// Long-term memory for agents, stored in an embedded outl workspace.
+///
+/// On by default with a workspace under `$DOTAGENT_HOME/outl`, scaffolded on
+/// first use. The alternative — memory that stays broken until someone reads a
+/// doc and runs `outl init` — is the kind of default this project avoids.
+///
+/// ```toml
+/// [memory]
+/// workspace = "/Users/me/outl-p2p"   # share the workspace with your notes
+/// enabled = false                    # or turn it off entirely
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// Expose memory tools from `dotagent mcp`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Workspace path. Empty (default) resolves to `$DOTAGENT_HOME/outl`.
+    ///
+    /// Pointing this at a workspace you already use puts what an agent
+    /// remembers next to your own notes, synced to your peers. Convenient, and
+    /// also means an agent writes where you write.
+    #[serde(default)]
+    pub workspace: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            workspace: String::new(),
+        }
+    }
+}
+
+impl MemoryConfig {
+    /// Configured workspace, or `None` to mean "use the default path".
+    pub fn workspace_override(&self) -> Option<&str> {
+        let w = self.workspace.trim();
+        (!w.is_empty()).then_some(w)
+    }
 }
 
 /// Inbound Telegram. Off unless configured — dotagent never opens a network

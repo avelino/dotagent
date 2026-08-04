@@ -54,6 +54,7 @@ crates/                  # orchestrator (workspace de crates)
   dotagent-notify/       # notifiers built-in (desktop / imessage / slack / ntfy / pushover)
   dotagent-plugin/       # PluginClient (subprocess + JSON) — goes through supervisor
   dotagent-mcp/          # JSON-RPC 2.0 + MCP wire types (agents as tools) — sem IO
+  dotagent-memory/       # memória de longo prazo (outl embutido: outl-ws + outl-actions)
   dotagent-secrets/      # loader de secrets.env (crate própria pra evitar ciclo core → notify)
   dotagent-supervisor/   # subprocess lifecycle: deadlines, kill-tree (POSIX pgroup), live registry
   dotagent-telemetry/    # tracing + JSON file rotation + OTLP export + retention
@@ -89,6 +90,7 @@ docs/
 | Novo notifier built-in (driver) | `dotagent-notify/src/drivers/` |
 | Ingress (receber evento externo) | `dotagent-notify/src/<source>_inbound.rs` (transporte) + política no daemon |
 | Tipo do protocolo MCP | `dotagent-mcp/src/lib.rs` + `docs/reference/mcp.md` |
+| Memória de agent (outl) | `dotagent-memory/src/lib.rs` + `docs/concepts/memory.md` |
 | Novo campo em `[telegram]` | `dotagent-core/src/config.rs` + `docs/guides/config-reference.md` + `docs/concepts/telegram.md` |
 | Novo preflight/sink | novo crate em `plugins/` |
 | Novo notifier de terceiro (não built-in) | novo crate em `plugins/` (kind = `notify`) |

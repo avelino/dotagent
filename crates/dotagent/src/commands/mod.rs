@@ -163,6 +163,7 @@ pub async fn doctor() -> Result<()> {
     // toward errors (daemon still runs without secrets).
     let (mut errors, mut warnings) = report_secrets_status();
     warnings += report_telegram_status();
+    warnings += report_memory_status();
 
     let found = discovery::discover();
     // Report unloadable manifests first: an agent that cannot parse never
@@ -355,6 +356,47 @@ pub async fn plugin_invoke(name: String, _payload: String) -> Result<()> {
 /// is fine (single-digit refs in practice). If a future CI gate calls
 /// `doctor` in a tight loop with many refs, cache inside this function
 /// rather than reaching for `snapshot()`.
+/// Report where long-term memory lives. Returns a warning count.
+///
+/// Says the path out loud because memory is a directory you are meant to open
+/// and read — an outl workspace, not an opaque store.
+fn report_memory_status() -> usize {
+    let config =
+        dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
+    if !config.memory.enabled {
+        println!("memory: off ([memory] enabled = false)");
+        return 0;
+    }
+
+    match config.memory.workspace_override() {
+        Some(path) => {
+            let p = std::path::Path::new(path);
+            if p.join(".outl").exists() {
+                println!("memory: {path} (from config.toml)");
+                0
+            } else {
+                println!("memory: {path} (from config.toml)");
+                println!("    ⚠ no outl workspace there — run `outl init` in it, or clear the setting to use the default");
+                1
+            }
+        }
+        None => {
+            let path = dotagent_state::paths::memory_workspace_dir();
+            let exists = path.join(".outl").exists();
+            println!(
+                "memory: {} (default){}",
+                path.display(),
+                if exists {
+                    ""
+                } else {
+                    " — created on first use"
+                }
+            );
+            0
+        }
+    }
+}
+
 /// Report inbound Telegram status. Returns a warning count.
 ///
 /// Silent when `[telegram]` is absent — the ingress is off by default and

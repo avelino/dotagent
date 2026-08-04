@@ -34,7 +34,7 @@ use dotagent_state::{
 };
 use dotagent_supervisor::{Supervisor, DEFAULT_REAPER_TICK};
 use tokio::signal::unix::{signal, SignalKind};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::discovery::{self, DiscoveredAgent};
 
@@ -64,6 +64,31 @@ impl Drop for PidGuard {
         if let Some(path) = pidfile_path() {
             let _ = std::fs::remove_file(path);
         }
+    }
+}
+
+/// Scaffold the memory workspace at boot when `[memory]` is enabled.
+///
+/// `dotagent mcp` would create it on the first tool call anyway, but lazily:
+/// `doctor` would report memory as on, the tools would be listed, and the
+/// directory would not exist until something happened to use it. Creating it
+/// here means the state on disk matches what the config says.
+///
+/// Never fatal. A workspace that cannot be created is a reason for memory to
+/// fail, not for scheduled agents to stop running.
+fn ensure_memory_workspace(config: &dotagent_core::Config) {
+    if !config.memory.enabled {
+        return;
+    }
+    // A configured path came from a human; a typo must not silently scaffold
+    // an empty workspace somewhere nobody will look.
+    if config.memory.workspace_override().is_some() {
+        return;
+    }
+    let path = dotagent_state::paths::memory_workspace_dir();
+    match dotagent_memory::MemoryStore::open_or_init(&path) {
+        Ok(_) => info!(path = %path.display(), "memory workspace ready"),
+        Err(e) => warn!(path = %path.display(), error = %e, "could not prepare memory workspace"),
     }
 }
 
@@ -163,6 +188,10 @@ async fn handle_trigger(
     audit: &AuditLog,
     plugins: &PluginClient,
 ) {
+    // Show "typing…" for as long as the run takes. A triggered run is seconds
+    // to minutes of silence otherwise, which reads as the bot being broken.
+    let typing = spawn_typing_indicator(&req);
+
     let reply = match run_triggered(&req, state, audit, plugins).await {
         Ok(OrchestratedOutcome::Ran(outcome)) if outcome.exit_code == 0 => {
             if outcome.stdout_tail.trim().is_empty() {
@@ -195,7 +224,45 @@ async fn handle_trigger(
         }
     };
 
+    // Stop before answering, so the indicator never outlives the reply.
+    if let Some(t) = typing {
+        t.abort();
+    }
     deliver_reply(&req, &reply).await;
+}
+
+/// The configured bot token, or `None` when inbound Telegram is not set up.
+///
+/// Both the typing indicator and the reply need it, and each was re-reading
+/// `config.toml` from disk — twice per message for the same string.
+fn telegram_bot_token() -> Option<String> {
+    let token = dotagent_core::Config::load(dotagent_state::paths::config_file())
+        .unwrap_or_default()
+        .telegram
+        .bot_token;
+    (!token.is_empty()).then_some(token)
+}
+
+/// Keep "typing…" alive in the chat until the returned handle is aborted.
+///
+/// `None` when the source cannot show one. Failures are logged at debug and
+/// never surface: a missing indicator is cosmetic, and a run that dies because
+/// a spinner failed would be a bad trade.
+fn spawn_typing_indicator(req: &TriggerRequest) -> Option<tokio::task::JoinHandle<()>> {
+    if req.source != TriggerSource::Telegram {
+        return None;
+    }
+    let chat_id: i64 = req.reply_to.as_ref()?.parse().ok()?;
+    let token = telegram_bot_token()?;
+
+    Some(tokio::spawn(async move {
+        loop {
+            if let Err(e) = dotagent_notify::telegram_inbound::typing(&token, chat_id).await {
+                debug!(error = %e, "typing indicator failed");
+            }
+            tokio::time::sleep(dotagent_notify::telegram_inbound::TYPING_REFRESH).await;
+        }
+    }))
 }
 
 /// Deliver a trigger's answer back to its origin. No-op when the source is
@@ -206,15 +273,26 @@ async fn deliver_reply(req: &TriggerRequest, body: &str) {
     };
     match req.source {
         TriggerSource::Telegram => {
-            let cfg = dotagent_core::Config::load(dotagent_state::paths::config_file())
-                .unwrap_or_default();
+            let Some(token) = telegram_bot_token() else {
+                warn!("telegram reply skipped — no bot_token configured");
+                return;
+            };
             let Ok(chat_id) = reply_to.parse::<i64>() else {
                 warn!(reply_to = %reply_to, "telegram reply_to is not a chat id");
                 return;
             };
+            // Quote the message being answered. Runs are asynchronous, so a
+            // chat with several questions in flight would otherwise show
+            // answers with no way to tell which is which. Absent (older
+            // payload, or a source that has no such concept) just sends
+            // unquoted rather than dropping the answer.
+            let message_id = req
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("message_id"))
+                .and_then(|v| v.as_i64());
             if let Err(e) =
-                dotagent_notify::telegram_inbound::reply(&cfg.telegram.bot_token, chat_id, body)
-                    .await
+                dotagent_notify::telegram_inbound::reply(&token, chat_id, message_id, body).await
             {
                 // `NotifyError` from this path is already token-sanitized.
                 warn!(error = %e, "could not deliver telegram reply");
@@ -319,10 +397,15 @@ fn screen(
         schedule: None,
         args: Vec::new(),
         // The body reaches the agent through AGENT_TRIGGER_PAYLOAD, never argv.
+        // `message_id` rides along so the reply can quote what it answers.
         payload: Some(serde_json::json!({
             "text": msg.text,
             "chat_id": msg.chat_id,
             "user_id": msg.user_id,
+            "message_id": msg.message_id,
+            // What the sender was replying to, when they used Telegram's
+            // reply. "sim" means nothing without it.
+            "reply_to_text": msg.reply_to_text,
         })),
         actor: Some(msg.user_id.to_string()),
         reply_to: Some(msg.chat_id.to_string()),
@@ -406,6 +489,7 @@ pub async fn run() -> Result<()> {
     // still let the daemon run so the operator can see the doctor warning
     // and fix permissions without losing scheduled runs.
     load_secrets_at_startup(&app_config, &audit);
+    ensure_memory_workspace(&app_config);
 
     // Inbound triggers. Consumed by an arm of the `select!` below rather than
     // a spawned task, so a triggered run is serialized against the tick loop.
@@ -1221,7 +1305,9 @@ mod tests {
             update_id: 1,
             user_id,
             chat_id: 999,
+            message_id: 55,
             text: "how's disk?".into(),
+            reply_to_text: None,
         }
     }
 
