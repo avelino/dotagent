@@ -303,6 +303,30 @@ async fn deliver_reply(req: &TriggerRequest, body: &str) {
     }
 }
 
+/// Start the ingress when the config asks for it, logging why when it does not.
+///
+/// Called at boot and again on every SIGHUP, so `[telegram]` changes take
+/// effect on `dotagent reload` rather than waiting for a restart. That matters
+/// most for `allowed_user_ids`: an operator revoking access expects it to be
+/// revoked now.
+fn start_telegram_ingress(
+    cfg: &dotagent_core::TelegramIngressConfig,
+    tx: &tokio::sync::mpsc::Sender<TriggerRequest>,
+    audit: &AuditLog,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if cfg.is_enabled() {
+        return Some(spawn_telegram_ingress(
+            cfg.clone(),
+            tx.clone(),
+            audit.clone(),
+        ));
+    }
+    if !cfg.bot_token.is_empty() {
+        warn!("telegram bot_token set but allowed_user_ids is empty — ingress stays off");
+    }
+    None
+}
+
 /// Long-poll Telegram and feed accepted messages into the trigger channel.
 ///
 /// Runs as its own task rather than inside the main loop, which sleeps up to
@@ -502,18 +526,7 @@ pub async fn run() -> Result<()> {
     // Inbound chat. Off unless `[telegram]` names both a token and at least
     // one allowed user id — an empty allowlist is misconfiguration, not
     // permission to run anything for anyone.
-    let _telegram = if app_config.telegram.is_enabled() {
-        Some(spawn_telegram_ingress(
-            app_config.telegram.clone(),
-            trigger_tx.clone(),
-            audit.clone(),
-        ))
-    } else {
-        if !app_config.telegram.bot_token.is_empty() {
-            warn!("telegram bot_token set but allowed_user_ids is empty — ingress stays off");
-        }
-        None
-    };
+    let mut telegram = start_telegram_ingress(&app_config.telegram, &trigger_tx, &audit);
 
     let mut last_summary_date: Option<chrono::NaiveDate> = None;
     let mut last_retention_date: Option<chrono::NaiveDate> = None;
@@ -567,6 +580,14 @@ pub async fn run() -> Result<()> {
                 let reloaded = dotagent_core::Config::load(dotagent_state::paths::config_file())
                     .unwrap_or_default();
                 load_secrets_at_startup(&reloaded, &audit);
+                // Restart the ingress against the new config. Without this a
+                // reload would leave the old allowlist live: removing a user
+                // id and reloading would look like it took effect while the
+                // daemon kept accepting their messages.
+                if let Some(handle) = telegram.take() {
+                    handle.abort();
+                }
+                telegram = start_telegram_ingress(&reloaded.telegram, &trigger_tx, &audit);
                 continue;
             }
             Some(req) = trigger_rx.recv() => {

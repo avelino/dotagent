@@ -162,10 +162,12 @@ pub async fn doctor() -> Result<()> {
     // warnings (insecure mode is a problem the operator should fix), never
     // toward errors (daemon still runs without secrets).
     let (mut errors, mut warnings) = report_secrets_status();
-    warnings += report_telegram_status();
     warnings += report_memory_status();
 
     let found = discovery::discover();
+    // After the scan, so the dispatcher check reuses it instead of triggering
+    // a second walk of the filesystem — and cannot disagree with it.
+    warnings += report_telegram_status(&found.agents);
     // Report unloadable manifests first: an agent that cannot parse never
     // runs, and its absence from the list below is otherwise silent.
     for bad in &found.invalid {
@@ -403,7 +405,7 @@ fn report_memory_status() -> usize {
 /// saying so on every `doctor` run would be noise. It speaks up in the two
 /// cases the operator needs to hear about: a half-configured section that
 /// silently does nothing, and a dispatcher agent that does not resolve.
-fn report_telegram_status() -> usize {
+fn report_telegram_status(agents: &[discovery::DiscoveredAgent]) -> usize {
     let config =
         dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
     let tg = &config.telegram;
@@ -421,7 +423,10 @@ fn report_telegram_status() -> usize {
         // A dispatcher that does not resolve means every accepted message
         // fails after passing the allowlist — worth catching here rather
         // than in the chat.
-        if discovery::find_by_name(&tg.dispatcher_agent).is_err() {
+        if !agents
+            .iter()
+            .any(|a| a.manifest.agent.name == tg.dispatcher_agent)
+        {
             println!(
                 "    ⚠ dispatcher agent '{}' not found — every message will fail",
                 tg.dispatcher_agent

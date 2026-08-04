@@ -48,6 +48,11 @@ dispatcher_agent = "telegram-assistant"
 
 **4. Reload.** `dotagent reload`. The log line `telegram ingress started` confirms it.
 
+Every `[telegram]` change takes effect on reload, including the allowlist — the
+daemon stops the running poller and starts a fresh one against the new config.
+Revoking a user id and reloading revokes it immediately, rather than leaving
+them able to trigger runs until the next restart.
+
 Full field list in the [config reference](../guides/config-reference.md#telegram).
 
 ## Why the config is daemon-level
