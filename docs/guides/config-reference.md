@@ -10,9 +10,19 @@ $DOTAGENT_HOME/config.toml         # default: ~/.config/dotagent/config.toml
 If this file is **missing**, dotagent uses the baked-in defaults
 (spelled out below). You only need a `config.toml` to:
 
-- Bump verbosity / change log retention
-- Enable OpenTelemetry export
-- Set OTel resource attributes / headers globally
+| Want to | Section |
+|---|---|
+| Bump verbosity, change log retention | [`[logging]`](#logging) |
+| Export traces to Honeycomb / Tempo / Datadog | [`[telemetry]`](#telemetry) |
+| Keep secrets somewhere other than the default path | [`[secrets]`](#secrets) |
+| **Talk to your agents from Telegram** | [`[telegram]`](#telegram) |
+| **Move or disable long-term memory** | [`[memory]`](#memory) |
+
+Two of those differ in kind. `[logging]`, `[telemetry]` and `[memory]` tune
+something that already works; `[telegram]` **turns on** a path that does not
+exist otherwise, and it is the one section that changes the threat model —
+inbound messages mean untrusted input from the internet can cause a local
+process to run.
 
 There is no required field. Anything you don't write falls back to the
 default.
@@ -58,6 +68,10 @@ allowed_user_ids = [123456789]       # numeric ids; empty = nobody
 dispatcher_agent = "telegram-assistant"
 poll_timeout_seconds = 30            # long-poll hold, capped at 50 by Telegram
 rate_limit_per_minute = 10           # accepted messages per sender
+
+[memory]
+enabled = true                       # default; false removes the memory tools
+workspace = ""                       # empty = $DOTAGENT_HOME/outl
 ```
 
 ---
@@ -89,6 +103,23 @@ Enabling this changes the threat model — a message from the public internet ca
 cause a local process to run. Read
 [V8 in the threat model](../security/threat-model.md) before turning it on, and
 [Telegram](../concepts/telegram.md) for the full setup.
+
+---
+
+## `[memory]`
+
+Long-term memory for agents, stored in an embedded [outl](https://github.com/avelino/outl) workspace. On by default.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Expose `memory-remember` / `memory-recall` from `dotagent mcp`. |
+| `workspace` | `""` | Workspace path. Empty resolves to `$DOTAGENT_HOME/outl`. |
+
+The default workspace is scaffolded when the daemon starts, so memory works without writing any config. A **configured** path is never scaffolded: a typo there must fail loudly rather than create an empty workspace nobody will look at. `dotagent doctor` reports which case you are in.
+
+Pointing this at a workspace you already use puts what an agent remembers next to your own notes, synced to your peers. Convenient, and also means an agent writes where you write.
+
+Full behavior in [Memory](../concepts/memory.md).
 
 ---
 

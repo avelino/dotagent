@@ -147,7 +147,7 @@ fn tools_list() -> Result<serde_json::Value> {
             detail.join("; ")
         ));
     }
-    let tools = catalog(&found.agents)
+    let mut tools: Vec<Tool> = catalog(&found.agents)
         .into_iter()
         .map(|(name, agent)| Tool {
             name,
@@ -155,8 +155,305 @@ fn tools_list() -> Result<serde_json::Value> {
             input_schema: dotagent_mcp::run_input_schema(),
         })
         .collect();
+    tools.extend(introspection_tools());
+    tools.extend(memory_tools());
 
     serde_json::to_value(ToolsListResult { tools }).context("serializing tool list")
+}
+
+/// Introspection tools. Always available — reading a log has nothing to do
+/// with whether memory is on.
+fn introspection_tools() -> Vec<Tool> {
+    let no_args =
+        || serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false});
+    vec![
+        Tool {
+            name: "dotagent-status".into(),
+            description:
+                "Health of every scheduled agent: ok / degraded / failing / stale, with the \
+            last run and why. Answers \"is everything running?\" without guessing."
+                    .into(),
+            input_schema: no_args(),
+        },
+        Tool {
+            name: "dotagent-inspect".into(),
+            description:
+                "Heartbeat, window state and manifest hash for one agent — when it last ran, \
+            whether it succeeded, how many attempts the current window has used."
+                    .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "agent": { "type": "string" } },
+                "required": ["agent"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "dotagent-doctor".into(),
+            description: "Validate every manifest, resolve plugin references, and report secrets, \
+            inbound Telegram and memory status. Use for \"is anything misconfigured?\"."
+                .into(),
+            input_schema: no_args(),
+        },
+        Tool {
+            name: "dotagent-next-runs".into(),
+            description:
+                "What the scheduler would dispatch right now, and when the next event is. \
+            A preview — nothing is executed."
+                    .into(),
+            input_schema: no_args(),
+        },
+        Tool {
+            name: "dotagent-logs".into(),
+            description: "Read the captured output of an agent's recent runs. Use this to answer \
+                \"did X run?\", \"why did X fail?\", or to quote what a run actually printed \
+                instead of guessing."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent": { "type": "string", "description": "Agent name." },
+                    "lines": { "type": "integer", "description": "Trailing lines. Default 40, max 400." }
+                },
+                "required": ["agent"],
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
+
+/// Memory tools, when `[memory]` is enabled.
+///
+/// Separate from the agent catalog on purpose: agents are things the operator
+/// installed, memory is a capability of the server itself.
+fn memory_tools() -> Vec<Tool> {
+    if !memory_config().enabled {
+        return Vec::new();
+    }
+    vec![
+        Tool {
+            name: "memory-remember".into(),
+            description: "Store a fact worth keeping across conversations — a preference, a \
+                decision, something about the user. Give it topics: each becomes a page that \
+                gathers every fact about that subject. Not for chit-chat or for what is \
+                already in this conversation."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The fact, in one sentence." },
+                    "topics": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Subjects this fact belongs to (people, projects, themes). \
+            Each becomes a linked page that gathers every fact mentioning it. Use existing \
+            topics when they fit — a new name for the same subject splits the graph."
+                    }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "memory-topics".into(),
+            description: "List the subjects memory knows about. Check this before inventing a \
+                topic name, so related facts land on the same page instead of splitting across \
+                near-duplicates."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object", "properties": {}, "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "memory-recall".into(),
+            description: "Search stored facts by text. Returns matching memories, newest first. \
+                An empty query returns the most recent ones."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Text to search for." },
+                    "topic": {
+                        "type": "string",
+                        "description": "Instead of a text search, return every fact linked to \
+            this subject, gathered from all days."
+                    },
+                    "limit": { "type": "integer", "description": "Default 10." }
+                },
+                "additionalProperties": false
+            }),
+        },
+    ]
+}
+
+fn memory_config() -> dotagent_core::config::MemoryConfig {
+    dotagent_core::Config::load(dotagent_state::paths::config_file())
+        .unwrap_or_default()
+        .memory
+}
+
+/// Run one of dotagent's own read-only subcommands and return its output.
+///
+/// Re-executes this binary rather than reimplementing each command. The
+/// rendering lives in the CLI, and duplicating it here would mean two versions
+/// of the truth drifting apart — an assistant quoting a status that no longer
+/// matches what `dotagent status` prints is worse than a subprocess.
+///
+/// Only ever called with a fixed set of read-only subcommands; the one variable
+/// argument is an agent name already resolved through discovery.
+fn run_readonly(argv: &[&str]) -> CallToolResult {
+    let Ok(exe) = std::env::current_exe() else {
+        return CallToolResult::text("Could not locate the dotagent binary.", true);
+    };
+    match std::process::Command::new(exe).args(argv).output() {
+        Ok(out) => {
+            let body = String::from_utf8_lossy(&out.stdout);
+            let body = body.trim();
+            if body.is_empty() {
+                let err = String::from_utf8_lossy(&out.stderr);
+                return CallToolResult::text(
+                    format!("No output. {}", err.trim()),
+                    !out.status.success(),
+                );
+            }
+            // A non-zero exit still carries useful output (doctor reports
+            // errors and exits non-zero), so the body goes back either way.
+            CallToolResult::text(body.to_string(), false)
+        }
+        Err(e) => CallToolResult::text(format!("Could not run dotagent {}: {e}", argv[0]), true),
+    }
+}
+
+/// Tail an agent's captured output by delegating to `dotagent logs`.
+///
+/// The name is resolved through discovery first, deliberately: the log path is
+/// derived from it, and `../` in a raw name would reach outside the log tree.
+fn read_agent_logs(args: &serde_json::Value) -> CallToolResult {
+    let agent = args
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim();
+    if agent.is_empty() {
+        return CallToolResult::text("Which agent?", true);
+    }
+    if discovery::find_by_name(agent).is_err() {
+        return CallToolResult::text(format!("No agent named {agent}."), true);
+    }
+    let lines = args
+        .get("lines")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(40)
+        .clamp(1, 400)
+        .to_string();
+    run_readonly(&["logs", agent, "-n", &lines])
+}
+
+/// Resolve the workspace and scaffold it if needed.
+fn memory_store() -> Result<dotagent_memory::MemoryStore> {
+    let cfg = memory_config();
+    match cfg.workspace_override() {
+        // A configured path came from a human, so a typo must fail loudly
+        // rather than scaffold an empty workspace nobody will look at.
+        Some(path) => dotagent_memory::MemoryStore::open(path).map_err(Into::into),
+        None => dotagent_memory::MemoryStore::open_or_init(
+            dotagent_state::paths::memory_workspace_dir(),
+        )
+        .map_err(Into::into),
+    }
+}
+
+/// Run a memory tool. `None` means "not a memory tool".
+fn call_memory(tool: &str, args: &serde_json::Value) -> Option<CallToolResult> {
+    let store = match tool {
+        // Introspection needs no memory workspace.
+        "dotagent-logs" => return Some(read_agent_logs(args)),
+        "dotagent-status" => return Some(run_readonly(&["status"])),
+        "dotagent-doctor" => return Some(run_readonly(&["doctor"])),
+        "dotagent-next-runs" => return Some(run_readonly(&["tick", "--dry-run"])),
+        "dotagent-inspect" => {
+            let agent = args
+                .get("agent")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if agent.is_empty() {
+                return Some(CallToolResult::text("Which agent?", true));
+            }
+            if discovery::find_by_name(&agent).is_err() {
+                return Some(CallToolResult::text(
+                    format!("No agent named {agent}."),
+                    true,
+                ));
+            }
+            return Some(run_readonly(&["inspect", &agent]));
+        }
+        "memory-remember" | "memory-recall" | "memory-topics" => match memory_store() {
+            Ok(s) => s,
+            Err(e) => {
+                return Some(CallToolResult::text(
+                    format!("Memory unavailable: {e}"),
+                    true,
+                ))
+            }
+        },
+        _ => return None,
+    };
+
+    Some(match tool {
+        "memory-topics" => match store.topics() {
+            Ok(t) if t.is_empty() => CallToolResult::text("No topics yet.", false),
+            Ok(t) => CallToolResult::text(t.join("\n"), false),
+            Err(e) => CallToolResult::text(format!("Could not list topics: {e}"), true),
+        },
+        "memory-remember" => {
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let topics: Vec<String> = args
+                .get("topics")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            match store.remember(text, &topics) {
+                Ok(m) => {
+                    CallToolResult::text(format!("Remembered ({}): {}", m.date, m.text), false)
+                }
+                Err(e) => CallToolResult::text(format!("Could not remember: {e}"), true),
+            }
+        }
+        "memory-recall" => {
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10)
+                .clamp(1, 50) as usize;
+            match store.recall(query, limit) {
+                Ok(hits) if hits.is_empty() => {
+                    CallToolResult::text("Nothing remembered about that.", false)
+                }
+                Ok(hits) => {
+                    let body: Vec<String> = hits
+                        .iter()
+                        .map(|m| format!("{}: {}", m.date, m.text))
+                        .collect();
+                    CallToolResult::text(body.join("\n"), false)
+                }
+                Err(e) => CallToolResult::text(format!("Could not recall: {e}"), true),
+            }
+        }
+        _ => unreachable!("guarded above"),
+    })
 }
 
 /// Pair each agent with its tool name, dropping collisions.
@@ -216,6 +513,10 @@ async fn tools_call(id: serde_json::Value, params: Option<serde_json::Value>) ->
             return JsonRpcResponse::err(id, error_code::INVALID_PARAMS, e.to_string());
         }
     };
+    // Kept as raw JSON for the memory tools, whose shape differs from
+    // RunArguments. Agent tools parse the typed form below.
+    let raw_args = call.arguments.clone().unwrap_or(serde_json::Value::Null);
+
     let arguments: RunArguments = match call.arguments {
         Some(a) => match serde_json::from_value(a) {
             Ok(a) => a,
@@ -225,6 +526,14 @@ async fn tools_call(id: serde_json::Value, params: Option<serde_json::Value>) ->
         },
         None => RunArguments::default(),
     };
+
+    // Memory tools are served by this process, not by spawning an agent.
+    if let Some(result) = call_memory(&call.name, &raw_args) {
+        return match serde_json::to_value(result) {
+            Ok(v) => JsonRpcResponse::ok(id, v),
+            Err(e) => JsonRpcResponse::err(id, error_code::INTERNAL_ERROR, e.to_string()),
+        };
+    }
 
     // Resolve the tool name back to an agent through the same catalog the
     // model saw. Never reconstruct the agent name from the tool name — the

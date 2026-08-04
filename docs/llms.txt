@@ -236,9 +236,11 @@ above, so a payload can never redefine `AGENT_NAME` or
 | `AGENT_TRIGGER_SOURCE`   | string | `telegram` \| `mcp` \| `cli`               |
 | `AGENT_TRIGGER_ACTOR`    | string | `123456789` (Telegram numeric user id)     |
 | `AGENT_TRIGGER_REPLY_TO` | string | `123456789` (chat id to answer)            |
-| `AGENT_TRIGGER_PAYLOAD`  | JSON   | `{"text":"how's disk?","chat_id":1,"user_id":2}` |
+| `AGENT_TRIGGER_PAYLOAD`  | JSON   | `{"text":"sim","chat_id":1,"user_id":2,"message_id":9,"reply_to_text":"Posso criar?"}` |
 
 The message body travels in `AGENT_TRIGGER_PAYLOAD`, never in argv.
+When the sender used Telegram's reply, `reply_to_text` carries what they
+replied to — a bare "sim" is meaningless without it.
 Whatever a triggered agent prints on stdout is sent back to whoever
 asked; log to stderr.
 
@@ -874,6 +876,35 @@ protocol faults (unknown method, unknown tool, bad params).
 Agents run in the `dotagent mcp` process, like `run-now` — not through
 the daemon — so they don't appear in `dotagent status`.
 
+### Memory — facts that outlive the conversation
+
+`dotagent mcp` also exposes `memory-remember` and `memory-recall`,
+backed by an embedded outl workspace at `~/.config/dotagent/outl`
+(scaffolded on daemon start; override with `[memory] workspace`).
+
+Memory is NOT conversation history. History is what was just said;
+memory is what stays true next week — a preference, a decision, a
+correction.
+
+It is a graph. `memory-remember` takes `text` + `topics[]`; each topic
+becomes a `[[link]]` to a page, and outl's backlinks make that page
+gather every fact mentioning it. So one fact, stored once in the day's
+journal, is reachable both by date and by subject.
+
+- `memory-remember {text, topics[]}` — store, linked
+- `memory-recall {topic}` — everything linked to a subject (ask the graph)
+- `memory-recall {query}` — substring search (fallback, not semantic)
+- `memory-topics {}` — what subjects exist; check before inventing a name
+
+Reuse topic names. `dotagent` and `dot-agent` are two disconnected pages
+about the same thing, and both look incomplete.
+
+Do not store what is already in the conversation, or anything the agent
+can look up on demand. A memory store full of noise makes recall return
+the wrong thing.
+
+Turn off with `[memory] enabled = false`.
+
 ### Telegram ingress — talk to your agents from a chat
 
 Daemon-level config, NOT per-manifest (Telegram allows one `getUpdates`
@@ -932,6 +963,7 @@ wrongly about what it can do.
 - LLM agents (`claude -p`, headless gotchas): `docs/guides/llm-agents.md`
 - Triggers (event-caused runs): `docs/concepts/triggers.md`
 - Telegram (inbound chat): `docs/concepts/telegram.md`
+- Memory (facts across conversations): `docs/concepts/memory.md`
 - MCP server (agents as tools): `docs/reference/mcp.md`
 - Threat model: `docs/security/threat-model.md`
 - Migrating from Fish framework: `docs/guides/migrating-from-fish.md`

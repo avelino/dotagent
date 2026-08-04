@@ -9,6 +9,51 @@ schema and the plugin protocol are flagged in each entry.
 
 ## [Unreleased]
 
+### Added
+
+- **Long-term memory** — new crate `dotagent-memory` embeds
+  [outl](https://github.com/avelino/outl) (`outl-ws` + `outl-actions`) as an
+  agent memory backend, and `dotagent mcp` exposes `memory-remember` /
+  `memory-recall`. Facts land as one block per journal entry in a workspace
+  at `~/.config/dotagent/outl`, scaffolded when the daemon starts. It is a
+  normal outl workspace on purpose: open it, read what an agent kept, fix a
+  wrong memory, delete a page. Configurable under `[memory]`, and a
+  configured path is never scaffolded so a typo fails loudly. Recall is
+  substring rather than semantic — a near-miss an assistant states as fact
+  is worse than no match. Docs: [`concepts/memory.md`](docs/concepts/memory.md).
+- **Replies carry what they answer.** When a Telegram message is a reply, the
+  quoted text rides in `AGENT_TRIGGER_PAYLOAD.reply_to_text`. A bare "sim"
+  means nothing on its own, and inferring it from conversation history breaks
+  the moment someone answers an older message out of order.
+- Memory is a **graph**, not a list. `memory-remember` takes topics, each
+  becoming a `[[link]]` to a page that outl's backlinks fill in, so a fact
+  stored once on the day it was learned is reachable both chronologically and
+  by subject. `memory-recall` accepts a `topic` to ask the graph instead of
+  guessing which words the fact used, and `memory-topics` lists what exists —
+  reusing a topic is what makes the gathering work, and inventing a near
+  duplicate splits a subject in two.
+- Topic names are normalized (`Roam Research`, `roam research` → `roam-research`)
+  so capitalization alone cannot fragment the graph. `/` survives, since
+  hierarchy is a real page path in outl.
+- **Introspection tools** on the MCP server: `dotagent-status`,
+  `dotagent-logs`, `dotagent-inspect`, `dotagent-doctor` and
+  `dotagent-next-runs`. An assistant asked "did it run?" can now quote the log
+  or the health table instead of reasoning about what probably happened.
+  Read-only by selection: `install`, `uninstall`, `reload` and `daily-summary`
+  are deliberately absent, and `bootstrap` most of all — it marks every window
+  as ok, silencing a failure instead of fixing it. Agent names resolve through
+  discovery, so `../` is refused rather than followed.
+- `dotagent doctor` reports where memory lives, or that it is off.
+
+### Changed
+
+- `reqwest` 0.13.1 → 0.13.4. The `webpki-roots` feature was dropped upstream
+  and `rustls` now carries the trust anchors; keeping the old feature name
+  pinned the lock and silently blocked every patch release. Verified with a
+  real TLS handshake against `api.telegram.org` before and after.
+
+## [0.2.0] - 2026-08-04
+
 ### Breaking (library consumers only)
 
 The `agent.toml` schema and the heartbeat file shape are **unchanged** — no
@@ -60,6 +105,11 @@ break only code that depends on the crates as libraries:
   and it is called out as an explicit exception to the document's premise.
 - `examples/telegram-assistant/` — the whole loop: message → `claude -p`
   with the MCP server attached → agent → reply.
+- Replies quote the message they answer (`reply_parameters`, Bot API 7.0+).
+  Runs are asynchronous and a chat can have several questions in flight, so
+  an unquoted answer leaves you guessing which one it belongs to. Sent with
+  `allow_sending_without_reply`, so deleting the original mid-run still
+  delivers the answer instead of failing with a 400.
 
 ### Fixed
 
@@ -81,6 +131,11 @@ break only code that depends on the crates as libraries:
 - **`give_up` re-derived the state root** instead of using the store it was
   given, so a daemon running against a non-default `DOTAGENT_HOME` wrote
   the give-up marker where nothing else would look for it.
+- **One malformed Telegram update no longer drops the whole batch.** A
+  required field missing from a single update failed the deserialization of
+  the entire `getUpdates` response, which in a long-poll means the offset
+  never advances and Telegram redelivers that batch forever. One bad message
+  would have wedged the bot permanently.
 
 ### Changed
 

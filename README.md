@@ -183,6 +183,7 @@ Canonical raw URL for `WebFetch`:
 - [Notifications](docs/concepts/notifications.md) — built-in drivers
 - [Triggers](docs/concepts/triggers.md) — runs caused by an event, not the clock
 - [Telegram](docs/concepts/telegram.md) — talk to your agents from a chat
+- [Memory](docs/concepts/memory.md) — facts that outlive the conversation
 - [LLM agents](docs/guides/llm-agents.md) — calling `claude -p` from an agent
 
 **Reference:**
