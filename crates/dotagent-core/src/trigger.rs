@@ -70,8 +70,11 @@ pub struct TriggerRequest {
     /// Extra argv appended after the manifest's own `run.args`.
     #[serde(default)]
     pub args: Vec<String>,
-    /// Structured payload handed to the agent as a file (never as argv, so
-    /// size and quoting stay out of the picture).
+    /// Structured payload handed to the agent as `AGENT_TRIGGER_PAYLOAD`,
+    /// never as argv — quoting and shell metacharacters in a message body stay
+    /// out of the picture that way. A source with payloads large enough to
+    /// approach `ARG_MAX` should write a file into `AGENT_TMPDIR` instead of
+    /// growing this.
     #[serde(default)]
     pub payload: Option<serde_json::Value>,
     /// Who asked, in whatever form the source can attest. For Telegram this is
