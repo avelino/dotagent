@@ -39,7 +39,7 @@ run_with_timeout() {
   perl -e 'alarm shift; exec @ARGV' "$seconds" "$@"
 }
 
-for bin in claude jq dotagent; do
+for bin in claude jq dotagent python3; do
   command -v "$bin" >/dev/null || {
     err "$bin not found in PATH"
     exit 1
@@ -78,6 +78,55 @@ cat >"$AGENT_TMPDIR/mcp.json" <<'JSON'
 }
 JSON
 
+# ---- Conversation ---------------------------------------------------------
+# One claude session per chat, so "sim" refers to whatever was just proposed.
+# Without it every message starts from nothing and a confirm-then-act flow is
+# impossible: the assistant asks "shall I?" and then has no idea what it
+# offered.
+#
+# The id is derived from the chat id, so it survives daemon restarts.
+chat_id="$(printf '%s' "$AGENT_TRIGGER_PAYLOAD" | jq -r '.chat_id // "unknown"')"
+session_dir="${DOTAGENT_HOME:-$HOME/.config/dotagent}/state/telegram-assistant"
+mkdir -p "$session_dir"
+
+# A generation counter, bumped when a session is retired for length.
+gen_file="$session_dir/$chat_id.gen"
+generation="$(cat "$gen_file" 2>/dev/null || echo 0)"
+session_id="$(printf '%s' "dotagent-telegram-$chat_id-g$generation" \
+  | python3 -c 'import sys,uuid; print(uuid.uuid5(uuid.NAMESPACE_DNS, sys.stdin.read()))')"
+
+# `--resume` replays the whole transcript as model input, and nothing trims
+# it, so a chat gets slower the more you use it. Measured on a real bot: a
+# ~90 KB transcript answers in 8-10s, a 977 KB one in 26-141s.
+#
+# The ceiling is a compromise, not a fix — retiring costs the recent back and
+# forth. That is why an assistant like this should store durable facts with
+# `memory-remember`: continuity that matters belongs there, not in a
+# transcript that grows until it is unusable. See docs/concepts/memory.md.
+max_transcript_kb=400
+# claude names the project directory after the PHYSICAL path, so `pwd -P`.
+project_slug="$(pwd -P | tr '/.' '-')"
+transcript="$HOME/.claude/projects/$project_slug/$session_id.jsonl"
+if [[ -f "$transcript" ]]; then
+  kb=$(( $(wc -c <"$transcript") / 1024 ))
+  if (( kb > max_transcript_kb )); then
+    generation=$(( generation + 1 ))
+    printf '%s' "$generation" >"$gen_file"
+    session_id="$(printf '%s' "dotagent-telegram-$chat_id-g$generation" \
+      | python3 -c 'import sys,uuid; print(uuid.uuid5(uuid.NAMESPACE_DNS, sys.stdin.read()))')"
+    log "transcript at ${kb}KB — retiring session, generation $generation"
+  fi
+fi
+
+# `--session-id` creates, `--resume` continues, and using the wrong one is an
+# error. A marker file records which state this chat is in.
+marker="$session_dir/$chat_id.started"
+if [[ -f "$marker" && "$(cat "$marker")" == "$session_id" ]]; then
+  session_flag=(--resume "$session_id")
+else
+  session_flag=(--session-id "$session_id")
+fi
+
 # The message goes in on stdin, never interpolated into the prompt string —
 # an argv-borne body would be one quoting bug away from a shell problem.
 set +e
@@ -85,13 +134,22 @@ answer="$(
   printf '%s' "$message" | run_with_timeout "$CLAUDE_TIMEOUT" \
     claude \
     --model "$MODEL" \
-    --system-prompt "$(cat "$AGENT_HOME/prompt.md")" \
+    --append-system-prompt "$(cat "$AGENT_HOME/prompt.md")" \
     --mcp-config "$AGENT_TMPDIR/mcp.json" \
+    --strict-mcp-config \
     --allowedTools "mcp__dotagent" \
+    "${session_flag[@]}" \
     -p -
 )"
 status=$?
 set -e
+
+# Only after a run that actually created it. Writing the marker up front
+# would leave a chat permanently broken if the first call failed: every later
+# message would `--resume` a session that never existed.
+if [[ $status -eq 0 ]]; then
+  printf '%s' "$session_id" >"$marker"
+fi
 
 if [[ $status -ne 0 ]]; then
   err "claude exited $status"

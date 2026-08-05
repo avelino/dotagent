@@ -272,6 +272,80 @@ if [[ -z "$body" ]]; then
 fi
 ```
 
+## Where the latency actually is
+
+For a scheduled agent, none of this matters — nobody is waiting. For anything
+conversational, it is the whole experience, and the intuition about where the
+time goes is usually wrong.
+
+Numbers below are measured on a real Telegram assistant, answering a trivial
+prompt with no tool call, so they isolate fixed cost from the model's thinking.
+
+### The MCP proxy you spawn per run
+
+| toolkit | time |
+|---|---|
+| no MCP server at all | 4.0s |
+| `dotagent mcp` (28 tools) | 3.8s |
+| plus an aggregating proxy over **stdio** | 12.0s |
+| plus the same proxy over **HTTP, already running** | 3.4s |
+
+`dotagent mcp` is free — it reads the catalog off disk and answers in ~20ms.
+An aggregating proxy is not: spawned per run it reopens its database,
+rediscovers every backend and reclassifies every tool before the first
+request. If a proxy is already listening, connect to it instead of spawning a
+private copy:
+
+```json
+{ "mcpServers": { "proxy": { "type": "http", "url": "http://127.0.0.1:7332/mcp" } } }
+```
+
+### The transcript you replay
+
+`--resume` sends the whole conversation as input, and nothing trims it:
+
+| transcript | answer |
+|---|---|
+| ~90 KB | 8-10s |
+| 977 KB (228 messages, ~128k tokens) | 26-141s |
+
+A chat gets monotonically slower the more you use it, which reads as "the bot
+got worse" rather than as a size problem. Put a ceiling on it and start a
+fresh session past that, and keep what must survive in
+[memory](../concepts/memory.md) instead of in the transcript.
+
+### The process you fork per message
+
+`claude -p` pays startup every invocation. `--input-format stream-json` keeps
+one process reading turns from stdin, so the session never leaves memory:
+
+| | 1st answer | 2nd answer |
+|---|---|---|
+| fork per message | 3.91s | 4.94s |
+| one persistent process | 3.46s | **1.90s** |
+
+Every message after the first is a second message. The catch is that dotagent
+spawns an agent per event by design, so holding a process alive means running
+something the supervisor does not manage — deadlines, reaping and crash
+recovery become yours. Worth it for a chat, not worth it for a cron job.
+
+### Tools you publish but never call
+
+Clients stop putting tool schemas in the prompt past a few hundred and defer
+them behind a lookup step, which turns one answer into several round trips —
+16 lookups in a single reply, in one measured case. Publishing 204 tools when
+the agent uses a dozen is not free, so narrow the catalog to what the agent
+actually needs.
+
+### One that is easy to miss
+
+Anything feeding the invocation must be **deterministic**, or the caching
+underneath it silently never hits. A proxy listing its servers from a hash map
+returned them in a different order every call; that reordered the allowlist,
+which changed the session fingerprint, which threw away the warm session on
+every single message. Sorting one list fixed it. If a cache "does not seem to
+work", check that its key is stable before assuming the cache is broken.
+
 ## Cost control
 
 **Dry run must not spend tokens.** `AGENT_DRY_RUN=true` should collect,
@@ -369,6 +443,10 @@ call in the middle. Some have none at all — see
 - [`reference/env-vars.md`](../reference/env-vars.md) — the `AGENT_*`
   vars your script reads
 - [`concepts/secrets.md`](../concepts/secrets.md) — where API keys go
+- [`examples/telegram-assistant`](../../examples/telegram-assistant) — the
+  conversational shape, with per-chat sessions and a ceiling on the transcript
+- [`concepts/memory.md`](../concepts/memory.md) — what should outlive a
+  conversation, and why a transcript is the wrong place for it
 - [`guides/troubleshooting.md`](troubleshooting.md) — when a scheduled
   run misbehaves
 - [`faq.md`](../faq.md#will-dotagent-run-my-llm-agents) — the short

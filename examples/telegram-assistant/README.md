@@ -61,6 +61,16 @@ It picks from `tools/list`, which is one entry per agent already installed. A na
 
 Your message reaches the script through `AGENT_TRIGGER_PAYLOAD` as JSON — in the environment, not argv — so quoting and shell metacharacters in what you type are never interpreted.
 
+## The conversation
+
+Each chat gets its own `claude` session, keyed off the chat id, so "sim" refers to whatever was just proposed. Without it a confirm-then-act flow is impossible: the assistant asks "shall I?" and then has no idea what it offered.
+
+That history is not kept forever. `--resume` replays the whole transcript as model input and nothing trims it, so a chat gets slower the more you use it — measured on a real bot, a ~90 KB transcript answers in 8-10s and a 977 KB one in 26-141s. Past 400 KB the session is retired and a fresh one starts, which costs the recent back and forth.
+
+So anything that must survive goes to [memory](../../docs/concepts/memory.md), not to the transcript. State lives in `~/.config/dotagent/state/telegram-assistant/`: which session belongs to which chat, and how many times it has been retired.
+
+More on what latency costs in a conversational agent: [LLM agents](../../docs/guides/llm-agents.md#where-the-latency-actually-is).
+
 ## Check it without Telegram
 
 The MCP server is the interesting half and it stands alone:

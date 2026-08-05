@@ -323,6 +323,24 @@ A normal outl workspace, on purpose: open it in the desktop app, read what an
 agent remembered, fix a wrong memory, delete a page. Relocate with
 `[memory] workspace` in `config.toml`. See [Memory](../concepts/memory.md).
 
+### `state/<agent>/`
+
+Whatever an agent needs to keep between runs, under a directory named after
+it. dotagent writes nothing here; the agent owns it.
+
+[`examples/telegram-assistant`](https://github.com/avelino/dotagent/tree/main/examples/telegram-assistant)
+uses `state/telegram-assistant/` for which `claude` session belongs to which
+chat, and how many times that session has been retired for length:
+
+```text
+state/telegram-assistant/
+├── <chat-id>.started      # session id, written only after a run that created it
+└── <chat-id>.gen          # generation counter, bumped on each retirement
+```
+
+An agent that keeps state here should declare the path in `[security]
+filesystem_writable`, so `doctor` can audit what it writes.
+
 ### `state/notify/telegram/offset.json`
 
 Last acknowledged Telegram `update_id`, written tmp-then-rename.

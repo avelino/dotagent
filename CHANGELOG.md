@@ -9,6 +9,30 @@ schema and the plugin protocol are flagged in each entry.
 
 ## [Unreleased]
 
+### Changed
+
+- **`examples/telegram-assistant` holds a conversation.** It used to answer
+  each message from nothing, which makes confirm-then-act impossible — the
+  assistant asks "shall I?" and then cannot know what it offered. Each chat
+  now gets its own `claude` session, with a 400 KB ceiling on the transcript
+  because `--resume` replays all of it as input and nothing trims it: measured
+  on a real bot, ~90 KB answers in 8-10s and 977 KB in 26-141s. Retiring costs
+  the recent history, which is the argument for keeping what matters in
+  [memory](docs/concepts/memory.md) instead.
+
+### Added
+
+- **Latency guidance for conversational agents** in
+  [`guides/llm-agents.md`](docs/guides/llm-agents.md#where-the-latency-actually-is),
+  with measurements rather than advice: an aggregating MCP proxy spawned per
+  run costs 8s that connecting to a running one does not, `dotagent mcp`
+  itself costs nothing, a forked `claude -p` answers the second message in
+  4.94s against 1.90s for a process kept alive, and a tool catalog past a few
+  hundred entries turns one answer into several round trips. Also the failure
+  that is easy to miss: a proxy listing its backends from a hash map returned
+  them in a different order each call, which changed the session fingerprint
+  and silently threw away the warm session on every message.
+
 ## [0.2.1] - 2026-08-04
 
 ### Added

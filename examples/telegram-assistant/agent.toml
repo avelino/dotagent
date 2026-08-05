@@ -52,6 +52,8 @@ TELEGRAM_ASSISTANT_CLAUDE_TIMEOUT = "540"
 # docs/security/threat-model.md), so today this documents intent and gives
 # `doctor` something to audit.
 [security]
-allowed_commands = ["bash", "jq", "claude", "dotagent", "perl"]
+allowed_commands = ["bash", "jq", "claude", "dotagent", "perl", "python3"]
 network = ["api.anthropic.com"]
-filesystem_writable = ["/tmp"]
+# Also the session state: which claude session belongs to which chat, and how
+# many times it has been retired for length.
+filesystem_writable = ["/tmp", "~/.config/dotagent/state/telegram-assistant"]
