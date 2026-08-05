@@ -9,6 +9,31 @@ schema and the plugin protocol are flagged in each entry.
 
 ## [Unreleased]
 
+### Added
+
+- **A reply knows which run it answers.** Notifications are the messages you
+  actually want to answer, and answering one used to arrive as prose someone
+  had to parse. dotagent now records what each outbound Telegram message was
+  about and resolves a reply back to it, handing the dispatcher
+  `AGENT_TRIGGER_PAYLOAD.reply_to_run` with the agent, schedule and event.
+  Resolved from the message id rather than the text, because the text is not
+  an interface: one alert reads `calendar-prep-1h/hourly-00 gave up after 2
+  attempts` and another reads only `preflight aborted by plugin
+  preflight-warp`. The table lives at `state/notify/telegram/sent.json`,
+  capped at 500 entries — losing it costs correlation on old alerts, never
+  delivery.
+- **`[[preflight]] remediation`** — declare what clears a check, and it
+  becomes a `remediate-<agent>-<plugin>` tool an assistant can offer instead
+  of only reporting the failure. The plugin's own `suggest` string stays
+  unexecutable on purpose: running a command a *plugin* wrote, triggered by a
+  chat message, is arbitrary execution over an inbound path. Declared in the
+  manifest it is the operator's command, in a file under review, published as
+  a closed catalog entry that takes no arguments — so a model picks *which*,
+  never *what*. Split into argv with no shell, supervised with a 120s
+  deadline, audited as `remediation_invoked` at `Critical`, and it does not
+  re-run the agent. New threat vector
+  [V12](docs/security/threat-model.md#v12--remediation-from-a-chat-message).
+
 ### Changed
 
 - **`examples/telegram-assistant` holds a conversation.** It used to answer

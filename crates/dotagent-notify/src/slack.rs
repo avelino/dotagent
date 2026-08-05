@@ -27,7 +27,7 @@ impl Notifier for SlackConfig {
         "slack"
     }
 
-    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<()> {
+    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<Option<i64>> {
         if !self.webhook_url.starts_with("http") {
             return Err(NotifyError::Config(
                 "slack: webhook_url must be an http(s) URL".into(),
@@ -54,6 +54,6 @@ impl Notifier for SlackConfig {
                 res.status()
             )));
         }
-        Ok(())
+        Ok(None)
     }
 }

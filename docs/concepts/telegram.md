@@ -97,6 +97,26 @@ An invoked command arrives beside the text rather than instead of it:
 
 Two answers do come straight from the daemon: `/help` and "no command named /typo". Both are questions about *what exists*, which is the catalog the daemon already publishes. Letting `/typo` fall through would mean a model improvising an answer to something meant to be exact.
 
+## Answering a notification
+
+The bot posts when a run fails. Replying to that message is the natural next
+move, and the reply carries which run it answers:
+
+```jsonc
+"reply_to_run": { "agent": "calendar-prep-1h", "schedule": "hourly-00", "event": "given_up" }
+```
+
+Resolved from the replied-to message id, through a table of the last few
+hundred notifications at `state/notify/telegram/sent.json`. Not from the text:
+one event reads `🚨 calendar-prep-1h/hourly-00 gave up after 2 attempts` and
+another reads only `preflight aborted by plugin preflight-warp`, so a
+dispatcher parsing the wording would work for one and be wrong on the other.
+
+With it, "por que falhou?" is answerable without guessing which agent — the
+dispatcher reads the field and calls `dotagent-logs` on the right one. If the
+manifest declared a [remediation](../reference/mcp.md#remediation-tools), the
+fix is a tool in the same catalog.
+
 ## Replies
 
 The dispatcher's stdout goes back to the chat that asked. Sent as plain text, not MarkdownV2 — the body is agent output, and an unescaped backtick or underscore in a log line would otherwise turn into a Bot API 400. Delivery beats formatting.

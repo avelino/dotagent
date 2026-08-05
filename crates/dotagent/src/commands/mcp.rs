@@ -156,6 +156,7 @@ fn tools_list() -> Result<serde_json::Value> {
         })
         .collect();
     tools.extend(introspection_tools());
+    tools.extend(remediation_tools(&found.agents));
     tools.extend(memory_tools());
     tools.extend(skill_tools());
     tools.extend(command_tools());
@@ -589,6 +590,197 @@ fn call_memory(tool: &str, args: &serde_json::Value) -> Option<CallToolResult> {
 }
 
 // -------------------------------------------------------------------------
+// Remediation
+// -------------------------------------------------------------------------
+
+/// One tool per `[[preflight]] remediation` an operator declared.
+///
+/// A preflight abort names what is wrong and often what would fix it, and
+/// until now the fix was something you got up and typed. The gap is not
+/// knowing the command — the plugin already returns it in `suggest`. The gap
+/// is that running a string a plugin wrote, triggered from a chat, is
+/// arbitrary execution over an inbound path.
+///
+/// Declaring it in the manifest closes that: the catalog holds commands a
+/// human committed to a file, and a model picks from the catalog. Same
+/// property as `run-*`, for the same reason — a name that is not there is not
+/// callable.
+fn remediation_tools(agents: &[DiscoveredAgent]) -> Vec<Tool> {
+    let mut tools = Vec::new();
+    let mut seen: std::collections::HashSet<String> = Default::default();
+    for agent in agents {
+        let agent_name = &agent.manifest.agent.name;
+        for pr in &agent.manifest.preflight {
+            let Some(command) = pr
+                .remediation
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            else {
+                continue;
+            };
+            let name = dotagent_mcp::remediation_tool_name_for(agent_name, &pr.plugin);
+            if !seen.insert(name.clone()) {
+                warn!(
+                    agent = %agent_name,
+                    plugin = %pr.plugin,
+                    tool = %name,
+                    "remediation tool name collides with an earlier one — skipping"
+                );
+                continue;
+            }
+            tools.push(Tool {
+                // The command is in the description on purpose: an assistant
+                // about to run something on the operator's machine should be
+                // able to say what it is before doing it.
+                description: format!(
+                    "Fix what makes {plugin} block {agent_name}, by running: {command}\n\n\
+                     Declared in {agent_name}'s manifest. Ask before calling this — it \
+                     changes the machine, unlike reading a log.",
+                    plugin = pr.plugin,
+                ),
+                name,
+                input_schema: dotagent_mcp::remediation_input_schema(),
+            });
+        }
+    }
+    tools
+}
+
+/// Resolve a tool name back to the declared command, through the same catalog
+/// the model saw. Returns `(agent, plugin, command)`.
+fn resolve_remediation(tool: &str) -> Option<(String, String, String)> {
+    for agent in discovery::discover().agents {
+        let agent_name = agent.manifest.agent.name.clone();
+        for pr in &agent.manifest.preflight {
+            let Some(command) = pr
+                .remediation
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+            else {
+                continue;
+            };
+            if dotagent_mcp::remediation_tool_name_for(&agent_name, &pr.plugin) == tool {
+                return Some((agent_name, pr.plugin.clone(), command.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Deadline for a remediation. Long enough for a VPN handshake, short enough
+/// that a command waiting on a prompt nobody will answer does not sit forever.
+const REMEDIATION_TIMEOUT_SECONDS: u64 = 120;
+
+/// Run a declared remediation under the supervisor. `None` means "not one".
+async fn call_remediation(tool: &str) -> Option<CallToolResult> {
+    if !tool.starts_with("remediate-") {
+        return None;
+    }
+    let Some((agent, plugin, command)) = resolve_remediation(tool) else {
+        return Some(CallToolResult::text(
+            format!("No declared remediation named {tool}."),
+            true,
+        ));
+    };
+
+    // argv, never a shell: `remediation = "x && curl ... | sh"` runs a program
+    // called `x` with those literal arguments, and fails, rather than becoming
+    // three commands.
+    let mut parts = command.split_whitespace();
+    let Some(program) = parts.next() else {
+        return Some(CallToolResult::text(
+            format!("{agent}: remediation for {plugin} is empty."),
+            true,
+        ));
+    };
+    let args: Vec<&str> = parts.collect();
+
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let plugins = PluginClient::from_environment();
+    let spec = dotagent_supervisor::SpawnSpec {
+        kind: dotagent_supervisor::ProcessKind::Skill,
+        owner: dotagent_supervisor::ProcessOwner {
+            agent: agent.clone(),
+            plugin: Some(plugin.clone()),
+            ..Default::default()
+        },
+        deadline: std::time::Duration::from_secs(REMEDIATION_TIMEOUT_SECONDS),
+        label: format!("remediate:{plugin}"),
+    };
+
+    let handle = match plugins.supervisor().spawn_supervised(cmd, spec).await {
+        Ok(h) => h,
+        Err(e) => {
+            return Some(CallToolResult::text(
+                format!("Could not start `{command}`: {e}"),
+                true,
+            ))
+        }
+    };
+
+    let (body, is_error, exit_code, timed_out) = match handle.wait_with_output().await {
+        Ok(out) => {
+            let code = out.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if code == 0 {
+                let tail = if stdout.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{stdout}")
+                };
+                (
+                    format!("Ran `{command}`. It exited 0.{tail}\n\nThis does not re-run {agent} — ask for that separately."),
+                    false,
+                    code,
+                    false,
+                )
+            } else {
+                (
+                    format!(
+                        "`{command}` exited {code}.\n{}",
+                        cap(&stderr, SKILL_OUTPUT_MAX_BYTES)
+                    ),
+                    true,
+                    code,
+                    false,
+                )
+            }
+        }
+        Err(dotagent_supervisor::SupervisorError::TimedOut { elapsed, .. }) => (
+            format!(
+                "`{command}` was still running after {}s and was killed.",
+                elapsed.as_secs()
+            ),
+            true,
+            -1,
+            true,
+        ),
+        Err(e) => (format!("`{command}` could not run: {e}"), true, -1, false),
+    };
+
+    // Audited because this changes the machine on behalf of whoever was in a
+    // chat window. `dotagent status` shows it live; this is the record after.
+    if let Ok(audit) = AuditLog::from_home() {
+        let _ = audit.append(dotagent_core::AuditEvent::RemediationInvoked {
+            agent,
+            plugin,
+            command,
+            exit_code,
+            timed_out,
+        });
+    }
+    Some(CallToolResult::text(body, is_error))
+}
+
+// -------------------------------------------------------------------------
 // Skills
 // -------------------------------------------------------------------------
 
@@ -940,6 +1132,14 @@ async fn tools_call(id: serde_json::Value, params: Option<serde_json::Value>) ->
     // ran — a tool failing on the schema of a *different* tool.
     let raw_args = call.arguments.clone().unwrap_or(serde_json::Value::Null);
 
+    // A declared remediation runs a command, not an agent.
+    if let Some(result) = call_remediation(&call.name).await {
+        return match serde_json::to_value(result) {
+            Ok(v) => JsonRpcResponse::ok(id, v),
+            Err(e) => JsonRpcResponse::err(id, error_code::INTERNAL_ERROR, e.to_string()),
+        };
+    }
+
     // Skills are text and (occasionally) a script — never an agent run.
     if let Some(result) = call_skill(&call.name, &raw_args).await {
         return match serde_json::to_value(result) {
@@ -1153,6 +1353,88 @@ mod tests {
         let s = serde_json::to_string(&res).unwrap();
         assert!(s.contains("-32602"), "{s}");
         assert!(s.contains("unknown tool"), "{s}");
+    }
+
+    // --- remediation ---
+
+    fn agent_with(toml_src: &str) -> DiscoveredAgent {
+        DiscoveredAgent {
+            manifest: toml::from_str(toml_src).unwrap(),
+            dir: std::path::PathBuf::from("/tmp"),
+        }
+    }
+
+    const GATED: &str = r#"
+[agent]
+name = "needs-vpn"
+[run]
+command = "true"
+[[preflight]]
+plugin = "preflight-warp"
+remediation = "warp-cli connect"
+"#;
+
+    #[test]
+    fn a_declared_remediation_becomes_a_tool_naming_the_command() {
+        let tools = remediation_tools(&[agent_with(GATED)]);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "remediate-needs-vpn-preflight-warp");
+        // The command is visible before it runs: an assistant should be able
+        // to say what it is about to do to the machine.
+        assert!(
+            tools[0].description.contains("warp-cli connect"),
+            "{}",
+            tools[0].description
+        );
+    }
+
+    #[test]
+    fn a_preflight_without_remediation_publishes_nothing() {
+        // The default. Declaring the command is opt-in, and a plugin's own
+        // `suggest` string never becomes callable on its own.
+        let plain = r#"
+[agent]
+name = "x"
+[run]
+command = "true"
+[[preflight]]
+plugin = "preflight-warp"
+"#;
+        assert!(remediation_tools(&[agent_with(plain)]).is_empty());
+    }
+
+    #[test]
+    fn an_empty_remediation_is_ignored() {
+        let blank = r#"
+[agent]
+name = "x"
+[run]
+command = "true"
+[[preflight]]
+plugin = "preflight-warp"
+remediation = "   "
+"#;
+        assert!(remediation_tools(&[agent_with(blank)]).is_empty());
+    }
+
+    #[test]
+    fn two_agents_gated_by_the_same_plugin_get_separate_tools() {
+        let other = GATED.replace("needs-vpn", "also-needs-vpn");
+        let tools = remediation_tools(&[agent_with(GATED), agent_with(&other)]);
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_remediation_is_refused_rather_than_guessed() {
+        let result = call_remediation("remediate-nope-nope").await.unwrap();
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(rendered.contains(r#""isError":true"#), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn a_non_remediation_tool_is_not_claimed() {
+        assert!(call_remediation("run-something").await.is_none());
+        assert!(call_remediation("skill-x").await.is_none());
     }
 
     // --- skills ---

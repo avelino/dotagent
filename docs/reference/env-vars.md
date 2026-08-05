@@ -30,7 +30,31 @@ SDK to import.
 | `AGENT_TRIGGER_SOURCE` | string   | `telegram`                                         | Only on [triggered](../concepts/triggers.md) runs. One of `telegram`, `mcp`, `cli`. |
 | `AGENT_TRIGGER_ACTOR`  | string   | `123456789`                                        | Triggered runs, when the source can attest an identity. Telegram: numeric user id. |
 | `AGENT_TRIGGER_REPLY_TO` | string | `123456789`                                        | Triggered runs, when the source can be answered. Telegram: chat id. |
-| `AGENT_TRIGGER_PAYLOAD` | JSON object | `{"text":"/standup x","chat_id":1,"user_id":2,"command":{"name":"standup","args":"x"}}` | Triggered runs. Body travels here, never in argv. `command` is present only when the sender invoked one — see [Commands](../concepts/commands.md#the-payload). |
+| `AGENT_TRIGGER_PAYLOAD` | JSON object | `{"text":"/standup x","chat_id":1,"user_id":2,"command":{"name":"standup","args":"x"}}` | Triggered runs. Body travels here, never in argv. `command` is present only when the sender invoked one — see [Commands](../concepts/commands.md#the-payload). `reply_to_run` is present when the sender replied to a notification dotagent sent — see below. |
+
+#### `reply_to_run`
+
+When the message answers a notification dotagent sent, the payload carries
+which run it came from:
+
+```jsonc
+{
+  "text": "por que falhou?",
+  "reply_to_text": "🚨 calendar-prep-1h/hourly-00 gave up after 2 attempts (exit 1)…",
+  "reply_to_run": {
+    "agent": "calendar-prep-1h",
+    "schedule": "hourly-00",
+    "event": "given_up"
+  }
+}
+```
+
+Resolved from the replied-to message id, not from the text. The wording is not
+a stable interface — one event names `agent/schedule` and another says only
+`preflight aborted by plugin preflight-warp` — and two agents can fail
+identically. Absent when the reply is to something else, or when the
+notification is older than the few hundred kept in
+`state/notify/telegram/sent.json`.
 
 The positional `argv` of your process is `[run].command` + `[run].args`
 + schedule's `args`, so most scripts don't actually need `AGENT_ARGV`

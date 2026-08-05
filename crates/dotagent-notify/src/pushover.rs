@@ -21,7 +21,7 @@ impl Notifier for PushoverConfig {
         "pushover"
     }
 
-    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<()> {
+    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<Option<i64>> {
         if self.token.is_empty() || self.user.is_empty() {
             return Err(NotifyError::Config(
                 "pushover: token and user are required".into(),
@@ -51,6 +51,6 @@ impl Notifier for PushoverConfig {
                 res.status()
             )));
         }
-        Ok(())
+        Ok(None)
     }
 }

@@ -30,7 +30,7 @@ impl Notifier for NtfyConfig {
         "ntfy"
     }
 
-    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<()> {
+    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<Option<i64>> {
         if self.topic.is_empty() {
             return Err(NotifyError::Config("ntfy: topic is required".into()));
         }
@@ -59,6 +59,6 @@ impl Notifier for NtfyConfig {
                 res.status()
             )));
         }
-        Ok(())
+        Ok(None)
     }
 }

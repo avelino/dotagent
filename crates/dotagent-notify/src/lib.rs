@@ -87,9 +87,20 @@ pub struct NotifyContext<'a> {
 /// Trait every built-in driver implements. `send` may short-circuit (return
 /// `Err(NotifyError::Skipped)`) for rate-limiting / dedup — the caller treats
 /// that as an `ok` outcome rather than a failure.
+///
+/// The `Option<i64>` is a handle the transport gives the message, when it has
+/// one. Only Telegram does, and only because a reply to that message can then
+/// be resolved back to the run that sent it. Every other driver returns
+/// `None`, and the caller must treat it as "no correlation available" rather
+/// than as an error — a desktop notification is not answerable.
+///
+/// This lives on the return value rather than in a store because
+/// `dotagent-notify` cannot depend on `dotagent-state`: `state` depends on
+/// `core`, and `core` re-exports `NotifierEntry` from here. Persisting is the
+/// caller's job, which is also where it belongs.
 #[async_trait]
 pub trait Notifier: Send + Sync {
-    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<()>;
+    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<Option<i64>>;
     fn driver_name(&self) -> &'static str;
 }
 

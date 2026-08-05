@@ -163,7 +163,7 @@ impl Notifier for TelegramConfig {
         "telegram"
     }
 
-    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<()> {
+    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<Option<i64>> {
         if self.chat_id.trim().is_empty() {
             return Err(NotifyError::Config("telegram: chat_id is required".into()));
         }
@@ -211,7 +211,7 @@ pub(crate) async fn send_message(
     parse_mode: Option<ParseMode>,
     silent: bool,
     reply_to: Option<i64>,
-) -> Result<()> {
+) -> Result<Option<i64>> {
     if bot_token.trim().is_empty() {
         return Err(NotifyError::Config(
             "telegram: bot_token is required".into(),
@@ -270,7 +270,17 @@ pub(crate) async fn send_message(
     if !status.is_success() {
         return Err(NotifyError::Backend(format!("telegram returned {status}")));
     }
-    Ok(())
+
+    // The id of the message we just posted, so a later reply to it can be
+    // resolved back to the run that caused it. Not being able to read it is
+    // not a delivery failure: the message arrived, and the only thing lost is
+    // the ability to correlate a future reply.
+    let message_id = res
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|v| v.get("result")?.get("message_id")?.as_i64());
+    Ok(message_id)
 }
 
 #[cfg(test)]

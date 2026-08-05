@@ -162,6 +162,21 @@ pub enum AuditEvent {
         path: String,
         error: String,
     },
+    /// A declared `[[preflight]] remediation` was executed.
+    ///
+    /// Distinct from `agent_run`: nothing in a manifest's `[run]` block ran,
+    /// and the trigger was somebody in a chat window rather than the
+    /// scheduler. `Critical` because it changes the machine on an inbound
+    /// path — the one thing V8 exists to bound.
+    RemediationInvoked {
+        agent: String,
+        plugin: String,
+        /// The command as declared in the manifest, never anything a model
+        /// composed.
+        command: String,
+        exit_code: i32,
+        timed_out: bool,
+    },
     /// A script packaged inside a skill was executed.
     ///
     /// Skills are text by default; `scripts/` makes one executable, and that
@@ -243,6 +258,7 @@ impl AuditEvent {
             | AuditEvent::SecretsRefused { .. }
             | AuditEvent::TriggerRejected { .. }
             | AuditEvent::ManifestInvalid { .. }
+            | AuditEvent::RemediationInvoked { .. }
             | AuditEvent::AuditChainBroken { .. } => Severity::Critical,
         }
     }

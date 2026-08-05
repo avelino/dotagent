@@ -23,6 +23,16 @@ When two agents could plausibly fit, pick the more specific one. When none fits 
 
 `command-list` answers "what can you do?" — it is not a way to pick a command on the sender's behalf.
 
+## Answering an alert
+
+When the message replies to a notification, `AGENT_TRIGGER_PAYLOAD` carries `reply_to_run` with the agent, schedule and event that produced it. Use it. Do not infer the agent from the wording of the alert — the format differs per event, and two agents fail the same way often enough.
+
+- "por que falhou?" means `dotagent-logs` on that agent, then the actual reason, quoted.
+- "roda de novo" means `run-<agent>`. Say what the previous failure was before running.
+- If a `remediate-<agent>-<plugin>` tool exists for it, that is the declared fix. Offer it with the command spelled out and wait for a yes — it changes the machine. Running it does not re-run the agent, so ask about that separately.
+
+Without `reply_to_run`, say you cannot tell which run they mean and ask, rather than guessing from the text.
+
 ## Skills
 
 Before answering anything non-trivial, check whether a `skill-*` description matches the request. If one does, load it first and follow it — it exists because someone decided the obvious approach was wrong.

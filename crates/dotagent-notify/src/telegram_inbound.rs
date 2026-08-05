@@ -49,6 +49,13 @@ pub struct InboundMessage {
     /// from conversation history, which breaks the moment someone answers an
     /// older message out of order.
     pub reply_to_text: Option<String>,
+    /// Id of the message this one replies to.
+    ///
+    /// The text alone cannot say which run a notification came from — the
+    /// wording differs per event, and two agents can fail the same way. The id
+    /// resolves through the sent-message table to the exact (agent, schedule,
+    /// event) that produced the alert.
+    pub reply_to_message_id: Option<i64>,
 }
 
 // ---------------------------------------------------------------------
@@ -119,8 +126,9 @@ fn extract(updates: Vec<Update>) -> Vec<InboundMessage> {
             if text.trim().is_empty() {
                 return None;
             }
-            let reply_to_text = msg
-                .reply_to_message
+            let replied_to = msg.reply_to_message;
+            let reply_to_message_id = replied_to.as_ref().and_then(|r| r.message_id);
+            let reply_to_text = replied_to
                 .and_then(|r| r.text)
                 .map(|t| t.trim().to_string())
                 .filter(|t| !t.is_empty());
@@ -131,6 +139,7 @@ fn extract(updates: Vec<Update>) -> Vec<InboundMessage> {
                 message_id,
                 text,
                 reply_to_text,
+                reply_to_message_id,
             })
         })
         .collect()
@@ -249,6 +258,9 @@ impl Poller {
 /// have several questions in flight, so without the quote there is no telling
 /// which answer belongs to which.
 pub async fn reply(bot_token: &str, chat_id: i64, reply_to: Option<i64>, text: &str) -> Result<()> {
+    // The id of the reply is not recorded: correlation exists so a *failure
+    // notification* can be answered, and an answer to an answer resolves to
+    // the same run through the message it quotes.
     send_message(
         bot_token,
         &chat_id.to_string(),
@@ -258,6 +270,7 @@ pub async fn reply(bot_token: &str, chat_id: i64, reply_to: Option<i64>, text: &
         reply_to,
     )
     .await
+    .map(|_| ())
 }
 
 // ---------------------------------------------------------------------
@@ -428,7 +441,8 @@ mod tests {
                 chat_id: 99,
                 message_id: 7,
                 text: "hello".into(),
-                reply_to_text: None
+                reply_to_text: None,
+                reply_to_message_id: None
             }]
         );
     }
@@ -456,7 +470,39 @@ mod tests {
         let raw = r#"{"ok":true,"result":[
             {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},"text":"oi"}}
         ]}"#;
-        assert!(extract(updates_json(raw))[0].reply_to_text.is_none());
+        let m = &extract(updates_json(raw))[0];
+        assert!(m.reply_to_text.is_none());
+        assert!(m.reply_to_message_id.is_none());
+    }
+
+    #[test]
+    fn a_reply_carries_the_id_it_answers() {
+        // The id is what resolves a notification back to the run that sent it.
+        // The text cannot: one event says "calendar-prep-1h/hourly-00 gave up"
+        // and another says only "preflight aborted by plugin preflight-warp",
+        // so parsing the wording would work for one and fail for the other.
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},
+             "text":"por que falhou?",
+             "reply_to_message":{"message_id":4821,"chat":{"id":2},
+              "text":"preflight aborted by plugin preflight-warp: warp-cli connect"}}}
+        ]}"#;
+        let m = &extract(updates_json(raw))[0];
+        assert_eq!(m.reply_to_message_id, Some(4821));
+    }
+
+    #[test]
+    fn a_reply_to_a_photo_still_carries_the_id() {
+        // No quotable text, but the id is what correlation needs, and the two
+        // are independent.
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},
+             "text":"e isso?",
+             "reply_to_message":{"message_id":8,"chat":{"id":2}}}}
+        ]}"#;
+        let m = &extract(updates_json(raw))[0];
+        assert!(m.reply_to_text.is_none());
+        assert_eq!(m.reply_to_message_id, Some(8));
     }
 
     #[test]

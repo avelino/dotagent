@@ -76,6 +76,30 @@ recall is substring rather than semantic.
 
 Turn them off with `[memory] enabled = false`.
 
+## Remediation tools
+
+One tool per `[[preflight]] remediation` declared in a manifest, named
+`remediate-<agent>-<plugin>`:
+
+| Tool | Arguments | Behavior |
+|---|---|---|
+| `remediate-<agent>-<plugin>` | — | Run the declared command, return its output. |
+
+The point is an alert you can answer. "preflight aborted by plugin
+preflight-warp: warp-cli connect" names the fix, and until now the fix was
+something you got up and typed.
+
+**It takes no arguments**, deliberately: the command is fixed by the manifest,
+so the model chooses *which* remediation, never *what* runs. And it is
+declared by the operator rather than taken from the plugin's `suggest` string
+— running a command a plugin wrote, triggered from a chat, is arbitrary
+execution over an inbound path. See [threat model
+V12](../security/threat-model.md#v12--remediation-from-a-chat-message).
+
+Supervised with a 120-second deadline, audited as `remediation_invoked` at
+`Critical`, and it does **not** re-run the agent: clearing the check and
+dispatching a run stay two decisions.
+
 ## Skill tools
 
 One tool per installed skill, plus two verbs that reach inside one:

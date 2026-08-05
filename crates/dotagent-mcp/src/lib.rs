@@ -297,6 +297,23 @@ pub fn command_list_input_schema() -> serde_json::Value {
     })
 }
 
+/// JSON Schema for `remediate-<agent>-<plugin>`: no arguments.
+///
+/// The command is fixed by the manifest. Taking arguments would be the model
+/// composing part of what runs, which is exactly what declaring it avoids.
+pub fn remediation_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    })
+}
+
+/// Turn an (agent, plugin) pair into a valid MCP tool name.
+pub fn remediation_tool_name_for(agent: &str, plugin: &str) -> String {
+    format!("remediate-{}-{}", sanitize(agent), sanitize(plugin))
+}
+
 /// Turn a skill name into a valid MCP tool name.
 ///
 /// Same sanitizer as [`tool_name_for`], different prefix — which is what keeps
@@ -387,6 +404,28 @@ mod tests {
         assert_eq!(
             skill_tool_name_for("dotagent:doc-review"),
             "skill-dotagent-doc-review"
+        );
+    }
+
+    #[test]
+    fn remediation_tool_names_carry_both_halves() {
+        assert_eq!(
+            remediation_tool_name_for("needs-vpn", "preflight-warp"),
+            "remediate-needs-vpn-preflight-warp"
+        );
+        // Two agents gated by the same plugin stay distinct.
+        assert_ne!(
+            remediation_tool_name_for("a", "preflight-warp"),
+            remediation_tool_name_for("b", "preflight-warp")
+        );
+    }
+
+    #[test]
+    fn a_remediation_can_never_collide_with_an_agent_or_skill() {
+        assert_ne!(remediation_tool_name_for("x", "y"), tool_name_for("x"));
+        assert_ne!(
+            remediation_tool_name_for("x", "y"),
+            skill_tool_name_for("x")
         );
     }
 

@@ -9,9 +9,11 @@
 pub mod audit;
 pub mod manifest_cache;
 pub mod paths;
+pub mod sent_messages;
 
 pub use audit::{AuditError, AuditLog, ChainBreak};
 pub use manifest_cache::{hash_manifest_file, KnownManifest, KnownManifests, ManifestCache};
+pub use sent_messages::{SentMessage, SentMessageStore, SentMessages};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;

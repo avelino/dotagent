@@ -184,6 +184,29 @@ pub struct PluginRef {
     /// `["given_up", "recovered"]`). Empty means "all events".
     #[serde(default)]
     pub events: Vec<String>,
+    /// What to run to clear this check, when it can be cleared by running
+    /// something.
+    ///
+    /// A preflight plugin already returns a `suggest` string, and the obvious
+    /// next step is to let an assistant run it. That step is the one not
+    /// taken: `suggest` is written by the plugin, and executing a string a
+    /// plugin chose, triggered by a chat message, is arbitrary execution from
+    /// an inbound path (V8 in the threat model).
+    ///
+    /// This is the operator saying it instead. Declared here, it becomes a
+    /// named entry in the MCP catalog — so a model *picks* it rather than
+    /// composing it, which is the same property `tools/list` gives agents.
+    ///
+    /// ```toml
+    /// [[preflight]]
+    /// plugin = "preflight-warp"
+    /// remediation = "warp-cli connect"
+    /// ```
+    ///
+    /// Split on whitespace into argv and executed directly. There is no shell,
+    /// so pipes, `&&` and globs are literal arguments rather than syntax.
+    #[serde(default)]
+    pub remediation: Option<String>,
     /// Optional per-hook deadline override (seconds). When set, the
     /// supervisor uses it instead of the global default for the plugin
     /// client's `invoke` verb. Useful for hooks that legitimately need

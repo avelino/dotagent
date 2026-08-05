@@ -39,7 +39,7 @@ impl Notifier for DesktopConfig {
         "desktop"
     }
 
-    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<()> {
+    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<Option<i64>> {
         // notify-rust is sync. Use spawn_blocking so we don't stall the
         // tokio runtime when the D-Bus call has to wait on the user's
         // session bus.
@@ -103,6 +103,7 @@ impl Notifier for DesktopConfig {
             agent = ctx.agent,
             "desktop notification sent"
         );
-        result
+        // A banner cannot be replied to, so there is nothing to correlate.
+        result.map(|_| None)
     }
 }

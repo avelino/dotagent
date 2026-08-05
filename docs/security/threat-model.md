@@ -263,6 +263,38 @@ skill body is. Write access to the commands directory is write access to what
 the assistant is told. `[commands] enabled = false` removes the menu and both
 tools.
 
+### V12 — Remediation from a chat message
+
+A `[[preflight]] remediation` ([`concepts/agents.md`](../concepts/agents.md))
+is a command an assistant can run, and the request to run it arrives over
+Telegram. That is V8's shape with a sharper edge: the point is to change the
+machine, not to read from it.
+
+The rejected design is worth naming, because it is the obvious one. A
+preflight plugin already returns `suggest` — the command that would clear the
+check — and letting an assistant run that string is one line of code. It is
+also arbitrary execution: the string is written by a plugin, and any plugin
+could then have anything run by asking an assistant nicely.
+
+**Mitigations:**
+- **Declared, not suggested.** The command comes from the operator's manifest.
+  `suggest` is never executable; it stays a message.
+- **The catalog is the boundary**, as with agents: `tools/list` publishes one
+  entry per declared remediation, a name that is not there is not callable,
+  and the tool takes no arguments — so the model chooses *which*, never *what*.
+- **argv, not a shell.** `remediation = "x && curl … | sh"` runs a program
+  named `x` with those literal arguments and fails. There is no shell to
+  interpret the operators.
+- **Supervised**, with a 120-second deadline and kill-tree on expiry.
+- **Audited** as `remediation_invoked` at `Critical`, recording the command as
+  declared. It is the one event where a chat message changed the machine.
+- **It does not re-run the agent.** Clearing the check and dispatching a run
+  stay two decisions.
+
+**Not mitigated:** an operator who declares a dangerous command has declared
+it. This moves the trust to the manifest, where V1 already puts it — someone
+who can write your `agent.toml` can already set `run.command`.
+
 ## Defenses shipped in v0 (with the daemon engine)
 
 | Defense | Status | Scope |

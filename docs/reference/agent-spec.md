@@ -68,6 +68,14 @@ args = []
 [[preflight]]
 plugin = "preflight-warp"
 config = { connect_command = "warp-cli connect" }
+# Optional: what clears this check. Declaring it publishes one MCP tool,
+# `remediate-<agent>-<plugin>`, so an assistant can offer to fix it instead
+# of only reporting it. Split on whitespace into argv — there is no shell.
+#
+# The plugin's own `suggest` string is never executable: a command a plugin
+# wrote, run from a chat message, is arbitrary execution. This is the
+# operator saying it, in a file under review. See threat model V12.
+# remediation = "warp-cli connect"
 # Optional per-hook deadline (seconds). Default: 30s for preflight,
 # 300s for on_success/on_failure invocations. The supervisor kills the
 # whole process group (TERM → 5s grace → KILL) when exceeded.

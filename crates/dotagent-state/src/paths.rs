@@ -106,6 +106,18 @@ pub fn memory_workspace_dir() -> PathBuf {
 /// Persisted so a daemon restart resumes instead of replaying the backlog —
 /// for a bot that runs agents, a replay would re-run whatever the last
 /// messages asked for.
+/// What each outbound Telegram notification was about, so a reply to one can
+/// be resolved back to the run that caused it.
+///
+/// Bounded to the most recent few hundred: a lookup table for notifications
+/// you might still answer, not a history of every alert ever sent.
+pub fn telegram_sent_file() -> PathBuf {
+    state_dir()
+        .join("notify")
+        .join("telegram")
+        .join("sent.json")
+}
+
 pub fn telegram_offset_file() -> PathBuf {
     state_dir()
         .join("notify")

@@ -44,7 +44,7 @@ impl Notifier for ImessageConfig {
         "imessage"
     }
 
-    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<()> {
+    async fn send(&self, ctx: &NotifyContext<'_>) -> Result<Option<i64>> {
         if !cfg!(target_os = "macos") {
             return Err(NotifyError::UnsupportedPlatform { driver: "imessage" });
         }
@@ -114,7 +114,8 @@ impl Notifier for ImessageConfig {
             }
         }
 
-        Ok(())
+        // iMessage has no id we could correlate a reply against.
+        Ok(None)
     }
 }
 

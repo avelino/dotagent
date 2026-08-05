@@ -81,8 +81,32 @@ pub async fn fire_notifiers(
             }
         };
         let outcome = driver_box.send(&ctx).await;
+
+        // Remember what this notification was about, when the transport gave
+        // it an id. A failure alert is the message someone replies to, and
+        // without this the reply arrives as prose that has to be parsed to
+        // guess the agent — the text format is not even consistent across
+        // events, so that guess would be wrong sooner or later.
+        //
+        // Best-effort by design: correlation is a convenience on top of a
+        // notification that was already delivered.
+        if let Ok(Some(message_id)) = &outcome {
+            let store = dotagent_state::SentMessageStore::from_home();
+            if let Err(e) = store.record(
+                *message_id,
+                dotagent_state::SentMessage {
+                    agent: ctx.agent.to_string(),
+                    schedule: ctx.schedule.to_string(),
+                    event: ctx.event.to_string(),
+                    at: chrono::Local::now().timestamp(),
+                },
+            ) {
+                warn!(driver, error = %e, "could not record notification for reply correlation");
+            }
+        }
+
         let (ok, skipped) = match &outcome {
-            Ok(()) => (true, false),
+            Ok(_) => (true, false),
             Err(NotifyError::Skipped { reason }) => {
                 debug!(driver, reason = %reason, "notifier skipped (rate-limit / dedup)");
                 (true, true)

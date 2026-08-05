@@ -573,6 +573,19 @@ fn screen(
             // What the sender was replying to, when they used Telegram's
             // reply. "sim" means nothing without it.
             "reply_to_text": msg.reply_to_text,
+            // When that message was a notification dotagent sent, this is the
+            // run it came from. Resolved from the id rather than the text:
+            // the wording differs per event (one carries `agent/schedule`,
+            // another does not) and two agents can fail the same way, so
+            // parsing prose would guess wrong eventually.
+            "reply_to_run": msg
+                .reply_to_message_id
+                .and_then(|id| dotagent_state::SentMessageStore::from_home().resolve(id))
+                .map(|s| serde_json::json!({
+                    "agent": s.agent,
+                    "schedule": s.schedule,
+                    "event": s.event,
+                })),
             // Present only when the sender invoked one. The dispatcher passes
             // both fields straight to `command-get`; it does not have to parse
             // the text or guess whether a leading slash meant anything.
@@ -1501,6 +1514,7 @@ mod tests {
             message_id: 55,
             text: "how's disk?".into(),
             reply_to_text: None,
+            reply_to_message_id: None,
         }
     }
 

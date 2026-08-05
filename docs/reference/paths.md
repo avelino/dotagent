@@ -341,6 +341,28 @@ state/telegram-assistant/
 An agent that keeps state here should declare the path in `[security]
 filesystem_writable`, so `doctor` can audit what it writes.
 
+### `state/notify/telegram/sent.json`
+
+What each outbound notification was about, so a reply to one resolves to the
+run that caused it.
+
+```jsonc
+{
+  "entries": {
+    "4821": {
+      "agent": "calendar-prep-1h",
+      "schedule": "hourly-00",
+      "event": "given_up",
+      "at": 1785925367
+    }
+  }
+}
+```
+
+Capped at the most recent 500, oldest dropped first. It is a lookup table for
+alerts you might still answer, not a history — and losing it costs correlation
+on old messages, never delivery.
+
 ### `state/notify/telegram/offset.json`
 
 Last acknowledged Telegram `update_id`, written tmp-then-rename.
@@ -478,6 +500,10 @@ Audit events emitted by dotagent:
 | `trigger_received`        | Inbound message accepted; records `actor` and `reply_to`, never the text    | notice        |
 | `trigger_rejected`        | Inbound message refused (allowlist, rate limit) before anything ran         | critical      |
 | `agent_triggered`         | A run started from a trigger rather than a schedule window                  | notice        |
+| `command_dispatched`      | A `/name` invocation was resolved; records the name and whether it was known, never the arguments | notice |
+| `skill_invoked`           | A `scripts/` executable inside a skill ran — code outside any manifest, which `agent_run` would not record | notice |
+| `skill_invalid`           | A `SKILL.md` exists but failed to parse; that procedure is missing from the catalog, the rest keep working | notice |
+| `remediation_invoked`     | A declared `[[preflight]] remediation` ran. The one event where a chat message changed the machine | critical |
 
 `Critical` severity drives out-of-band notifier dispatch. Defined in
 [`crates/dotagent-core/src/audit.rs`](../../crates/dotagent-core/src/audit.rs).
