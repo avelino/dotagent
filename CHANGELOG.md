@@ -9,6 +9,8 @@ schema and the plugin protocol are flagged in each entry.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-04
+
 ### Added
 
 - **Commands** — procedures *you* pick, published as a Telegram menu. A command
@@ -49,13 +51,6 @@ schema and the plugin protocol are flagged in each entry.
   Writing your own `help.md` replaces the built-in.
 
 [cc-slash]: https://docs.claude.com/en/docs/claude-code/slash-commands
-
-### Fixed
-
-- `tools/call` parsed the agent argument schema before dispatching, so a tool
-  whose `args` is not a list — `command-get`, whose `args` is the string the
-  sender typed — was rejected with the *agent* schema's error before its handler
-  ran. The typed parse now happens once the tool is known to be an agent.
 
 - **Skills** — procedures an assistant loads when they apply. A skill is a
   directory with a `SKILL.md` (frontmatter + markdown), and `dotagent mcp`
@@ -113,6 +108,13 @@ schema and the plugin protocol are flagged in each entry.
   and `rustls` now carries the trust anchors; keeping the old feature name
   pinned the lock and silently blocked every patch release. Verified with a
   real TLS handshake against `api.telegram.org` before and after.
+
+### Fixed
+
+- `tools/call` parsed the agent argument schema before dispatching, so a tool
+  whose `args` is not a list — `command-get`, whose `args` is the string the
+  sender typed — was rejected with the *agent* schema's error before its handler
+  ran. The typed parse now happens once the tool is known to be an agent.
 
 ## [0.2.0] - 2026-08-04
 
@@ -270,6 +272,8 @@ break only code that depends on the crates as libraries:
 - CLI run-now output pretty-prints the outcome instead of dumping
   `Debug` and tightens the renderer test suite.
 
+[0.2.1]: https://github.com/avelino/dotagent/releases/tag/v0.2.1
+[0.2.0]: https://github.com/avelino/dotagent/releases/tag/v0.2.0
 [0.1.4]: https://github.com/avelino/dotagent/releases/tag/v0.1.4
 [0.1.3]: https://github.com/avelino/dotagent/releases/tag/v0.1.3
 [0.1.2]: https://github.com/avelino/dotagent/releases/tag/v0.1.2

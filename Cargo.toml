@@ -23,7 +23,7 @@ members = [
 default-members = ["crates/dotagent"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Avelino <avelinorun@gmail.com>"]
@@ -34,18 +34,18 @@ readme = "README.md"
 
 [workspace.dependencies]
 # Internal crates
-dotagent-core = { path = "crates/dotagent-core", version = "0.2.0" }
-dotagent-scheduler = { path = "crates/dotagent-scheduler", version = "0.2.0" }
-dotagent-runner = { path = "crates/dotagent-runner", version = "0.2.0" }
-dotagent-state = { path = "crates/dotagent-state", version = "0.2.0" }
-dotagent-plugin = { path = "crates/dotagent-plugin", version = "0.2.0" }
-dotagent-mcp = { path = "crates/dotagent-mcp", version = "0.2.0" }
-dotagent-memory = { path = "crates/dotagent-memory", version = "0.2.0" }
-dotagent-notify = { path = "crates/dotagent-notify", version = "0.2.0" }
-dotagent-secrets = { path = "crates/dotagent-secrets", version = "0.2.0" }
-dotagent-supervisor = { path = "crates/dotagent-supervisor", version = "0.2.0" }
-dotagent-telemetry = { path = "crates/dotagent-telemetry", version = "0.2.0" }
-dotagent-unit-gen = { path = "crates/dotagent-unit-gen", version = "0.2.0" }
+dotagent-core = { path = "crates/dotagent-core", version = "0.2.1" }
+dotagent-scheduler = { path = "crates/dotagent-scheduler", version = "0.2.1" }
+dotagent-runner = { path = "crates/dotagent-runner", version = "0.2.1" }
+dotagent-state = { path = "crates/dotagent-state", version = "0.2.1" }
+dotagent-plugin = { path = "crates/dotagent-plugin", version = "0.2.1" }
+dotagent-mcp = { path = "crates/dotagent-mcp", version = "0.2.1" }
+dotagent-memory = { path = "crates/dotagent-memory", version = "0.2.1" }
+dotagent-notify = { path = "crates/dotagent-notify", version = "0.2.1" }
+dotagent-secrets = { path = "crates/dotagent-secrets", version = "0.2.1" }
+dotagent-supervisor = { path = "crates/dotagent-supervisor", version = "0.2.1" }
+dotagent-telemetry = { path = "crates/dotagent-telemetry", version = "0.2.1" }
+dotagent-unit-gen = { path = "crates/dotagent-unit-gen", version = "0.2.1" }
 
 # Async runtime
 tokio = { version = "1", features = [
