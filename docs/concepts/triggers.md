@@ -39,6 +39,8 @@ That is a correctness requirement, not a performance choice. Two concurrent runs
 
 The practical consequence: a long agent delays the next trigger. A ten-minute run means a message arriving at minute two waits. If that matters for your setup, keep the dispatcher fast and let it hand slow work to something else.
 
+`[lifecycle] mode = "persistent"` does not change this. It removes the startup cost of each run, not the queue.
+
 ## What the agent receives
 
 Trigger context arrives as environment variables, alongside the usual `AGENT_*` block:
@@ -53,6 +55,8 @@ Trigger context arrives as environment variables, alongside the usual `AGENT_*` 
 `AGENT_TRIGGER_PAYLOAD` carries the message text, plus a `command` object when the sender invoked one — see [Commands](commands.md#the-payload). It rides in the environment rather than argv on purpose: a body that reached argv would be one quoting bug away from a shell problem, and every current producer is bounded well under `ARG_MAX` (a Telegram message caps at 4096 characters). A source with unbounded payloads should write a file into `AGENT_TMPDIR` rather than grow this variable.
 
 These variables are applied *before* the `AGENT_*` block, so a payload can never redefine `AGENT_NAME` or `AGENT_HEARTBEAT_FILE`.
+
+A [persistent](lifecycle.md) agent gets none of them. An environment is fixed at spawn and that process answers many different messages, so the same context arrives in the `trigger` field of each request frame instead — see [the persistent protocol](../reference/persistent-protocol.md).
 
 An agent with no `[[schedules]]` at all is legal and gets the synthetic schedule id `trigger`. That is the natural shape for an agent that only ever runs because someone asked.
 
@@ -73,6 +77,7 @@ A trigger can originate from outside the machine. The full posture is in the [th
 
 ## See also
 
+- [Lifecycle](lifecycle.md) — keeping a dispatcher alive between messages
 - [Telegram](telegram.md) — the inbound chat source
 - [MCP server](../reference/mcp.md) — agents as tools
 - [`examples/telegram-assistant`](https://github.com/avelino/dotagent/tree/main/examples/telegram-assistant) — the whole loop end to end

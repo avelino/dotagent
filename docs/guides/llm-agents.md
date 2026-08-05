@@ -324,10 +324,15 @@ one process reading turns from stdin, so the session never leaves memory:
 | fork per message | 3.91s | 4.94s |
 | one persistent process | 3.46s | **1.90s** |
 
-Every message after the first is a second message. The catch is that dotagent
-spawns an agent per event by design, so holding a process alive means running
-something the supervisor does not manage — deadlines, reaping and crash
-recovery become yours. Worth it for a chat, not worth it for a cron job.
+Every message after the first is a second message. Holding a process alive used
+to mean running something the supervisor did not manage — deadlines, reaping
+and crash recovery became yours. It no longer does: declare `[lifecycle] mode =
+"persistent"` and dotagent keeps the process alive, delivers requests over
+[JSON lines](../reference/persistent-protocol.md), and supervises it like every
+other subprocess. Set `key = "chat_id"` so each conversation gets its own.
+
+Still worth it for a chat and not for a cron job. A process that lives is a
+process that can leak and drift, and a scheduled agent has nothing to gain.
 
 ### Tools you publish but never call
 

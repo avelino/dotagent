@@ -1,0 +1,48 @@
+# Example: an agent that stays alive between runs.
+#
+# A one-shot agent is spawned, answers, and dies. This one is spawned once and
+# answers many times — which is what you want when the answer depends on state
+# the process is holding (a conversation, a warm cache, an open connection).
+#
+# Try it:
+#   DOTAGENT_ROOT=$PWD/examples dotagent run hello-persistent --schedule manual
+#
+# That runs it through a pool that lives exactly as long as the command, so you
+# see the real protocol rather than a fiction. Inside the daemon, the same
+# process would answer the next request too — see docs/concepts/lifecycle.md.
+
+[agent]
+name = "hello-persistent"
+description = "Minimal persistent agent — counts how many requests it has answered."
+monitor = false
+# In persistent mode this is the deadline for ONE request, not the lifetime of
+# the process. A request that exceeds it recycles the instance.
+timeout_seconds = 30
+
+[run]
+command = "bash"
+args = ["./agent.sh"]
+
+[lifecycle]
+mode = "persistent"
+# One process per conversation. Without this, every sender shares one process
+# — and the counter below would prove it, mixing everyone's messages into one
+# tally. Reads `chat_id` out of AGENT_TRIGGER_PAYLOAD.
+key = "chat_id"
+# Small on purpose so the example is easy to poke at.
+idle_timeout_seconds = 120
+max_invocations = 10
+max_instances = 4
+startup_timeout_seconds = 10
+
+# No [[schedules]] would be legal — this agent exists to answer requests. One
+# is declared so `dotagent run` has something to name.
+[[schedules]]
+id = "manual"
+type = "interval"
+interval_minutes = 10080
+args = []
+
+[security]
+allowed_commands = ["bash"]
+network = "deny"

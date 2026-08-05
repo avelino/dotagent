@@ -295,6 +295,40 @@ could then have anything run by asking an assistant nicely.
 it. This moves the trust to the manifest, where V1 already puts it — someone
 who can write your `agent.toml` can already set `run.command`.
 
+### V13 — State carried between senders by a persistent agent
+
+`[lifecycle] mode = "persistent"` ([`concepts/lifecycle.md`](../concepts/lifecycle.md))
+keeps an agent process alive between runs. That process holds whatever it
+holds — a conversation, a cached credential, a decision someone authorized —
+and every later request lands in the same memory.
+
+The failure is not a bug in the pool. It is a manifest that declares
+`mode = "persistent"` without a `key` on an agent that serves more than one
+person: every conversation shares one process, so what one sender said is
+context for the next one's answer. Nothing about it looks wrong until two
+people use the bot, which is exactly the shape of a leak that ships.
+
+**Mitigations:**
+- **`key` shards by an attested field.** `key = "chat_id"` gives one process
+  per conversation. The value is a *selector over the payload the daemon
+  already attested* — the sender names nothing.
+- **The key never reaches a label raw.** It is reduced to `[A-Za-z0-9_-]`, and
+  anything else — path separators, whitespace, 4 KB of chat text — becomes a
+  stable digest instead. Two distinct values never collapse to one process, so
+  sanitizing cannot merge two conversations.
+- **`doctor` warns** when the Telegram `dispatcher_agent` is persistent with no
+  key, because that is the configuration where this actually bites.
+- **`max_invocations` bounds how long any one process accumulates**, and
+  `max_instances` bounds how many exist. Both default to finite values.
+- **Recycling is audited** as `persistent_agent_recycled` with the reason, so
+  "why did it forget" has an answer.
+- **One pool, inside the daemon.** There is no second instance to race it,
+  which is what an external pool needs `flock` for.
+
+**Not mitigated:** an agent that writes its own state to disk, keyed however it
+likes. dotagent isolates the *process*, not the filesystem — `[security]
+filesystem_writable` is still schema-only (V-deferred, below).
+
 ## Defenses shipped in v0 (with the daemon engine)
 
 | Defense | Status | Scope |

@@ -7,6 +7,8 @@
 
 pub mod hooks;
 pub mod notifiers;
+pub mod persistent;
+pub mod protocol;
 
 use std::path::Path;
 use std::process::Stdio;
@@ -110,6 +112,14 @@ pub struct RunContext<'a> {
     /// daemon should always pass its singleton so `status`/`doctor` can see
     /// the live agent.
     pub supervisor: Option<&'a Supervisor>,
+    /// Pool of live processes for agents declaring `[lifecycle] mode =
+    /// "persistent"`.
+    ///
+    /// `None` means "run it one-shot regardless" — which is what every caller
+    /// outside a long-lived process should pass. A pool held for the duration
+    /// of a single CLI invocation would spawn a process, ask it one question
+    /// and kill it, paying the startup cost the mode exists to avoid.
+    pub persistent: Option<&'a persistent::PersistentPool>,
 }
 
 /// Outcome variants produced by `run_with_hooks`.
@@ -173,8 +183,16 @@ pub async fn run_with_hooks(
         }
     }
 
-    // 2) Spawn (consumes `spec`, but we kept the refs we still need)
-    let outcome = run(spec, ctx.state, ctx.supervisor).await?;
+    // 2) Run it. A persistent agent is handed to the pool, which delivers the
+    //    request to a process that is already up; everything else spawns.
+    //    `dry_run` always takes the one-shot path — a dry run must not leave a
+    //    live process behind, and there is nothing to deliver anyway.
+    let outcome = match ctx.persistent {
+        Some(pool) if manifest_ref.lifecycle.is_persistent() && !spec.dry_run => {
+            pool.dispatch(&spec, ctx.state, ctx.audit).await?
+        }
+        _ => run(spec, ctx.state, ctx.supervisor).await?,
+    };
 
     // 3) Audit
     if let Some(log) = ctx.audit {
@@ -259,21 +277,7 @@ pub async fn run(
     let heartbeat_path = state.heartbeat_path(&name, &slug);
 
     if !spec.dry_run {
-        let prev = state.read_heartbeat(&name, &slug)?;
-        let hb = Heartbeat {
-            name: name.clone(),
-            slug: slug.clone(),
-            args: spec.args.to_vec(),
-            started_at: start.timestamp(),
-            started_at_iso: start.format("%Y-%m-%dT%H:%M:%S%z").to_string(),
-            finished_at: None,
-            finished_at_iso: None,
-            exit_code: None,
-            duration_seconds: None,
-            last_success_at: prev.as_ref().and_then(|p| p.last_success_at),
-            last_success_at_iso: prev.as_ref().and_then(|p| p.last_success_at_iso.clone()),
-        };
-        state.write_heartbeat(&hb)?;
+        begin_heartbeat(state, &name, &slug, spec.args, &start)?;
     }
 
     // Tmpdir (auto-cleanup when this scope ends)
@@ -403,49 +407,7 @@ pub async fn run(
     });
 
     if !spec.dry_run {
-        // The start heartbeat was written above, but it is a file on disk and
-        // another process (`run-now`, `dotagent mcp`, an operator with `rm`)
-        // can remove it while the agent runs. Reconstructing beats panicking:
-        // the run already happened, and losing its record to an `expect` would
-        // turn a cosmetic problem into a dead daemon.
-        let mut hb = match state.read_heartbeat(&name, &slug) {
-            Ok(Some(hb)) => hb,
-            Ok(None) => {
-                warn!(
-                    agent = %name,
-                    slug = %slug,
-                    "heartbeat vanished mid-run — rebuilding from this run"
-                );
-                Heartbeat {
-                    name: name.clone(),
-                    slug: slug.clone(),
-                    args: spec.args.to_vec(),
-                    started_at: start.timestamp(),
-                    started_at_iso: start.format("%Y-%m-%dT%H:%M:%S%z").to_string(),
-                    finished_at: None,
-                    finished_at_iso: None,
-                    exit_code: None,
-                    duration_seconds: None,
-                    // Unknown, and guessing would be worse: claiming a success
-                    // that never happened makes the scheduler skip a window.
-                    last_success_at: None,
-                    last_success_at_iso: None,
-                }
-            }
-            Err(e) => {
-                warn!(agent = %name, slug = %slug, error = %e, "heartbeat unreadable mid-run");
-                return Err(e.into());
-            }
-        };
-        hb.finished_at = Some(finish.timestamp());
-        hb.finished_at_iso = Some(finish.format("%Y-%m-%dT%H:%M:%S%z").to_string());
-        hb.exit_code = Some(exit_code);
-        hb.duration_seconds = Some(duration);
-        if exit_code == 0 {
-            hb.last_success_at = Some(finish.timestamp());
-            hb.last_success_at_iso = Some(finish.format("%Y-%m-%dT%H:%M:%S%z").to_string());
-        }
-        state.write_heartbeat(&hb)?;
+        finish_heartbeat(state, &name, &slug, spec.args, &start, &finish, exit_code)?;
     }
 
     let (stdout_tail, stdout_truncated_lines) = tail_lines(&stdout_buf, TAIL_LINES);
@@ -461,6 +423,92 @@ pub async fn run(
     })
 }
 
+/// Write the "this run started" heartbeat.
+///
+/// Shared with the persistent pool, which writes one per *request* rather
+/// than one per process — same file, same shape, so `status`, health states
+/// and retry accounting cannot tell the two execution modes apart.
+pub(crate) fn begin_heartbeat(
+    state: &StateStore,
+    name: &str,
+    slug: &str,
+    args: &[String],
+    start: &chrono::DateTime<Local>,
+) -> Result<()> {
+    let prev = state.read_heartbeat(name, slug)?;
+    let hb = Heartbeat {
+        name: name.to_string(),
+        slug: slug.to_string(),
+        args: args.to_vec(),
+        started_at: start.timestamp(),
+        started_at_iso: start.format("%Y-%m-%dT%H:%M:%S%z").to_string(),
+        finished_at: None,
+        finished_at_iso: None,
+        exit_code: None,
+        duration_seconds: None,
+        last_success_at: prev.as_ref().and_then(|p| p.last_success_at),
+        last_success_at_iso: prev.as_ref().and_then(|p| p.last_success_at_iso.clone()),
+    };
+    state.write_heartbeat(&hb)?;
+    Ok(())
+}
+
+/// Close out the heartbeat for a finished run.
+pub(crate) fn finish_heartbeat(
+    state: &StateStore,
+    name: &str,
+    slug: &str,
+    args: &[String],
+    start: &chrono::DateTime<Local>,
+    finish: &chrono::DateTime<Local>,
+    exit_code: i32,
+) -> Result<()> {
+    // The start heartbeat was written above, but it is a file on disk and
+    // another process (`run-now`, `dotagent mcp`, an operator with `rm`)
+    // can remove it while the agent runs. Reconstructing beats panicking:
+    // the run already happened, and losing its record to an `expect` would
+    // turn a cosmetic problem into a dead daemon.
+    let mut hb = match state.read_heartbeat(name, slug) {
+        Ok(Some(hb)) => hb,
+        Ok(None) => {
+            warn!(
+                agent = %name,
+                slug = %slug,
+                "heartbeat vanished mid-run — rebuilding from this run"
+            );
+            Heartbeat {
+                name: name.to_string(),
+                slug: slug.to_string(),
+                args: args.to_vec(),
+                started_at: start.timestamp(),
+                started_at_iso: start.format("%Y-%m-%dT%H:%M:%S%z").to_string(),
+                finished_at: None,
+                finished_at_iso: None,
+                exit_code: None,
+                duration_seconds: None,
+                // Unknown, and guessing would be worse: claiming a success
+                // that never happened makes the scheduler skip a window.
+                last_success_at: None,
+                last_success_at_iso: None,
+            }
+        }
+        Err(e) => {
+            warn!(agent = %name, slug = %slug, error = %e, "heartbeat unreadable mid-run");
+            return Err(e.into());
+        }
+    };
+    hb.finished_at = Some(finish.timestamp());
+    hb.finished_at_iso = Some(finish.format("%Y-%m-%dT%H:%M:%S%z").to_string());
+    hb.exit_code = Some(exit_code);
+    hb.duration_seconds = Some((*finish - *start).num_seconds());
+    if exit_code == 0 {
+        hb.last_success_at = Some(finish.timestamp());
+        hb.last_success_at_iso = Some(finish.format("%Y-%m-%dT%H:%M:%S%z").to_string());
+    }
+    state.write_heartbeat(&hb)?;
+    Ok(())
+}
+
 fn apply_env(
     cmd: &mut Command,
     spec: &RunSpec<'_>,
@@ -469,6 +517,28 @@ fn apply_env(
     start: &chrono::DateTime<Local>,
     tmpdir: &Path,
     heartbeat: &Path,
+) {
+    apply_env_for(cmd, spec, name, slug, start, tmpdir, heartbeat, None)
+}
+
+/// `apply_env`, plus the two things that only make sense for an instance that
+/// outlives a single request.
+///
+/// `persist_key` present means: this process is persistent. The
+/// `AGENT_TRIGGER_*` block is dropped, because it describes one message and
+/// this process will see many — a stale payload frozen at spawn reads as
+/// perfectly valid and is the worst possible failure mode. Trigger context
+/// travels in the request frame instead.
+#[allow(clippy::too_many_arguments)]
+fn apply_env_for(
+    cmd: &mut Command,
+    spec: &RunSpec<'_>,
+    name: &str,
+    slug: &str,
+    start: &chrono::DateTime<Local>,
+    tmpdir: &Path,
+    heartbeat: &Path,
+    persist_key: Option<&str>,
 ) {
     if let Some(env_cfg) = &spec.manifest.env {
         if !env_cfg.inherit {
@@ -481,7 +551,14 @@ fn apply_env(
     // Per-invocation env goes before the AGENT_* block on purpose: a trigger
     // payload must never be able to redefine AGENT_NAME or AGENT_HEARTBEAT_FILE.
     for (k, v) in spec.extra_env {
+        if persist_key.is_some() && protocol::is_trigger_env(k) {
+            continue;
+        }
         cmd.env(k, v);
+    }
+    if let Some(key) = persist_key {
+        cmd.env("AGENT_LIFECYCLE", "persistent");
+        cmd.env("AGENT_PERSIST_KEY", key);
     }
     cmd.env("AGENT_NAME", name);
     cmd.env("AGENT_HOME", spec.manifest_dir);

@@ -221,6 +221,33 @@ pub enum AuditEvent {
         actor: Option<String>,
         known: bool,
     },
+    /// A persistent agent instance was spawned and answered the handshake.
+    ///
+    /// One `AgentRun` per message still gets written; this records the thing
+    /// that outlives them — which process is holding state for which key, and
+    /// since when.
+    PersistentAgentStarted {
+        agent: String,
+        /// The `[lifecycle] key` value this instance answers for, or
+        /// `"default"` when the agent declared no key.
+        key: String,
+        pid: u32,
+    },
+    /// A persistent agent instance went away.
+    ///
+    /// `reason` is why, and it is the whole point of the event: an instance
+    /// that died because a conversation grew past `max_invocations` is normal
+    /// housekeeping, and one that died because it crashed is a bug somebody
+    /// should see.
+    PersistentAgentRecycled {
+        agent: String,
+        key: String,
+        /// `idle` | `max_invocations` | `crashed` | `timeout` | `evicted`
+        /// | `shutdown` | `config_changed`
+        reason: String,
+        /// How many requests it answered before going away.
+        invocations: u32,
+    },
 }
 
 impl AuditEvent {
@@ -248,7 +275,18 @@ impl AuditEvent {
             // The signal is repetition, which a query over `known: false`
             // finds without the severity being wrong the rest of the time.
             | AuditEvent::CommandDispatched { .. }
+            | AuditEvent::PersistentAgentStarted { .. }
             | AuditEvent::PluginInvoked { ok: false, .. } => Severity::Notice,
+
+            // Recycling is routine except when it isn't. `crashed` and
+            // `timeout` mean the process failed to hold up its end; the rest
+            // are the pool doing exactly what the manifest asked for.
+            AuditEvent::PersistentAgentRecycled { reason, .. } => {
+                match reason.as_str() {
+                    "crashed" | "timeout" => Severity::Critical,
+                    _ => Severity::Notice,
+                }
+            }
 
             AuditEvent::AgentRun { .. } /* non-zero exit */
             | AuditEvent::AgentGivenUp { .. }

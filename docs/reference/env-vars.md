@@ -27,7 +27,9 @@ SDK to import.
 | `AGENT_START_EPOCH`    | int      | `1700000000`                                       | Always — unix epoch of `started_at`. |
 | `AGENT_ARGV`           | JSON array | `["--period","dia-anterior"]`                    | Always — the schedule's `args` as JSON. |
 | `AGENT_HEARTBEAT_FILE` | abs path | `~/.config/dotagent/state/agents/.../slug.heartbeat.json` | Set when NOT dry-run.        |
-| `AGENT_TRIGGER_SOURCE` | string   | `telegram`                                         | Only on [triggered](../concepts/triggers.md) runs. One of `telegram`, `mcp`, `cli`. |
+| `AGENT_LIFECYCLE`      | string   | `persistent`                                       | Only when `[lifecycle] mode = "persistent"`. Absent otherwise, so one script can support both shapes. |
+| `AGENT_PERSIST_KEY`    | string   | `12345`                                            | Persistent runs only — which slice this instance answers for (the resolved `[lifecycle] key`, or `default`). |
+| `AGENT_TRIGGER_SOURCE` | string   | `telegram`                                         | Only on [triggered](../concepts/triggers.md) runs. One of `telegram`, `mcp`, `cli`. **Never set in persistent mode** — see below. |
 | `AGENT_TRIGGER_ACTOR`  | string   | `123456789`                                        | Triggered runs, when the source can attest an identity. Telegram: numeric user id. |
 | `AGENT_TRIGGER_REPLY_TO` | string | `123456789`                                        | Triggered runs, when the source can be answered. Telegram: chat id. |
 | `AGENT_TRIGGER_PAYLOAD` | JSON object | `{"text":"/standup x","chat_id":1,"user_id":2,"command":{"name":"standup","args":"x"}}` | Triggered runs. Body travels here, never in argv. `command` is present only when the sender invoked one — see [Commands](../concepts/commands.md#the-payload). `reply_to_run` is present when the sender replied to a notification dotagent sent — see below. |
@@ -55,6 +57,26 @@ a stable interface — one event names `agent/schedule` and another says only
 identically. Absent when the reply is to something else, or when the
 notification is older than the few hundred kept in
 `state/notify/telegram/sent.json`.
+
+#### Persistent agents get no `AGENT_TRIGGER_*`
+
+An environment is fixed at spawn. A persistent process is spawned once and
+answers many different messages, so those four variables would freeze the first
+one and keep serving it — and stale trigger context reads as perfectly valid,
+which is worse than absent.
+
+In `[lifecycle] mode = "persistent"` the same information arrives in the
+`trigger` field of each request frame:
+
+```jsonc
+{ "kind": "request", "id": "1", "deadline_seconds": 600,
+  "trigger": { "source": "telegram", "actor": "123", "reply_to": "123",
+               "payload": { "text": "…", "chat_id": 12345 } } }
+```
+
+`AGENT_TMPDIR` also changes lifetime: it belongs to the instance rather than to
+one request, so it survives between them and is removed when the instance is
+recycled. See [the persistent protocol](persistent-protocol.md).
 
 The positional `argv` of your process is `[run].command` + `[run].args`
 + schedule's `args`, so most scripts don't actually need `AGENT_ARGV`

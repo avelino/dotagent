@@ -47,6 +47,10 @@ Three things to internalize:
    every agent and sleeps until that exact moment.
 3. **Your agent is a one-shot subprocess.** It reads env vars, does its
    thing, writes stdout, exits. No SDK, no IPC, no long-running state.
+   The one exception is opt-in: an agent declaring `[lifecycle] mode =
+   "persistent"` is kept alive between runs and handed requests over JSON
+   lines. Same supervisor, same deadline, same reaping — see
+   [`lifecycle.md`](lifecycle.md).
 
 Everything else in this doc is detail.
 
@@ -92,7 +96,7 @@ close the loop.
 |-----------------------|-------------------------------------------------------------------------------------------------|
 | `dotagent-core`       | Shared types: `AgentManifest`, `Schedule`, `Heartbeat`, `WindowState`, `Config`, `AuditEvent`, `TriggerRequest`. |
 | `dotagent-scheduler`  | **Pure** scheduling math. `compute_next_event`, `expected_at`, `should_retry`, `health_state`. No IO. |
-| `dotagent-runner`     | Spawn the agent subprocess. Timeout, env injection, stdio capture, heartbeat lifecycle, hook firing. |
+| `dotagent-runner`     | Spawn the agent subprocess. Timeout, env injection, stdio capture, heartbeat lifecycle, hook firing. Also the pool of live processes for `[lifecycle] mode = "persistent"` agents. |
 | `dotagent-state`      | Filesystem state: heartbeats, window state, audit log, plugin state, manifest cache.            |
 | `dotagent-notify`     | Built-in notifier drivers (`desktop`, `slack`, `ntfy`, `pushover`, `telegram`, `imessage`) **and** inbound Telegram transport. |
 | `dotagent-secrets`    | Loader for `secrets.env`. Separate crate to keep `core → notify` acyclic.                       |
@@ -215,6 +219,7 @@ flowchart LR
 | Failure                       | Containment                                                                                            |
 |-------------------------------|--------------------------------------------------------------------------------------------------------|
 | Agent script panics / segfaults | Subprocess dies. `exit_code` captured. Daemon writes the heartbeat and moves on. Retry policy kicks in. |
+| Persistent instance dies          | The next request finds the dead pipe, discards the instance and spawns a replacement. A death in the window between setting the deadline and writing the request costs one retry, not the message. |
 | Agent hangs                     | `agent.timeout_seconds` triggers SIGTERM, then SIGKILL after 5s. `exit_code = 124`.                    |
 | Plugin panics                   | Subprocess dies. dotagent records `PluginInvoked { ok: false }` and continues. No retry of the plugin. |
 | Notifier driver fails (e.g., Slack 503) | The notifier call returns `Err` but the **run already happened**. Audit records the failure. The run is still considered successful. |
@@ -299,6 +304,7 @@ Two important properties:
 - [`agents.md`](agents.md) — what an agent looks like from the author's side
 - [`plugins.md`](plugins.md) — how the plugin protocol works
 - [`notifications.md`](notifications.md) — why notifiers are NOT plugins
+- [`lifecycle.md`](lifecycle.md) — agents kept alive between runs
 - [`triggers.md`](triggers.md) — runs caused by an event, not the clock
 - [`telegram.md`](telegram.md) — inbound chat
 - [`../reference/mcp.md`](../reference/mcp.md) — agents as MCP tools

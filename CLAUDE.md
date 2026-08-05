@@ -33,6 +33,10 @@ proxy MCP, não é AI. É um scheduler + supervisor.
 - [`docs/reference/agent-spec.md`](docs/reference/agent-spec.md) — schema formal de `agent.toml`
 - [`docs/reference/plugin-protocol.md`](docs/reference/plugin-protocol.md) — protocolo formal de
   subprocess + JSON stdio
+- [`docs/concepts/lifecycle.md`](docs/concepts/lifecycle.md) — `oneshot` vs `persistent`, e por que
+  o idle timeout é o relógio do reaper reapontado
+- [`docs/reference/persistent-protocol.md`](docs/reference/persistent-protocol.md) — JSON lines do
+  agent que não morre
 - [`docs/security/threat-model.md`](docs/security/threat-model.md) — modelo de ameaças
 - [`docs/guides/migrating-from-fish.md`](docs/guides/migrating-from-fish.md) — guia de
   migração da Fish framework
@@ -49,7 +53,7 @@ crates/                  # orchestrator (workspace de crates)
   dotagent/              # CLI binary — entry point
   dotagent-core/         # types: Manifest, Schedule, Heartbeat, WindowState, Config
   dotagent-scheduler/    # funções PURAS — sem IO, sem clock, totalmente testável
-  dotagent-runner/       # spawn + timeout + heartbeat lifecycle + env injection
+  dotagent-runner/       # spawn + timeout + heartbeat lifecycle + env injection + pool de agents persistentes
   dotagent-state/        # filesystem state (atomic write + flock) + paths
   dotagent-notify/       # notifiers built-in (desktop / imessage / slack / ntfy / pushover)
   dotagent-plugin/       # PluginClient (subprocess + JSON) — goes through supervisor
@@ -64,7 +68,7 @@ plugins/                 # plugins oficiais (cada um seu binário) — só prefl
   preflight-{warp,cmd}/
   sink-{roam,file}/
 
-examples/                # agents minimais (hello-*) + casos reais (disk-alert)
+examples/                # agents minimais (hello-*, hello-persistent) + casos reais (disk-alert)
   skills/                # skills de exemplo (triage) — procedimento + scripts/ + references/
   commands/              # commands de exemplo (standup) — um .md por command
 
@@ -93,6 +97,8 @@ docs/
 | Ingress (receber evento externo) | `dotagent-notify/src/<source>_inbound.rs` (transporte) + política no daemon |
 | Tipo do protocolo MCP | `dotagent-mcp/src/lib.rs` + `docs/reference/mcp.md` |
 | Memória de agent (outl) | `dotagent-memory/src/lib.rs` + `docs/concepts/memory.md` |
+| Modo de vida do processo (`[lifecycle]`) | `dotagent-core/src/lifecycle.rs` (schema) + `dotagent-runner/src/persistent.rs` (pool) + `docs/concepts/lifecycle.md` |
+| Protocolo do agent persistente (JSON lines) | `dotagent-runner/src/protocol.rs` + `docs/reference/persistent-protocol.md` |
 | Skill (procedimento carregado sob demanda) | `dotagent-core/src/skill.rs` (parse) + `dotagent/src/skills.rs` (discovery + containment) + `docs/concepts/skills.md` |
 | Command (procedimento invocado por nome) | `dotagent-core/src/command.rs` (parse + args + nome Telegram) + `dotagent/src/slash.rs` (discovery) + `docs/concepts/commands.md` |
 | Parser de frontmatter (skill/command) | `dotagent-core/src/frontmatter.rs` — compartilhado, lenient de propósito |

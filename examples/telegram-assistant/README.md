@@ -95,6 +95,46 @@ You should see one tool per installed agent. The same server works from Claude C
 
 **Runs started this way are invisible to `dotagent status`.** `dotagent mcp` runs agents in its own process, like `run-now`. They keep their own heartbeat under the `trigger-mcp` slug, so they never overwrite the scheduled history of the same agent, but the live subprocess tree is not the daemon's.
 
+## Keeping it warm
+
+This example forks a process per message, which is the shape every agent has by
+default. It is also where its latency goes: `claude -p` pays startup every
+invocation, and `--resume` reloads the transcript before it can answer.
+
+`[lifecycle] mode = "persistent"` removes the first half — dotagent keeps the
+agent process alive and delivers each message to it over
+[JSON lines](../../docs/reference/persistent-protocol.md):
+
+```toml
+[lifecycle]
+mode = "persistent"
+key = "chat_id"        # one process per conversation, not one for everyone
+max_invocations = 120
+```
+
+That alone buys nothing here. The cost this example pays is inside `claude`,
+not inside bash, so an `agent.sh` that stays alive and still shells out to
+`claude -p` per message is exactly as slow as it is now. The win needs the
+model process to be the thing that lives:
+
+```
+dotagent  ──JSON lines──▶  agent.sh  ──stream-json──▶  claude (alive)
+```
+
+`claude --input-format stream-json --output-format stream-json` reads turns
+from stdin and keeps the session in memory, so the transcript never round-trips
+through disk. The agent becomes a bridge between the two protocols, one
+`claude` per `AGENT_PERSIST_KEY`.
+
+Measured on a real bot: 4.94s per forked message against **1.90s** on a live
+process, and the gap widens as the conversation grows.
+
+Not done here on purpose — the bridge is a different thing to get right than
+the routing this example is about, and the routing is what most people need
+first. `examples/hello-persistent/` shows the protocol on its own, and
+[`lifecycle.md`](../../docs/concepts/lifecycle.md) covers what dotagent
+guarantees a persistent agent.
+
 ## Rewriting it
 
 The contract is env vars in, stdout out, exit code for success. Nothing about it is bash-specific:
@@ -107,3 +147,7 @@ The contract is env vars in, stdout out, exit code for success. Nothing about it
 | `AGENT_TRIGGER_PAYLOAD` | JSON: `text`, `chat_id`, `user_id` |
 
 Print the reply on stdout. Log everything else to stderr — stdout is what reaches the chat.
+
+In persistent mode that table does not apply: the environment is fixed at spawn
+and the process sees many messages, so the same fields arrive in each request
+frame instead. See [Keeping it warm](#keeping-it-warm).

@@ -37,7 +37,7 @@ use dotagent_mcp::{
     ToolsListResult, DEFAULT_PROTOCOL_VERSION,
 };
 use dotagent_plugin::PluginClient;
-use dotagent_runner::{run_with_hooks, OrchestratedOutcome, RunContext, RunSpec};
+use dotagent_runner::{OrchestratedOutcome, RunSpec};
 use dotagent_state::{AuditLog, StateStore};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
@@ -1249,14 +1249,16 @@ async fn execute(agent_name: &str, arguments: &RunArguments) -> Result<CallToolR
         slug_override: Some(&mcp_slug),
         extra_env: &extra_env,
     };
-    let ctx = RunContext {
-        state: &state,
-        plugins: Some(&plugins),
-        audit: Some(&audit),
-        supervisor: Some(plugins.supervisor()),
-    };
+    let outcome = crate::commands::run_scoped(
+        spec,
+        &state,
+        plugins.supervisor(),
+        Some(&plugins),
+        Some(&audit),
+    )
+    .await?;
 
-    Ok(match run_with_hooks(spec, &ctx).await? {
+    Ok(match outcome {
         OrchestratedOutcome::Ran(outcome) if outcome.exit_code == 0 => {
             let body = if outcome.stdout_tail.trim().is_empty() {
                 format!("{agent_name} finished with no output.")

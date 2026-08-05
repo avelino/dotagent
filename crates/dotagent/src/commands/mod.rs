@@ -10,8 +10,10 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use dotagent_plugin::PluginClient;
-use dotagent_runner::{run as runner_run, RunSpec};
-use dotagent_state::StateStore;
+use dotagent_runner::persistent::PersistentPool;
+use dotagent_runner::{run_with_hooks, OrchestratedOutcome, RunContext, RunSpec};
+use dotagent_state::{AuditLog, StateStore};
+use dotagent_supervisor::Supervisor;
 use dotagent_unit_gen::GenContext;
 
 pub mod completions;
@@ -24,6 +26,44 @@ pub mod status;
 pub mod utility;
 
 use crate::discovery;
+
+/// Run one agent from a short-lived process — `dotagent run`, `run-now`, an
+/// MCP tool call. Everything the daemon does not own.
+///
+/// A persistent agent still speaks the JSON-lines protocol here. Running it
+/// one-shot instead would hand it a closed stdin, which every correct
+/// implementation reads as "shut down" — so the agent would exit without
+/// answering and the operator would be debugging a protocol they never left.
+/// It gets a pool that lives exactly as long as this call: the startup cost is
+/// paid and thrown away, which is precisely what the daemon exists to avoid,
+/// and precisely what a one-off invocation should do.
+pub(crate) async fn run_scoped(
+    spec: RunSpec<'_>,
+    state: &StateStore,
+    supervisor: &Supervisor,
+    plugins: Option<&PluginClient>,
+    audit: Option<&AuditLog>,
+) -> dotagent_runner::Result<OrchestratedOutcome> {
+    let pool = spec
+        .manifest
+        .lifecycle
+        .is_persistent()
+        .then(|| PersistentPool::new(supervisor.clone()));
+    let ctx = RunContext {
+        state,
+        plugins,
+        audit,
+        supervisor: Some(supervisor),
+        persistent: pool.as_ref(),
+    };
+    let outcome = run_with_hooks(spec, &ctx).await;
+    if let Some(pool) = &pool {
+        // Before returning, not on drop: the instance has to be reaped while
+        // there is still an async context to kill it in.
+        pool.shutdown(audit).await;
+    }
+    outcome
+}
 
 /// Execute one schedule of one agent.
 pub async fn run(name: String, schedule: String, dry_run: bool) -> Result<()> {
@@ -42,9 +82,25 @@ pub async fn run(name: String, schedule: String, dry_run: bool) -> Result<()> {
         slug_override: None,
         extra_env: &[],
     };
-    let outcome = runner_run(spec, &state, None)
+    // No plugins and no audit: `dotagent run` is the ad-hoc foreground path,
+    // and firing an agent's sinks from a debugging session would publish
+    // whatever it printed.
+    let supervisor = Supervisor::new();
+    let outcome = match run_scoped(spec, &state, &supervisor, None, None)
         .await
-        .context("runner failed")?;
+        .context("runner failed")?
+    {
+        OrchestratedOutcome::Ran(outcome) => outcome,
+        // Unreachable with `plugins: None` (preflight never runs), but the
+        // type says otherwise and a panic here would be gratuitous.
+        OrchestratedOutcome::PreflightFailed { plugin, suggest } => {
+            eprintln!(
+                "[dotagent] {name}/{schedule}: preflight {plugin} aborted the run{}",
+                suggest.map(|s| format!(": {s}")).unwrap_or_default()
+            );
+            std::process::exit(1);
+        }
+    };
 
     if !outcome.stdout_tail.is_empty() {
         println!("{}", outcome.stdout_tail);
@@ -80,7 +136,12 @@ pub async fn tick(dry_run: bool, _verbose: bool) -> Result<()> {
     let audit = dotagent_state::AuditLog::from_home().context("opening audit log")?;
     let plugins = PluginClient::from_environment();
     let cache = dotagent_state::ManifestCache::from_home().context("opening manifest cache")?;
-    let r = daemon::tick_once(&state, &audit, &plugins, &cache, now).await;
+    // A pool that lives for this one tick. Same reasoning as `run_scoped`: a
+    // persistent agent must speak its protocol here too, and nothing should
+    // outlive the command that started it.
+    let pool = PersistentPool::new(plugins.supervisor().clone());
+    let r = daemon::tick_once(&state, &audit, &plugins, &cache, Some(&pool), now).await;
+    pool.shutdown(Some(&audit)).await;
     println!(
         "scanned {} agent(s); dispatched {}; next event: {}",
         r.agents_scanned,
@@ -236,6 +297,21 @@ pub async fn doctor() -> Result<()> {
             } else {
                 println!("    notifier driver={driver} (built-in)");
             }
+        }
+        // Lifecycle — only worth a line when it is not the default shape.
+        if agent.manifest.lifecycle.is_persistent() {
+            let lc = &agent.manifest.lifecycle;
+            println!(
+                "    lifecycle=persistent key={} max_instances={} idle={}s max_invocations={}",
+                lc.key.as_deref().unwrap_or("(single instance)"),
+                lc.max_instances,
+                lc.idle_timeout_seconds,
+                if lc.max_invocations == 0 {
+                    "unlimited".to_string()
+                } else {
+                    lc.max_invocations.to_string()
+                }
+            );
         }
         // [security] declaration
         if !agent.manifest.security.is_explicit() {
@@ -517,15 +593,33 @@ fn report_telegram_status(agents: &[discovery::DiscoveredAgent]) -> usize {
         // A dispatcher that does not resolve means every accepted message
         // fails after passing the allowlist — worth catching here rather
         // than in the chat.
-        if !agents
+        match agents
             .iter()
-            .any(|a| a.manifest.agent.name == tg.dispatcher_agent)
+            .find(|a| a.manifest.agent.name == tg.dispatcher_agent)
         {
-            println!(
-                "    ⚠ dispatcher agent '{}' not found — every message will fail",
-                tg.dispatcher_agent
-            );
-            warnings += 1;
+            None => {
+                println!(
+                    "    ⚠ dispatcher agent '{}' not found — every message will fail",
+                    tg.dispatcher_agent
+                );
+                warnings += 1;
+            }
+            // A persistent dispatcher without a key is one process for every
+            // conversation: whatever the process remembers from one sender is
+            // there for the next one. Worth saying out loud, because nothing
+            // about it looks wrong until two people use the bot.
+            Some(a)
+                if a.manifest.lifecycle.is_persistent() && a.manifest.lifecycle.key.is_none() =>
+            {
+                println!(
+                    "    ⚠ dispatcher '{}' is persistent with no [lifecycle] key — every \
+                     conversation shares one process, and whatever it holds. \
+                     Set key = \"chat_id\".",
+                    tg.dispatcher_agent
+                );
+                warnings += 1;
+            }
+            Some(_) => {}
         }
     } else if tg.allowed_user_ids.is_empty() {
         println!("telegram ingress: OFF — bot_token set but allowed_user_ids is empty");

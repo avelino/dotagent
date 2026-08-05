@@ -27,6 +27,7 @@ name = "my-agent"                       # unique within the dotagent root
 description = "What this does."         # optional
 monitor = true                          # default: true. false = excluded from `tick`
 timeout_seconds = 1800                  # hard kill SIGTERM→SIGKILL; default 1800
+                                        # persistent mode: deadline for ONE request
 
 # Required: how to run it
 [run]
@@ -38,6 +39,17 @@ working_dir = "."                       # optional, relative to the manifest dir
 [env]
 inherit = true                          # default true — inherit parent env
 extra = { LOG_LEVEL = "info" }          # added on top
+
+# Optional: how long one process lives. Absent = "oneshot", the shape every
+# agent had before this section existed. See docs/concepts/lifecycle.md.
+[lifecycle]
+mode = "persistent"                     # "oneshot" (default) | "persistent"
+key = "chat_id"                         # payload field deciding which instance
+                                        # answers; absent = one instance total
+idle_timeout_seconds = 1800             # recycle after this long with no request
+max_invocations = 120                   # recycle after this many; 0 = unlimited
+max_instances = 8                       # ceiling; past it, LRU is evicted
+startup_timeout_seconds = 30            # window to answer the `hello` handshake
 
 # Optional: agent-wide defaults for retry/backoff/stale
 [defaults]
@@ -108,6 +120,36 @@ network              = "allow"                      # or "deny" or ["api.github.
 filesystem_writable  = ["/Users/me/reports"]        # $AGENT_TMPDIR / heartbeat always writable
 env_passthrough      = ["PATH", "HOME", "LANG"]
 ```
+
+### `[lifecycle]` — how long one process lives
+
+Absent means `mode = "oneshot"`: spawn, run, exit, one process per event. That
+is the default and it is not going to change.
+
+`mode = "persistent"` keeps the process alive between runs and delivers
+requests over [JSON lines](persistent-protocol.md). The agent's own shape
+changes with it — it reads requests and writes answers on a loop instead of
+running once — so this is opt-in per manifest and never inferred.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `mode` | `"oneshot"` | `"oneshot"` or `"persistent"`. Anything else is a parse error, not a silent fallback. |
+| `key` | *(none)* | Trigger-payload field that decides which instance answers. Absent = one instance for the whole agent. |
+| `idle_timeout_seconds` | `1800` | Recycle after this long with no request. Must be > 0. |
+| `max_invocations` | `120` | Recycle after this many requests. `0` = unlimited. |
+| `max_instances` | `8` | Ceiling on live instances. Past it, the least recently used is terminated. Must be ≥ 1. |
+| `startup_timeout_seconds` | `30` | Window to answer the `hello` handshake. Must be below `[agent] timeout_seconds` — a handshake that outlasts the request deadline means the first message can never land, and `doctor` refuses the manifest. |
+
+Two things change meaning in this mode:
+
+- **`[agent] timeout_seconds` is the deadline for one request**, not the
+  lifetime of the process. Exceeding it recycles the instance.
+- **`AGENT_TRIGGER_*` is not injected.** Those variables describe a single
+  message and the process outlives many; the context rides in each request
+  frame instead. `AGENT_LIFECYCLE` and `AGENT_PERSIST_KEY` are added — see
+  [env-vars](env-vars.md).
+
+Full reasoning in [Lifecycle](../concepts/lifecycle.md).
 
 ### `[[notifiers]]` — built-in drivers
 

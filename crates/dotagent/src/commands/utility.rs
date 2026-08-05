@@ -6,7 +6,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Local;
 use dotagent_plugin::PluginClient;
-use dotagent_runner::{run_with_hooks, RunContext, RunSpec};
+use dotagent_runner::RunSpec;
 use dotagent_state::{slug_from_args, AuditLog, ManifestCache, StateStore};
 
 use crate::commands::output::{render_outcome, Format};
@@ -213,14 +213,15 @@ pub async fn run_now(agent_name: String, schedule: Option<String>, format: Forma
         slug_override: None,
         extra_env: &[],
     };
-    let ctx = RunContext {
-        state: &state,
-        plugins: Some(&plugins),
-        audit: Some(&audit),
-        supervisor: Some(plugins.supervisor()),
-    };
     let started = Local::now();
-    let outcome = run_with_hooks(spec, &ctx).await?;
+    let outcome = crate::commands::run_scoped(
+        spec,
+        &state,
+        plugins.supervisor(),
+        Some(&plugins),
+        Some(&audit),
+    )
+    .await?;
     let duration = (Local::now() - started).num_seconds();
     render_outcome(&agent_name, sched.id(), &outcome, duration, format);
     Ok(())

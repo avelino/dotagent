@@ -11,6 +11,34 @@ schema and the plugin protocol are flagged in each entry.
 
 ### Added
 
+- **An agent can stay alive between runs.** `[lifecycle] mode = "persistent"`
+  keeps the process up and delivers requests to it over JSON lines, one object
+  per line each way. The problem it solves is a dispatcher paying for startup
+  and for reloading its conversation on every single message: measured on a
+  chat bot, 4.94s per forked message against **1.90s** on a live process. Every
+  message after the first is a second message.
+
+  It is deliberately not a second supervisor. Instances are spawned through
+  `dotagent-supervisor` like every other subprocess, so they appear in
+  `dotagent status` under `persistent`, the reaper enforces their deadline with
+  a real kill-tree, and daemon shutdown reaps them. The idle timeout is not a
+  new timer either — it is the reaper's existing clock, re-pointed after each
+  answer with the new `Supervisor::retime`. One clock, one kill path.
+
+  `key = "chat_id"` gives one process per conversation; without it every
+  sender shares one process and whatever it remembers. `max_invocations`
+  recycles before a long conversation degrades it, `max_instances` evicts the
+  least recently used, and a crash costs a respawn rather than the message —
+  a death in the window between setting the deadline and writing the request
+  is retried once. Recycles are audited as `persistent_agent_recycled` with
+  the reason. New threat vector
+  [V13](docs/security/threat-model.md#v13--state-carried-between-senders-by-a-persistent-agent);
+  the protocol is at
+  [`docs/reference/persistent-protocol.md`](docs/reference/persistent-protocol.md)
+  and the why at [`docs/concepts/lifecycle.md`](docs/concepts/lifecycle.md).
+
+  `mode = "oneshot"` is the default and stays the default. An agent with no
+  `[lifecycle]` behaves exactly as before.
 - **A reply knows which run it answers.** Notifications are the messages you
   actually want to answer, and answering one used to arrive as prose someone
   had to parse. dotagent now records what each outbound Telegram message was

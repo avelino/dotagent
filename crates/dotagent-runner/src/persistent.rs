@@ -1,0 +1,949 @@
+//! The pool behind `[lifecycle] mode = "persistent"`.
+//!
+//! An agent that holds state — a conversation, a warm cache, an open
+//! connection — pays for all of it again every time dotagent spawns it fresh.
+//! This keeps the process alive between runs and hands it the next request
+//! over [`crate::protocol`].
+//!
+//! What it deliberately does *not* do is invent a second supervisor. Every
+//! instance is spawned through [`Supervisor::spawn_supervised`] like any other
+//! subprocess, so it shows up in `dotagent status`, the reaper enforces its
+//! deadline with a real kill-tree, and daemon shutdown reaps it. The idle
+//! timeout is not a timer of its own: it is the reaper's clock, re-pointed
+//! with [`Supervisor::retime`] after every answer.
+//!
+//! ## Concurrency
+//!
+//! One mutex per instance, so requests for one key serialize. This does **not**
+//! make different keys run in parallel today — the daemon reads triggers from
+//! the same `select!` that drives its tick loop, and that serialization is
+//! what keeps the heartbeat's read-modify-write safe. Instances of the same
+//! agent share one heartbeat file (the slug is per source, not per key), so
+//! the per-instance mutex is defense in depth, not a throughput promise.
+//!
+//! See `docs/concepts/lifecycle.md`.
+
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
+
+use chrono::Local;
+use dotagent_core::audit::AuditEvent;
+use dotagent_state::{AuditLog, StateStore};
+use dotagent_supervisor::{ProcId, ProcessKind, ProcessOwner, SpawnSpec, Supervisor};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{ChildStdin, ChildStdout, Command};
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
+
+use crate::protocol::{HelloFrame, InboundFrame, RequestFrame, TriggerFrame};
+use crate::{tail_lines, RunOutcome, RunSpec, RunnerError, TAIL_LINES, TIMED_OUT_EXIT_CODE};
+
+/// Key used when the manifest declares no `[lifecycle] key`.
+pub const DEFAULT_INSTANCE_KEY: &str = "default";
+
+/// Longest a resolved key may be before it is hashed. Keys land in process
+/// labels and audit entries; a 4 KB chat field should not.
+const MAX_KEY_LEN: usize = 64;
+
+/// How many stderr lines one instance keeps for the next `stderr_tail`.
+const STDERR_RING_LINES: usize = 500;
+
+/// Why an instance went away. The string lands in the audit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecycleReason {
+    Idle,
+    MaxInvocations,
+    Crashed,
+    Timeout,
+    Evicted,
+    Shutdown,
+    ConfigChanged,
+}
+
+impl RecycleReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            RecycleReason::Idle => "idle",
+            RecycleReason::MaxInvocations => "max_invocations",
+            RecycleReason::Crashed => "crashed",
+            RecycleReason::Timeout => "timeout",
+            RecycleReason::Evicted => "evicted",
+            RecycleReason::Shutdown => "shutdown",
+            RecycleReason::ConfigChanged => "config_changed",
+        }
+    }
+}
+
+/// Rolling window of the instance's stderr.
+///
+/// A one-shot run has a natural boundary for "what did this print" — the
+/// process exiting. A persistent one has none, so each request records where
+/// the stream was when it started and takes the delta.
+#[derive(Default)]
+struct StderrRing {
+    lines: VecDeque<String>,
+    /// Total lines ever seen. Monotonic, so a request can subtract.
+    total: usize,
+}
+
+impl StderrRing {
+    fn push(&mut self, line: String) {
+        self.total += 1;
+        self.lines.push_back(line);
+        while self.lines.len() > STDERR_RING_LINES {
+            self.lines.pop_front();
+        }
+    }
+
+    /// Lines seen since `mark`, capped at what the ring still holds.
+    fn since(&self, mark: usize) -> String {
+        let produced = self.total.saturating_sub(mark);
+        let take = produced.min(self.lines.len());
+        let start = self.lines.len() - take;
+        self.lines
+            .iter()
+            .skip(start)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// One live agent process.
+struct Instance {
+    proc_id: ProcId,
+    pid: u32,
+    handle: dotagent_supervisor::SupervisedHandle,
+    stdin: ChildStdin,
+    stdout: Lines<BufReader<ChildStdout>>,
+    stderr: Arc<StdMutex<StderrRing>>,
+    stderr_task: tokio::task::JoinHandle<()>,
+    /// `AGENT_TMPDIR`. Owned by the instance, not by a request: a one-shot run
+    /// drops it on exit, and doing that here would delete the directory out
+    /// from under a process that is still using it.
+    _tmpdir: tempfile::TempDir,
+    invocations: u32,
+    seq: u64,
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        // The stderr reader would otherwise outlive the process it drains.
+        self.stderr_task.abort();
+    }
+}
+
+/// A slot in the pool. `None` means "this key has no live process right now" —
+/// the slot itself is created before the spawn so two concurrent requests for
+/// the same key queue on the same mutex instead of racing to spawn twice.
+type Slot = Arc<Mutex<Option<Instance>>>;
+
+struct SlotEntry {
+    slot: Slot,
+    last_used: Instant,
+}
+
+/// Live persistent agents, keyed by `(agent, instance key)`.
+pub struct PersistentPool {
+    supervisor: Supervisor,
+    slots: Mutex<HashMap<(String, String), SlotEntry>>,
+}
+
+impl std::fmt::Debug for PersistentPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PersistentPool").finish_non_exhaustive()
+    }
+}
+
+/// How a request against a live instance ended.
+enum Exchange {
+    Answered(RunOutcome),
+    /// The process was gone before the answer. Retryable exactly once, with a
+    /// fresh instance — an idle recycle landing between the deadline reset and
+    /// the write is a real race, and it should cost a respawn rather than a
+    /// dropped message.
+    Dead(String),
+    /// The request outlived its deadline. Not retryable: the agent is
+    /// presumably still working on it, and asking again would double the work.
+    TimedOut,
+}
+
+impl PersistentPool {
+    pub fn new(supervisor: Supervisor) -> Self {
+        Self {
+            supervisor,
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Number of keys with a live process. Test and status affordance.
+    pub async fn live_count(&self) -> usize {
+        let slots = self.slots.lock().await;
+        let mut live = 0;
+        for entry in slots.values() {
+            if let Ok(guard) = entry.slot.try_lock() {
+                if guard.is_some() {
+                    live += 1;
+                }
+            } else {
+                // Locked means a request is in flight, which means it is live.
+                live += 1;
+            }
+        }
+        live
+    }
+
+    /// Run one request against the agent's persistent instance, spawning it if
+    /// there is not one already.
+    ///
+    /// Writes the same heartbeat a one-shot run writes, per request, so
+    /// nothing downstream (`status`, health, retry) can tell the modes apart.
+    pub async fn dispatch(
+        &self,
+        spec: &RunSpec<'_>,
+        state: &StateStore,
+        audit: Option<&AuditLog>,
+    ) -> crate::Result<RunOutcome> {
+        let name = spec.manifest.agent.name.clone();
+        let slug = spec.slug();
+        let key = resolve_key(spec);
+        let start = Local::now();
+
+        if !spec.dry_run {
+            crate::begin_heartbeat(state, &name, &slug, spec.args, &start)?;
+        }
+
+        let result = self
+            .exchange_with_retry(spec, state, &name, &key, audit)
+            .await;
+
+        let outcome = match result {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                // A spawn that never happened has no exit code to report. Mirror
+                // `run()`: propagate, leaving the started heartbeat open, which
+                // is what crash detection reads.
+                return Err(e);
+            }
+        };
+
+        if !spec.dry_run {
+            let finish = Local::now();
+            crate::finish_heartbeat(
+                state,
+                &name,
+                &slug,
+                spec.args,
+                &start,
+                &finish,
+                outcome.exit_code,
+            )?;
+        }
+        Ok(outcome)
+    }
+
+    async fn exchange_with_retry(
+        &self,
+        spec: &RunSpec<'_>,
+        state: &StateStore,
+        name: &str,
+        key: &str,
+        audit: Option<&AuditLog>,
+    ) -> crate::Result<RunOutcome> {
+        let mut last_error = String::new();
+        for attempt in 0..2 {
+            let slot = self.slot_for(spec, name, key, audit).await;
+            let mut guard = slot.lock().await;
+
+            if guard.is_none() {
+                match self.spawn_instance(spec, state, name, key).await {
+                    Ok(inst) => {
+                        let _ = audit.map(|log| {
+                            log.append(AuditEvent::PersistentAgentStarted {
+                                agent: name.to_string(),
+                                key: key.to_string(),
+                                pid: inst.pid,
+                            })
+                        });
+                        info!(agent = %name, key = %key, pid = inst.pid, "persistent agent up");
+                        *guard = Some(inst);
+                    }
+                    Err(e) => {
+                        // A process that cannot start is not a race worth
+                        // retrying — the next attempt would fail identically.
+                        drop(guard);
+                        self.forget_slot(name, key).await;
+                        return Err(e);
+                    }
+                }
+            }
+
+            let inst = guard.as_mut().expect("just ensured");
+            match self.exchange(inst, spec).await {
+                Exchange::Answered(outcome) => {
+                    let recycle = spec.manifest.lifecycle.max_invocations > 0
+                        && inst.invocations >= spec.manifest.lifecycle.max_invocations;
+                    let idle = Duration::from_secs(spec.manifest.lifecycle.idle_timeout_seconds);
+                    let proc_id = inst.proc_id;
+                    let invocations = inst.invocations;
+                    if recycle {
+                        let inst = guard.take().expect("live");
+                        drop(guard);
+                        self.retire(inst, name, key, RecycleReason::MaxInvocations, audit)
+                            .await;
+                        self.forget_slot(name, key).await;
+                    } else {
+                        // Hand the reaper the idle clock. A false return means
+                        // it already collected the process; the next request
+                        // will spawn a new one, which is exactly right.
+                        if !self.supervisor.retime(proc_id, idle) {
+                            debug!(agent = %name, key = %key, "instance collected before going idle");
+                            let _ = guard.take();
+                            drop(guard);
+                            self.record_recycle(name, key, RecycleReason::Idle, invocations, audit);
+                            self.forget_slot(name, key).await;
+                        } else {
+                            drop(guard);
+                        }
+                        self.touch(name, key).await;
+                    }
+                    return Ok(outcome);
+                }
+                Exchange::TimedOut => {
+                    // Recycle rather than reuse: the instance is still working
+                    // on a question nobody is waiting for anymore, and its next
+                    // line would answer the wrong one.
+                    let inst = guard.take().expect("live");
+                    drop(guard);
+                    self.retire(inst, name, key, RecycleReason::Timeout, audit)
+                        .await;
+                    self.forget_slot(name, key).await;
+                    warn!(agent = %name, key = %key, "persistent request timed out — recycled");
+                    return Ok(RunOutcome {
+                        exit_code: TIMED_OUT_EXIT_CODE,
+                        timed_out: true,
+                        duration_seconds: spec.manifest.agent.timeout_seconds as i64,
+                        stdout_tail: String::new(),
+                        stderr_tail: format!(
+                            "persistent agent did not answer within {}s — instance recycled",
+                            spec.manifest.agent.timeout_seconds
+                        ),
+                        stdout_truncated_lines: 0,
+                        stderr_truncated_lines: 0,
+                    });
+                }
+                Exchange::Dead(why) => {
+                    let invocations = inst.invocations;
+                    let inst = guard.take().expect("live");
+                    drop(guard);
+                    self.retire_dead(inst, name, key, invocations, audit).await;
+                    self.forget_slot(name, key).await;
+                    last_error = why;
+                    if attempt == 0 {
+                        debug!(
+                            agent = %name, key = %key, error = %last_error,
+                            "persistent instance was gone — retrying once with a fresh one"
+                        );
+                        continue;
+                    }
+                }
+            }
+        }
+        Err(RunnerError::Spawn(format!(
+            "persistent agent {name} died twice in a row: {last_error}"
+        )))
+    }
+
+    /// One request against a live instance.
+    async fn exchange(&self, inst: &mut Instance, spec: &RunSpec<'_>) -> Exchange {
+        if let Ok(Some(status)) = inst.handle.try_wait() {
+            return Exchange::Dead(format!("process already exited ({status})"));
+        }
+
+        let deadline = Duration::from_secs(spec.manifest.agent.timeout_seconds);
+        if !self.supervisor.retime(inst.proc_id, deadline) {
+            return Exchange::Dead("supervisor had already collected the process".into());
+        }
+
+        inst.seq += 1;
+        let id = inst.seq.to_string();
+        let frame = RequestFrame {
+            v: crate::protocol::PROTOCOL_VERSION,
+            kind: "request",
+            id: id.clone(),
+            agent: spec.manifest.agent.name.clone(),
+            schedule: spec.schedule_id.to_string(),
+            args: spec.args.to_vec(),
+            deadline_seconds: spec.manifest.agent.timeout_seconds,
+            trigger: TriggerFrame::from_env(spec.extra_env),
+        };
+
+        let stderr_mark = inst
+            .stderr
+            .lock()
+            .map(|ring| ring.total)
+            .unwrap_or_default();
+        let started = Instant::now();
+
+        if let Err(e) = write_frame(&mut inst.stdin, &frame).await {
+            return Exchange::Dead(format!("write failed: {e}"));
+        }
+
+        let answer = tokio::time::timeout(deadline, read_answer(&mut inst.stdout, &id)).await;
+        let elapsed = started.elapsed().as_secs() as i64;
+        let stderr_delta = inst
+            .stderr
+            .lock()
+            .map(|ring| ring.since(stderr_mark))
+            .unwrap_or_default();
+
+        match answer {
+            Err(_) => Exchange::TimedOut,
+            Ok(Err(e)) => Exchange::Dead(e),
+            Ok(Ok(frame)) => {
+                inst.invocations += 1;
+                let exit_code = frame.resolved_exit_code();
+                // A failure with only an `error` still has something to say —
+                // and stdout is where the reply comes from, so that is where
+                // it has to land or the chat gets silence.
+                let stdout = frame.output.or(frame.error).unwrap_or_default();
+                let (stdout_tail, stdout_truncated_lines) = tail_lines(&stdout, TAIL_LINES);
+                let (stderr_tail, stderr_truncated_lines) = tail_lines(&stderr_delta, TAIL_LINES);
+                Exchange::Answered(RunOutcome {
+                    exit_code,
+                    timed_out: false,
+                    duration_seconds: elapsed,
+                    stdout_tail,
+                    stderr_tail,
+                    stdout_truncated_lines,
+                    stderr_truncated_lines,
+                })
+            }
+        }
+    }
+
+    /// Get (or create) the slot for a key, evicting the least recently used
+    /// instance first when the agent is at its ceiling.
+    async fn slot_for(
+        &self,
+        spec: &RunSpec<'_>,
+        name: &str,
+        key: &str,
+        audit: Option<&AuditLog>,
+    ) -> Slot {
+        let map_key = (name.to_string(), key.to_string());
+
+        // Everything that touches the map happens here, with no `.await`
+        // inside: terminating the evicted instance sleeps through the kill
+        // grace, and holding the map across that would stall every other key.
+        let (slot, victim) = {
+            let mut slots = self.slots.lock().await;
+            if let Some(entry) = slots.get_mut(&map_key) {
+                entry.last_used = Instant::now();
+                return entry.slot.clone();
+            }
+            // New key. Make room before adding, counting only this agent's
+            // slots — one chatty agent should not evict another's warm cache.
+            let max = spec.manifest.lifecycle.max_instances as usize;
+            let mine: Vec<_> = slots.keys().filter(|(a, _)| a == name).cloned().collect();
+            let victim = if mine.len() >= max {
+                mine.into_iter()
+                    .min_by_key(|k| slots.get(k).map(|e| e.last_used))
+                    .and_then(|k| slots.remove(&k).map(|e| (k, e.slot)))
+            } else {
+                None
+            };
+            let slot: Slot = Arc::new(Mutex::new(None));
+            slots.insert(
+                map_key,
+                SlotEntry {
+                    slot: slot.clone(),
+                    last_used: Instant::now(),
+                },
+            );
+            (slot, victim)
+        };
+
+        if let Some((victim_key, victim_slot)) = victim {
+            let mut guard = victim_slot.lock().await;
+            if let Some(inst) = guard.take() {
+                self.retire(
+                    inst,
+                    &victim_key.0,
+                    &victim_key.1,
+                    RecycleReason::Evicted,
+                    audit,
+                )
+                .await;
+            }
+        }
+        slot
+    }
+
+    async fn spawn_instance(
+        &self,
+        spec: &RunSpec<'_>,
+        state: &StateStore,
+        name: &str,
+        key: &str,
+    ) -> crate::Result<Instance> {
+        let slug = spec.slug();
+        let start = Local::now();
+        let tmpdir = tempfile::tempdir()?;
+        let heartbeat_path = state.heartbeat_path(name, &slug);
+
+        let working_dir = spec
+            .manifest
+            .run
+            .working_dir
+            .clone()
+            .map(|p| spec.manifest_dir.join(p))
+            .unwrap_or_else(|| spec.manifest_dir.to_path_buf());
+
+        let mut cmd = Command::new(&spec.manifest.run.command);
+        cmd.args(&spec.manifest.run.args);
+        cmd.args(spec.args);
+        cmd.current_dir(&working_dir);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        crate::apply_env_for(
+            &mut cmd,
+            spec,
+            name,
+            &slug,
+            &start,
+            tmpdir.path(),
+            &heartbeat_path,
+            Some(key),
+        );
+
+        let startup = Duration::from_secs(spec.manifest.lifecycle.startup_timeout_seconds);
+        let spawn_spec = SpawnSpec {
+            kind: ProcessKind::PersistentAgent,
+            owner: ProcessOwner {
+                agent: name.to_string(),
+                schedule: Some(spec.schedule_id.to_string()),
+                hook_event: None,
+                plugin: None,
+            },
+            // Until the handshake lands, the startup window is the deadline —
+            // an agent that never says `ready` is collected instead of sitting
+            // there forever.
+            deadline: startup,
+            label: format!("{name}.persistent[{key}]"),
+        };
+
+        let mut handle = self
+            .supervisor
+            .spawn_supervised(cmd, spawn_spec)
+            .await
+            .map_err(|e| RunnerError::Spawn(e.to_string()))?;
+        let proc_id = handle.id();
+        let pid = handle.pid().unwrap_or(0);
+        let mut stdin = handle.take_stdin().expect("piped stdin");
+        let stdout = handle.take_stdout().expect("piped stdout");
+        let stderr = handle.take_stderr().expect("piped stderr");
+
+        let ring = Arc::new(StdMutex::new(StderrRing::default()));
+        let stderr_task = spawn_stderr_reader(stderr, ring.clone(), name.to_string());
+        let mut lines = BufReader::new(stdout).lines();
+
+        // Handshake. Failure here terminates rather than leaks: the process is
+        // already registered with the supervisor and nobody else holds it.
+        let hello = HelloFrame::new(name, key, spec.schedule_id);
+        let handshake = async {
+            write_frame(&mut stdin, &hello).await?;
+            loop {
+                match lines.next_line().await {
+                    Ok(Some(line)) => match InboundFrame::parse(&line) {
+                        Some(f) if f.is_ready() && f.ok => return Ok(()),
+                        Some(f) if f.is_ready() => {
+                            return Err(f
+                                .error
+                                .unwrap_or_else(|| "agent refused the handshake".into()))
+                        }
+                        _ => {
+                            debug!(agent = %name, line = %line, "ignoring pre-handshake output");
+                        }
+                    },
+                    Ok(None) => return Err("agent exited before the handshake".to_string()),
+                    Err(e) => return Err(format!("reading handshake: {e}")),
+                }
+            }
+        };
+
+        match tokio::time::timeout(startup, handshake).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                stderr_task.abort();
+                self.supervisor.terminate(proc_id).await;
+                return Err(RunnerError::Spawn(format!(
+                    "persistent agent {name} failed to start: {e}"
+                )));
+            }
+            Err(_) => {
+                stderr_task.abort();
+                self.supervisor.terminate(proc_id).await;
+                return Err(RunnerError::Spawn(format!(
+                    "persistent agent {name} did not answer the handshake within {}s",
+                    startup.as_secs()
+                )));
+            }
+        }
+
+        Ok(Instance {
+            proc_id,
+            pid,
+            handle,
+            stdin,
+            stdout: lines,
+            stderr: ring,
+            stderr_task,
+            _tmpdir: tmpdir,
+            invocations: 0,
+            seq: 0,
+        })
+    }
+
+    /// Kill an instance and record why.
+    ///
+    /// Order matters: `terminate` runs **while the instance is still held**.
+    /// Dropping it first releases the `Child`, tokio reaps the process in the
+    /// background, and the pid becomes available for reuse — at which point
+    /// the `killpg` we were about to send could land on somebody else's
+    /// process group. Holding the handle across the kill keeps the pid
+    /// reserved. This is the same hazard `SupervisedHandle::Drop` exists to
+    /// avoid.
+    async fn retire(
+        &self,
+        inst: Instance,
+        name: &str,
+        key: &str,
+        reason: RecycleReason,
+        audit: Option<&AuditLog>,
+    ) {
+        let invocations = inst.invocations;
+        self.supervisor.terminate(inst.proc_id).await;
+        drop(inst);
+        self.record_recycle(name, key, reason, invocations, audit);
+    }
+
+    /// Same, for an instance that is already dead. `terminate` is best effort:
+    /// the reaper may have collected it, in which case it is a no-op.
+    async fn retire_dead(
+        &self,
+        inst: Instance,
+        name: &str,
+        key: &str,
+        invocations: u32,
+        audit: Option<&AuditLog>,
+    ) {
+        self.supervisor.terminate(inst.proc_id).await;
+        drop(inst);
+        self.record_recycle(name, key, RecycleReason::Crashed, invocations, audit);
+    }
+
+    fn record_recycle(
+        &self,
+        name: &str,
+        key: &str,
+        reason: RecycleReason,
+        invocations: u32,
+        audit: Option<&AuditLog>,
+    ) {
+        if let Some(log) = audit {
+            let _ = log.append(AuditEvent::PersistentAgentRecycled {
+                agent: name.to_string(),
+                key: key.to_string(),
+                reason: reason.as_str().to_string(),
+                invocations,
+            });
+        }
+        info!(
+            agent = %name, key = %key, reason = reason.as_str(), invocations,
+            "persistent agent recycled"
+        );
+    }
+
+    async fn touch(&self, name: &str, key: &str) {
+        let mut slots = self.slots.lock().await;
+        if let Some(entry) = slots.get_mut(&(name.to_string(), key.to_string())) {
+            entry.last_used = Instant::now();
+        }
+    }
+
+    async fn forget_slot(&self, name: &str, key: &str) {
+        let mut slots = self.slots.lock().await;
+        slots.remove(&(name.to_string(), key.to_string()));
+    }
+
+    /// Collect instances that died while nobody was looking.
+    ///
+    /// The reaper enforces the idle window, but it kills a process — it does
+    /// not know the pool exists. Without this sweep, an instance recycled for
+    /// sitting idle would only be noticed (and audited) when the next message
+    /// arrived, which for an idle conversation could be never.
+    pub async fn sweep(&self, audit: Option<&AuditLog>) {
+        let entries: Vec<((String, String), Slot)> = {
+            let slots = self.slots.lock().await;
+            slots
+                .iter()
+                .map(|(k, e)| (k.clone(), e.slot.clone()))
+                .collect()
+        };
+        let mut dead: Vec<(String, String)> = Vec::new();
+        for (key, slot) in entries {
+            // A locked slot has a request in flight — leave it alone.
+            let Ok(mut guard) = slot.try_lock() else {
+                continue;
+            };
+            let exited = match guard.as_mut() {
+                Some(inst) => inst.handle.try_wait().ok().flatten().is_some(),
+                None => true,
+            };
+            if exited {
+                let invocations = guard.as_ref().map(|i| i.invocations).unwrap_or(0);
+                let had_instance = guard.take().is_some();
+                if had_instance {
+                    self.record_recycle(&key.0, &key.1, RecycleReason::Idle, invocations, audit);
+                }
+                dead.push(key);
+            }
+        }
+        if !dead.is_empty() {
+            let mut slots = self.slots.lock().await;
+            for key in dead {
+                slots.remove(&key);
+            }
+        }
+    }
+
+    /// Drop every instance of one agent — used when its manifest changed and
+    /// the live process no longer matches what is on disk.
+    pub async fn forget_agent(&self, name: &str, audit: Option<&AuditLog>) {
+        let mine: Vec<((String, String), Slot)> = {
+            let mut slots = self.slots.lock().await;
+            let keys: Vec<_> = slots.keys().filter(|(a, _)| a == name).cloned().collect();
+            keys.into_iter()
+                .filter_map(|k| slots.remove(&k).map(|e| (k, e.slot)))
+                .collect()
+        };
+        for (key, slot) in mine {
+            let mut guard = slot.lock().await;
+            if let Some(inst) = guard.take() {
+                self.retire(inst, &key.0, &key.1, RecycleReason::ConfigChanged, audit)
+                    .await;
+            }
+        }
+    }
+
+    /// Terminate every instance. Called on daemon shutdown so the audit log
+    /// says why they went away — `Supervisor::shutdown` would reap them either
+    /// way, but silently.
+    pub async fn shutdown(&self, audit: Option<&AuditLog>) {
+        self.drain(RecycleReason::Shutdown, audit).await
+    }
+
+    /// Terminate every instance because the operator asked for a reload.
+    ///
+    /// A live instance was spawned from the manifest as it read at the time:
+    /// its `[run]` command, its `[env]`, its timeouts. Keeping it through a
+    /// reload would make the reload look applied while the behavior stayed
+    /// exactly where it was — the same reason the Telegram ingress is
+    /// restarted rather than left alone. Costs one respawn per conversation,
+    /// on an event the operator triggered deliberately.
+    pub async fn reload(&self, audit: Option<&AuditLog>) {
+        self.drain(RecycleReason::ConfigChanged, audit).await
+    }
+
+    async fn drain(&self, reason: RecycleReason, audit: Option<&AuditLog>) {
+        let all: Vec<((String, String), Slot)> = {
+            let mut slots = self.slots.lock().await;
+            slots.drain().map(|(k, e)| (k, e.slot)).collect()
+        };
+        for (key, slot) in all {
+            let mut guard = slot.lock().await;
+            if let Some(inst) = guard.take() {
+                self.retire(inst, &key.0, &key.1, reason, audit).await;
+            }
+        }
+    }
+}
+
+/// Which instance answers this request.
+///
+/// The key is a *selector over the payload the daemon already attested*, never
+/// something the sender can point anywhere: it names a field, and whatever is
+/// in that field is sanitized before it reaches a process label.
+fn resolve_key(spec: &RunSpec<'_>) -> String {
+    let Some(field) = spec.manifest.lifecycle.key.as_deref() else {
+        return DEFAULT_INSTANCE_KEY.to_string();
+    };
+    let raw = spec
+        .extra_env
+        .iter()
+        .find(|(k, _)| k == "AGENT_TRIGGER_PAYLOAD")
+        .and_then(|(_, v)| serde_json::from_str::<serde_json::Value>(v).ok())
+        .and_then(|payload| match payload.get(field) {
+            Some(serde_json::Value::String(s)) => Some(s.clone()),
+            Some(serde_json::Value::Number(n)) => Some(n.to_string()),
+            _ => None,
+        });
+    match raw {
+        Some(value) => sanitize_key(&value),
+        None => DEFAULT_INSTANCE_KEY.to_string(),
+    }
+}
+
+/// Reduce an arbitrary payload value to something safe to put in a process
+/// label, a log line and an audit entry.
+fn sanitize_key(raw: &str) -> String {
+    let clean: String = raw
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if clean.is_empty() || clean.len() != raw.len() || clean.len() > MAX_KEY_LEN {
+        // Anything that is not already a plain identifier becomes a stable
+        // digest of itself. Two different values never collapse to one key,
+        // and no chat text ever reaches a label.
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        raw.hash(&mut hasher);
+        format!("k{:016x}", hasher.finish())
+    } else {
+        clean
+    }
+}
+
+async fn write_frame<T: serde::Serialize>(
+    stdin: &mut ChildStdin,
+    frame: &T,
+) -> std::result::Result<(), String> {
+    let mut line = serde_json::to_vec(frame).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    stdin.write_all(&line).await.map_err(|e| e.to_string())?;
+    stdin.flush().await.map_err(|e| e.to_string())
+}
+
+/// Read until the frame answering `id` shows up.
+///
+/// Everything else is dropped: a log line that went to the wrong stream, a
+/// banner, or the late answer to a request that already timed out. The last
+/// one is why this exists — without it, one slow reply would shift every
+/// subsequent answer by one, and the chat would silently start replying to the
+/// previous question.
+async fn read_answer(
+    lines: &mut Lines<BufReader<ChildStdout>>,
+    id: &str,
+) -> std::result::Result<InboundFrame, String> {
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => match InboundFrame::parse(&line) {
+                Some(frame) if frame.answers(id) => return Ok(frame),
+                Some(_) => debug!(line = %line, "dropping frame that answers nothing in flight"),
+                None => debug!(line = %line, "dropping non-protocol line on stdout"),
+            },
+            Ok(None) => return Err("agent closed stdout".to_string()),
+            Err(e) => return Err(format!("reading stdout: {e}")),
+        }
+    }
+}
+
+/// Drain stderr into the ring and the agent's log file, forever.
+fn spawn_stderr_reader(
+    stderr: tokio::process::ChildStderr,
+    ring: Arc<StdMutex<StderrRing>>,
+    agent: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Only stderr is teed to the log. stdout is the protocol channel, and
+        // a log full of JSON frames helps nobody.
+        let log_file = {
+            let dir = dotagent_state::paths::agent_logs_dir(&agent);
+            std::fs::create_dir_all(&dir).ok().and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(dir.join(format!("{agent}.log")))
+                    .ok()
+            })
+        };
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(mut f) = log_file.as_ref().and_then(|f| f.try_clone().ok()) {
+                use std::io::Write;
+                let _ = writeln!(f, "{line}");
+            }
+            if let Ok(mut ring) = ring.lock() {
+                ring.push(line);
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_plain_identifier_is_kept_verbatim() {
+        assert_eq!(sanitize_key("12345"), "12345");
+        assert_eq!(sanitize_key("chat-9_a"), "chat-9_a");
+    }
+
+    #[test]
+    fn anything_else_becomes_a_stable_digest() {
+        let a = sanitize_key("../../etc/passwd");
+        assert!(a.starts_with('k'), "{a}");
+        assert_eq!(a, sanitize_key("../../etc/passwd"), "must be stable");
+        assert_ne!(a, sanitize_key("../../etc/shadow"), "must not collide");
+        // No path separator, no whitespace, nothing a label would have to quote.
+        assert!(a.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn an_overlong_key_is_hashed_rather_than_truncated() {
+        // Truncating would let two different chats share one process.
+        let long = "a".repeat(MAX_KEY_LEN + 1);
+        let longer = "a".repeat(MAX_KEY_LEN + 2);
+        assert_ne!(sanitize_key(&long), sanitize_key(&longer));
+        assert!(sanitize_key(&long).len() <= MAX_KEY_LEN);
+    }
+
+    #[test]
+    fn an_empty_key_never_yields_an_empty_label() {
+        assert!(!sanitize_key("").is_empty());
+    }
+
+    #[test]
+    fn the_stderr_ring_reports_only_what_this_request_produced() {
+        let mut ring = StderrRing::default();
+        ring.push("before".into());
+        let mark = ring.total;
+        ring.push("during one".into());
+        ring.push("during two".into());
+        assert_eq!(ring.since(mark), "during one\nduring two");
+        assert_eq!(ring.since(ring.total), "");
+    }
+
+    #[test]
+    fn the_stderr_ring_survives_more_lines_than_it_holds() {
+        let mut ring = StderrRing::default();
+        let mark = ring.total;
+        for i in 0..(STDERR_RING_LINES + 10) {
+            ring.push(format!("line {i}"));
+        }
+        let seen = ring.since(mark);
+        assert_eq!(seen.lines().count(), STDERR_RING_LINES);
+        assert!(seen.ends_with(&format!("line {}", STDERR_RING_LINES + 9)));
+    }
+
+    #[test]
+    fn recycle_reasons_render_as_the_documented_strings() {
+        assert_eq!(RecycleReason::MaxInvocations.as_str(), "max_invocations");
+        assert_eq!(RecycleReason::ConfigChanged.as_str(), "config_changed");
+    }
+}

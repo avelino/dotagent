@@ -69,8 +69,16 @@ fn print_live_subprocesses(snap: &[ProcessInfo]) {
     // Sort: highest deadline_pct first — surfaces near-deadline processes.
     let mut sorted: Vec<&ProcessInfo> = snap.iter().collect();
     sorted.sort_by_key(|p| std::cmp::Reverse(p.deadline_pct));
+    let mut has_persistent = false;
     for p in sorted {
-        let icon = if p.deadline_pct >= 100 {
+        // For a persistent agent the clock is the idle window, not a run that
+        // is running late. Reaching it means "recycled for sitting idle",
+        // which is the pool working, so it never gets an alarm colour.
+        let persistent = p.kind == dotagent_supervisor::ProcessKind::PersistentAgent;
+        has_persistent |= persistent;
+        let icon = if persistent {
+            "  "
+        } else if p.deadline_pct >= 100 {
             "🔴"
         } else if p.deadline_pct >= 80 {
             "⚠️ "
@@ -79,9 +87,17 @@ fn print_live_subprocesses(snap: &[ProcessInfo]) {
         };
         let kind = p.kind.to_string();
         let owner = p.owner.agent.as_str();
+        let clock = if persistent { "idle" } else { "" };
         println!(
-            "{icon} {kind:<8} {:<8} {:<14} {:<30} {}s / {}s ({}%)",
-            p.pid, owner, p.label, p.age_seconds, p.deadline_seconds, p.deadline_pct
+            "{icon} {kind:<8} {:<8} {:<14} {:<30} {}{}s / {}s ({}%)",
+            p.pid, owner, p.label, clock, p.age_seconds, p.deadline_seconds, p.deadline_pct
+        );
+    }
+    if has_persistent {
+        println!();
+        println!(
+            "  persistent: AGE is time since the last answer; DEADLINE is the \
+             idle window before recycling."
         );
     }
 }

@@ -53,6 +53,11 @@ pub type ProcId = u64;
 pub enum ProcessKind {
     /// The agent process itself (fish / python / binary declared in `[run]`).
     Agent,
+    /// An agent declaring `[lifecycle] mode = "persistent"` — spawned once and
+    /// handed requests until it is recycled. Its `deadline` is not the length
+    /// of a run: it is whichever clock currently applies (the idle window
+    /// while nobody is talking to it, the request deadline while somebody is).
+    PersistentAgent,
     /// `dotagent-plugin-<name> info`.
     PluginInfo,
     /// `dotagent-plugin-<name> validate`.
@@ -73,6 +78,7 @@ impl std::fmt::Display for ProcessKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             ProcessKind::Agent => "agent",
+            ProcessKind::PersistentAgent => "persistent",
             ProcessKind::PluginInfo => "plugin_info",
             ProcessKind::PluginValidate => "plugin_validate",
             ProcessKind::Preflight => "preflight",
@@ -314,6 +320,77 @@ impl Supervisor {
         })
     }
 
+    /// Restart the deadline clock for a live entry, with a new deadline.
+    ///
+    /// A one-shot subprocess has one deadline for its whole life. A persistent
+    /// one has two, alternating: the request deadline while it is answering,
+    /// and the idle window while it is not. Rather than growing a second timer
+    /// beside the reaper, the pool re-points the reaper's existing clock at
+    /// whichever one currently applies — so an idle timeout is enforced by the
+    /// same sweep, with the same kill-tree, as every other deadline.
+    ///
+    /// Returns `false` when the entry is gone or the reaper has already
+    /// claimed it. Callers must read that as "this process is dead" and
+    /// respawn rather than write to it.
+    pub fn retime(&self, id: ProcId, deadline: Duration) -> bool {
+        let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
+        match reg.get_mut(&id) {
+            Some(entry) if !entry.killed_by_reaper => {
+                entry.started_instant = Instant::now();
+                entry.deadline = deadline;
+                entry.info_template.deadline_seconds = deadline.as_secs();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Kill one live entry: `SIGTERM` to its process group, grace, `SIGKILL`.
+    ///
+    /// The reaper kills on deadline and `shutdown` kills everything; this is
+    /// the third case — the caller decided, for its own reasons (an idle
+    /// instance evicted to make room, an invocation cap reached), that this
+    /// specific process should go. Emits `Finished { exit_code: None }` and
+    /// deregisters, so `status` stops showing it immediately.
+    ///
+    /// No-op when the id is unknown or already claimed by the reaper.
+    pub async fn terminate(&self, id: ProcId) {
+        let (pgid, owner, kind) = {
+            let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
+            match reg.get_mut(&id) {
+                Some(entry) if !entry.killed_by_reaper => {
+                    // Claim it the same way the reaper does, so a concurrent
+                    // sweep skips it and cannot double-emit.
+                    entry.killed_by_reaper = true;
+                    (
+                        entry.pgid,
+                        entry.info_template.owner.clone(),
+                        entry.info_template.kind,
+                    )
+                }
+                _ => return,
+            }
+        };
+        if let Some(pgid) = pgid {
+            let _ = signal::killpg(pgid, signal::SIGTERM);
+            tokio::time::sleep(self.inner.grace).await;
+            let _ = signal::killpg(pgid, signal::SIGKILL);
+        }
+        let elapsed = {
+            let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
+            reg.remove(&id)
+                .map(|e| e.started_instant.elapsed())
+                .unwrap_or_default()
+        };
+        self.inner.emit(SupervisorEvent::Finished {
+            id,
+            owner,
+            kind,
+            exit_code: None,
+            elapsed,
+        });
+    }
+
     /// Cloned snapshot of every live entry — never holds the registry lock
     /// across an `.await` point.
     pub fn snapshot(&self) -> Vec<ProcessInfo> {
@@ -475,6 +552,21 @@ impl SupervisedHandle {
 
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(|c| c.id())
+    }
+
+    /// Has the child exited already? Never blocks.
+    ///
+    /// A caller that holds a handle across many requests — rather than
+    /// awaiting it once — needs to know whether the process on the other end
+    /// of the pipe is still there before writing to it. Without this, the
+    /// first sign of a dead persistent agent is an `EPIPE` halfway through a
+    /// request.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        match self.child.as_mut() {
+            Some(child) => child.try_wait(),
+            // The child was already consumed by a `wait_*` call.
+            None => Ok(None),
+        }
     }
 
     /// Take ownership of the child's stdin pipe. Used by callers that need to

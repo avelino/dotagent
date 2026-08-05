@@ -23,6 +23,7 @@ use dotagent_core::{
     WindowState, TRIGGER_SCHEDULE_ID,
 };
 use dotagent_plugin::PluginClient;
+use dotagent_runner::persistent::PersistentPool;
 use dotagent_runner::{run_with_hooks, OrchestratedOutcome, RunContext, RunSpec};
 use dotagent_scheduler::{
     compute_next_event, expected_at, is_stale, should_retry, AgentSchedulePair, ResolvedPolicy,
@@ -124,6 +125,7 @@ pub(crate) async fn run_triggered(
     state: &StateStore,
     audit: &AuditLog,
     plugins: &PluginClient,
+    pool: Option<&PersistentPool>,
 ) -> Result<OrchestratedOutcome> {
     let agent = discovery::find_by_name(&req.agent)
         .with_context(|| format!("trigger names unknown agent '{}'", req.agent))?;
@@ -173,6 +175,7 @@ pub(crate) async fn run_triggered(
         plugins: Some(plugins),
         audit: Some(audit),
         supervisor: Some(plugins.supervisor()),
+        persistent: pool,
     };
     run_with_hooks(spec, &ctx).await.map_err(Into::into)
 }
@@ -187,12 +190,13 @@ async fn handle_trigger(
     state: &StateStore,
     audit: &AuditLog,
     plugins: &PluginClient,
+    pool: &PersistentPool,
 ) {
     // Show "typing…" for as long as the run takes. A triggered run is seconds
     // to minutes of silence otherwise, which reads as the bot being broken.
     let typing = spawn_typing_indicator(&req);
 
-    let reply = match run_triggered(&req, state, audit, plugins).await {
+    let reply = match run_triggered(&req, state, audit, plugins, Some(pool)).await {
         Ok(OrchestratedOutcome::Ran(outcome)) if outcome.exit_code == 0 => {
             if outcome.stdout_tail.trim().is_empty() {
                 format!("{} finished with no output.", req.agent)
@@ -662,6 +666,11 @@ pub async fn run() -> Result<()> {
         Duration::from_secs(2),
     );
     let plugins = PluginClient::from_environment().with_supervisor(supervisor.clone());
+    // Live processes for `[lifecycle] mode = "persistent"` agents. Shares the
+    // singleton supervisor, so an instance is as visible and as reapable as a
+    // one-shot run — which is the whole reason this lives in the orchestrator
+    // rather than beside it.
+    let pool = PersistentPool::new(supervisor.clone());
     let cache = ManifestCache::from_home().context("opening manifest cache")?;
 
     // Write our PID so `dotagent reload` / `dotagent status` can find us.
@@ -718,7 +727,13 @@ pub async fn run() -> Result<()> {
     let exit_reason = loop {
         let cycle_start = Local::now();
         let TickResult { next_event, .. } =
-            tick_once(&state, &audit, &plugins, &cache, cycle_start).await;
+            tick_once(&state, &audit, &plugins, &cache, Some(&pool), cycle_start).await;
+
+        // Collect persistent instances the reaper took while nobody was
+        // looking. The reaper kills a process; it does not know the pool
+        // exists, and an idle conversation might not send another message for
+        // days — so without this the recycle would go unrecorded until then.
+        pool.sweep(Some(&audit)).await;
 
         // Daily summary at 22:45 local time. Fires once per day; the
         // `last_summary_date` guard avoids double-fire when the daemon
@@ -773,10 +788,15 @@ pub async fn run() -> Result<()> {
                     handle.abort();
                 }
                 telegram = start_telegram_ingress(&reloaded.telegram, &trigger_tx, &audit);
+                // Same reasoning as restarting the ingress: a persistent
+                // instance was spawned from the manifest as it read then, and
+                // leaving it up would make the reload look applied while the
+                // behavior stayed put.
+                pool.reload(Some(&audit)).await;
                 continue;
             }
             Some(req) = trigger_rx.recv() => {
-                handle_trigger(req, &state, &audit, &plugins).await;
+                handle_trigger(req, &state, &audit, &plugins, &pool).await;
                 continue;
             }
             _ = sigterm.recv() => break "SIGTERM",
@@ -788,6 +808,10 @@ pub async fn run() -> Result<()> {
     // Graceful supervisor shutdown — SIGTERM every live subprocess, wait
     // grace, SIGKILL stragglers. Without this, daemon exit would orphan
     // long-running plugin invocations.
+    // Retire persistent instances first: `supervisor.shutdown` would reap
+    // them either way, but as anonymous subprocesses. Going through the pool
+    // writes down which conversation each one was holding.
+    pool.shutdown(Some(&audit)).await;
     let pre_shutdown_live = supervisor.snapshot().len();
     if pre_shutdown_live > 0 {
         info!(
@@ -923,6 +947,7 @@ pub async fn tick_once(
     audit: &AuditLog,
     plugins: &PluginClient,
     cache: &ManifestCache,
+    pool: Option<&PersistentPool>,
     now: DateTime<Local>,
 ) -> TickResult {
     let found = discovery::discover();
@@ -946,7 +971,7 @@ pub async fn tick_once(
         agents_scanned: agents.len() as u32,
     });
 
-    let runs_dispatched = dispatch_due_runs(&agents, state, audit, plugins, now).await;
+    let runs_dispatched = dispatch_due_runs(&agents, state, audit, plugins, pool, now).await;
     let next_event = compute_next_event_from_agents(&agents, state, now);
 
     let _ = audit.append(AuditEvent::TickCompleted {
@@ -1110,6 +1135,7 @@ pub(crate) async fn dispatch_due_runs(
     state: &StateStore,
     audit: &AuditLog,
     plugins: &PluginClient,
+    pool: Option<&PersistentPool>,
     now: DateTime<Local>,
 ) -> u32 {
     let mut dispatched = 0u32;
@@ -1118,7 +1144,7 @@ pub(crate) async fn dispatch_due_runs(
             continue;
         }
         for sched in &agent.manifest.schedules {
-            if dispatch_one(agent, sched, state, audit, plugins, now).await {
+            if dispatch_one(agent, sched, state, audit, plugins, pool, now).await {
                 dispatched += 1;
             }
         }
@@ -1127,12 +1153,14 @@ pub(crate) async fn dispatch_due_runs(
 }
 
 /// Returns `true` if a run was dispatched (regardless of outcome).
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_one(
     agent: &DiscoveredAgent,
     sched: &Schedule,
     state: &StateStore,
     audit: &AuditLog,
     plugins: &PluginClient,
+    pool: Option<&PersistentPool>,
     now: DateTime<Local>,
 ) -> bool {
     let dctx = DaemonCtx {
@@ -1227,6 +1255,7 @@ async fn dispatch_one(
         plugins: Some(plugins),
         audit: Some(audit),
         supervisor: Some(plugins.supervisor()),
+        persistent: pool,
     };
 
     let outcome = match run_with_hooks(spec, &ctx).await {

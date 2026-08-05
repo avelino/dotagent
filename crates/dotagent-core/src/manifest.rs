@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::lifecycle::LifecycleConfig;
 use crate::security::SecurityConfig;
 
 // Re-export so manifest authors can refer to `dotagent_core::NotifierEntry`.
@@ -25,6 +26,10 @@ pub struct AgentManifest {
     pub run: RunConfig,
     #[serde(default)]
     pub env: Option<EnvConfig>,
+    /// How long one process lives. Absent = `oneshot`, the shape every agent
+    /// had before this section existed.
+    #[serde(default)]
+    pub lifecycle: LifecycleConfig,
     #[serde(default)]
     pub defaults: ScheduleDefaults,
     #[serde(default, rename = "schedules")]
@@ -242,6 +247,80 @@ impl AgentManifest {
                 )));
             }
         }
+        self.lifecycle
+            .validate(self.agent.timeout_seconds)
+            .map_err(Error::InvalidManifest)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lifecycle::{LifecycleMode, DEFAULT_IDLE_TIMEOUT_SECONDS};
+
+    fn parse(extra: &str) -> Result<AgentManifest> {
+        let raw = format!(
+            r#"
+            [agent]
+            name = "x"
+            [run]
+            command = "bash"
+            {extra}
+            "#
+        );
+        let manifest: AgentManifest = toml::from_str(&raw).map_err(Error::from)?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    #[test]
+    fn a_manifest_without_lifecycle_is_oneshot() {
+        let m = parse("").unwrap();
+        assert_eq!(m.lifecycle.mode, LifecycleMode::Oneshot);
+        assert!(!m.lifecycle.is_persistent());
+    }
+
+    #[test]
+    fn declaring_the_mode_is_enough_to_opt_in() {
+        let m = parse("[lifecycle]\nmode = \"persistent\"").unwrap();
+        assert!(m.lifecycle.is_persistent());
+        assert_eq!(
+            m.lifecycle.idle_timeout_seconds,
+            DEFAULT_IDLE_TIMEOUT_SECONDS
+        );
+    }
+
+    #[test]
+    fn lifecycle_fields_override_the_defaults() {
+        let m = parse(
+            r#"[lifecycle]
+            mode = "persistent"
+            idle_timeout_seconds = 60
+            max_invocations = 5
+            startup_timeout_seconds = 10
+            key = "chat_id"
+            max_instances = 2"#,
+        )
+        .unwrap();
+        assert_eq!(m.lifecycle.idle_timeout_seconds, 60);
+        assert_eq!(m.lifecycle.max_invocations, 5);
+        assert_eq!(m.lifecycle.startup_timeout_seconds, 10);
+        assert_eq!(m.lifecycle.key.as_deref(), Some("chat_id"));
+        assert_eq!(m.lifecycle.max_instances, 2);
+    }
+
+    #[test]
+    fn an_impossible_startup_window_fails_the_manifest() {
+        // agent.timeout_seconds defaults to 1800; a longer handshake window
+        // means the first message can never land.
+        let err = parse("[lifecycle]\nmode = \"persistent\"\nstartup_timeout_seconds = 3600")
+            .unwrap_err();
+        assert!(err.to_string().contains("startup_timeout_seconds"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_mode_is_a_parse_error_not_a_silent_oneshot() {
+        assert!(parse("[lifecycle]\nmode = \"forever\"").is_err());
     }
 }

@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod frontmatter;
 pub mod heartbeat;
+pub mod lifecycle;
 pub mod manifest;
 pub mod security;
 pub mod skill;
@@ -24,6 +25,7 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub use heartbeat::Heartbeat;
+pub use lifecycle::{LifecycleConfig, LifecycleMode};
 pub use manifest::{
     AgentManifest, AgentMeta, EnvConfig, PluginRef, RunConfig, Schedule, ScheduleDefaults,
 };

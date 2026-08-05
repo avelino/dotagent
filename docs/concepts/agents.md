@@ -356,7 +356,9 @@ inherited environment (unless `env.inherit = false` in the manifest):
 | `AGENT_SLUG`           | derived slug for the heartbeat (from args)            |
 | `AGENT_START_EPOCH`    | epoch seconds of `started_at`                         |
 | `AGENT_ARGV`           | JSON array of the schedule's `args`                   |
-| `AGENT_TRIGGER_*`      | only on [triggered](triggers.md) runs — source, actor, reply handle, payload |
+| `AGENT_TRIGGER_*`      | only on [triggered](triggers.md) runs — source, actor, reply handle, payload. **Not set** for a [persistent](lifecycle.md) agent. |
+| `AGENT_LIFECYCLE`      | `persistent` when the agent stays alive between runs; absent otherwise |
+| `AGENT_PERSIST_KEY`    | which slice a persistent instance answers for              |
 | `AGENT_HEARTBEAT_FILE` | path to the heartbeat file (empty if `dry_run`)       |
 
 Use them. Don't reinvent (no need for your own tempdir, no need to write
@@ -572,6 +574,11 @@ For a **complete agent that calls a model**, see
 [`examples/hn-digest/`](../../examples/hn-digest/) — collect with `curl`,
 one `claude -p` call for the judgment, deterministic render into a sink.
 
+For an agent that **stays alive between runs**, see
+[`examples/hello-persistent/`](../../examples/hello-persistent/) — the whole
+JSON-lines protocol in about twenty lines of bash. Why you would want that is
+in [`lifecycle.md`](lifecycle.md).
+
 ---
 
 ## Related docs
@@ -580,5 +587,7 @@ one `claude -p` call for the judgment, deterministic render into a sink.
 - [`plugins.md`](plugins.md) — what plugins are and how to use/build them
 - [`notifications.md`](notifications.md) — built-in notifier drivers
 - [`plugin-protocol.md`](../reference/plugin-protocol.md) — protocol spec for plugins
+- [`lifecycle.md`](lifecycle.md) — agents kept alive between runs
+- [`persistent-protocol.md`](../reference/persistent-protocol.md) — their wire format
 - [`migrating-from-fish.md`](../guides/migrating-from-fish.md) — for users of the legacy framework
 - [`threat-model.md`](../security/threat-model.md) — security considerations

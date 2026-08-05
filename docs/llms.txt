@@ -190,6 +190,12 @@ env_passthrough = ["PATH", "HOME", "LANG"]
 | `[[schedules]]`| `interval_minutes`     | int             | interval | —                      |
 | `[[schedules]]`| `expression`           | string          | expr     | — (systemd OnCalendar) |
 | `[[schedules]]`| `args`                 | `string[]`      | no       | `[]`                   |
+| `[lifecycle]`  | `mode`                 | `oneshot`/`persistent` | no | `oneshot`           |
+| `[lifecycle]`  | `key`                  | string          | no       | — (single instance)    |
+| `[lifecycle]`  | `idle_timeout_seconds` | int             | no       | `1800`                 |
+| `[lifecycle]`  | `max_invocations`      | int             | no       | `120` (`0` = unlimited)|
+| `[lifecycle]`  | `max_instances`        | int             | no       | `8`                    |
+| `[lifecycle]`  | `startup_timeout_seconds` | int          | no       | `30`                   |
 | `[[preflight]]`| `plugin`               | string          | yes      | —                      |
 | `[[preflight]]`| `config`               | table           | no       | `{}`                   |
 | `[[preflight]]`| `timeout_seconds`      | int             | no       | `30`                   |
@@ -241,6 +247,12 @@ above, so a payload can never redefine `AGENT_NAME` or
 When the sender invoked a command, the payload also carries
 `{"command":{"name":"standup","args":"disk-alert"}}` — the resolved catalog
 name, ready to pass to `command-get`. It is `null` for ordinary prose.
+
+A **persistent** agent gets none of those four (see §19b): the environment
+is fixed at spawn and that process answers many messages, so the trigger
+rides in each request frame instead. It gets `AGENT_LIFECYCLE=persistent`
+and `AGENT_PERSIST_KEY=<key>`, and its `AGENT_TMPDIR` survives between
+requests rather than being fresh per run.
 
 The message body travels in `AGENT_TRIGGER_PAYLOAD`, never in argv.
 When the sender used Telegram's reply, `reply_to_text` carries what they
@@ -949,6 +961,59 @@ wrongly about what it can do.
 
 ---
 
+## 19b. Lifecycle — agents kept alive between runs
+
+Default is one process per event: spawn, run, exit. `[lifecycle] mode =
+"persistent"` keeps the process alive and delivers requests to it, which
+matters for anything holding state a fresh process would have to rebuild
+(a conversation, a warm cache, an open connection). Measured on a chat
+bot: 4.94s per forked message vs **1.90s** on a live process.
+
+```toml
+[lifecycle]
+mode = "persistent"
+key = "chat_id"          # one process per conversation; absent = one total
+idle_timeout_seconds = 1800
+max_invocations = 120    # recycle before a long conversation degrades it
+max_instances = 8        # past this, the least recently used is evicted
+startup_timeout_seconds = 30
+```
+
+The agent's shape changes with it — **one JSON object per line, both
+ways**. stdout is the channel, stderr is the log:
+
+```
+→ stdin   {"v":1,"kind":"hello","agent":"x","key":"12345"}
+← stdout  {"v":1,"kind":"ready","ok":true}
+→ stdin   {"v":1,"kind":"request","id":"1","deadline_seconds":600,
+           "trigger":{"source":"telegram","payload":{"text":"…","chat_id":12345}}}
+← stdout  {"v":1,"kind":"response","id":"1","ok":true,"output":"the answer"}
+```
+
+Rules that bite if you skip them:
+
+- **`AGENT_TRIGGER_*` does not exist here.** An environment is fixed at
+  spawn and this process sees many messages; the context is in the
+  `trigger` field of each request. `AGENT_LIFECYCLE=persistent` and
+  `AGENT_PERSIST_KEY=<key>` are set instead.
+- **`[agent] timeout_seconds` is the deadline for one request**, not the
+  process lifetime. Exceeding it recycles the instance.
+- **Echo `id` back.** A frame whose `id` is not the one in flight is
+  dropped — that is what stops a late answer from being handed to the
+  next question.
+- A line that does not parse is dropped, not fatal. Put logs on stderr
+  anyway.
+- `AGENT_TMPDIR` belongs to the instance, so it survives between requests.
+- A persistent dispatcher **without `key`** puts every conversation into
+  one process, and whatever it remembers from one sender answers the
+  next. `doctor` warns about it.
+
+Minimum viable agent: `while read -r line`, answer `ready` to `hello`,
+answer `{"id":…,"output":…}` to `request`. See
+`examples/hello-persistent/`.
+
+---
+
 ## 20. Deep dives (when this digest isn't enough)
 
 - Full schema: `docs/reference/agent-spec.md`
@@ -966,6 +1031,8 @@ wrongly about what it can do.
 - Config reference (`config.toml`): `docs/guides/config-reference.md`
 - LLM agents (`claude -p`, headless gotchas): `docs/guides/llm-agents.md`
 - Triggers (event-caused runs): `docs/concepts/triggers.md`
+- Lifecycle (persistent agents): `docs/concepts/lifecycle.md`
+- Persistent protocol (JSON lines): `docs/reference/persistent-protocol.md`
 - Telegram (inbound chat): `docs/concepts/telegram.md`
 - Memory (facts across conversations): `docs/concepts/memory.md`
 - MCP server (agents as tools): `docs/reference/mcp.md`
@@ -975,7 +1042,8 @@ wrongly about what it can do.
 - Worked examples: `examples/hello-fish/`, `examples/hello-python/`,
   `examples/hello-go/`, `examples/hello-rust/`, `examples/disk-alert/`,
   `examples/hn-digest/` (bash + `claude -p`),
-  `examples/telegram-assistant/` (trigger + MCP + `claude -p`)
+  `examples/telegram-assistant/` (trigger + MCP + `claude -p`),
+  `examples/hello-persistent/` (`[lifecycle] mode = "persistent"`)
 
 ---
 

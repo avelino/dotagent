@@ -316,3 +316,159 @@ async fn event_handler_observes_started_and_finished() {
     let events = log.lock().unwrap().clone();
     assert_eq!(events, vec!["started", "finished"]);
 }
+
+// ---------------------------------------------------------------------------
+// Persistent-agent primitives: a process the caller holds across many
+// requests instead of awaiting once.
+// ---------------------------------------------------------------------------
+
+fn persistent_spec(label: &str, deadline_ms: u64) -> SpawnSpec {
+    SpawnSpec {
+        kind: ProcessKind::PersistentAgent,
+        owner: ProcessOwner {
+            agent: "test".into(),
+            schedule: Some("trigger".into()),
+            hook_event: None,
+            plugin: None,
+        },
+        deadline: Duration::from_millis(deadline_ms),
+        label: label.into(),
+    }
+}
+
+/// The whole point of `retime`: the reaper's clock can be re-pointed, so an
+/// idle window and a request deadline take turns on one timer.
+#[tokio::test(flavor = "current_thread")]
+async fn retime_postpones_the_reaper() {
+    let sup = Supervisor::with_grace(Duration::from_millis(100));
+    let _reaper = sup.start_reaper(Duration::from_millis(50));
+
+    let mut handle = sup
+        .spawn_supervised(sh("sleep 30 & wait"), persistent_spec("warm", 300))
+        .await
+        .expect("spawn");
+    let id = handle.id();
+
+    // Keep pushing the deadline out past what the original 300ms would allow.
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(sup.retime(id, Duration::from_millis(300)), "still alive");
+    }
+
+    assert_eq!(sup.snapshot().len(), 1, "retime should have kept it alive");
+    assert!(
+        handle.try_wait().expect("try_wait").is_none(),
+        "process must still be running"
+    );
+
+    sup.terminate(id).await;
+}
+
+/// A shortened deadline is honoured on the next sweep — that is how an
+/// instance gets recycled for sitting idle.
+#[tokio::test(flavor = "current_thread")]
+async fn retime_to_a_shorter_deadline_lets_the_reaper_win() {
+    let sup = Supervisor::with_grace(Duration::from_millis(100));
+    let _reaper = sup.start_reaper(Duration::from_millis(50));
+
+    let mut handle = sup
+        .spawn_supervised(sh("sleep 30 & wait"), persistent_spec("idle", 30_000))
+        .await
+        .expect("spawn");
+    let id = handle.id();
+
+    assert!(sup.retime(id, Duration::from_millis(100)));
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    assert!(sup.snapshot().is_empty(), "reaper should have collected it");
+    assert!(
+        !sup.retime(id, Duration::from_secs(60)),
+        "retime on a collected entry must report the process is gone"
+    );
+    assert!(
+        handle.try_wait().expect("try_wait").is_some(),
+        "try_wait should see the exit"
+    );
+}
+
+/// `terminate` is the third way something dies: not a deadline, not a global
+/// shutdown, but the caller deciding this one process should go.
+#[tokio::test(flavor = "current_thread")]
+async fn terminate_kills_the_tree_and_deregisters() {
+    let sup = Supervisor::with_grace(Duration::from_millis(150));
+    let mut handle = sup
+        .spawn_supervised(sh("sleep 30 & wait"), persistent_spec("evicted", 30_000))
+        .await
+        .expect("spawn");
+    let id = handle.id();
+    let pgid = handle.pid().expect("pid") as i32;
+
+    sup.terminate(id).await;
+
+    assert!(sup.snapshot().is_empty(), "entry must be gone");
+    assert!(
+        handle.try_wait().expect("try_wait").is_some(),
+        "child must have exited"
+    );
+
+    // Nothing from the group may still be running — the grandchild `sleep`
+    // included.
+    let out = std::process::Command::new("ps")
+        .args(["-g", &pgid.to_string(), "-o", "stat="])
+        .output()
+        .expect("ps");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout
+            .lines()
+            .all(|l| l.trim().starts_with('Z') || l.trim().is_empty()),
+        "process group {pgid} should be dead, ps stdout=\n{stdout}"
+    );
+}
+
+/// Terminating twice, or terminating something the reaper already took, must
+/// not panic or emit a second event.
+#[tokio::test(flavor = "current_thread")]
+async fn terminate_is_idempotent_and_emits_once() {
+    use std::sync::{Arc, Mutex};
+
+    let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = log.clone();
+    let sup = Supervisor::with_grace(Duration::from_millis(50)).with_event_handler(Arc::new(
+        move |evt: SupervisorEvent| {
+            if let SupervisorEvent::Finished { .. } = evt {
+                log_clone.lock().unwrap().push("finished".to_string());
+            }
+        },
+    ));
+
+    let handle = sup
+        .spawn_supervised(sh("sleep 30 & wait"), persistent_spec("twice", 30_000))
+        .await
+        .expect("spawn");
+    let id = handle.id();
+
+    sup.terminate(id).await;
+    sup.terminate(id).await;
+    sup.terminate(999_999).await; // unknown id
+
+    assert_eq!(log.lock().unwrap().len(), 1, "exactly one Finished");
+}
+
+/// A handle held across requests reports liveness without blocking.
+#[tokio::test(flavor = "current_thread")]
+async fn try_wait_reports_liveness_without_blocking() {
+    let sup = Supervisor::with_grace(Duration::from_millis(100));
+    let mut handle = sup
+        .spawn_supervised(sh("sleep 0.2"), persistent_spec("short", 30_000))
+        .await
+        .expect("spawn");
+
+    assert!(
+        handle.try_wait().expect("try_wait").is_none(),
+        "still alive"
+    );
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let status = handle.try_wait().expect("try_wait").expect("exited");
+    assert!(status.success());
+}

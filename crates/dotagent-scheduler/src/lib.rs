@@ -407,6 +407,7 @@ mod tests {
                 working_dir: None,
             },
             env: None,
+            lifecycle: Default::default(),
             defaults: ScheduleDefaults {
                 max_retries: Some(3),
                 retry_backoff_minutes: Some(vec![5, 15, 30]),
