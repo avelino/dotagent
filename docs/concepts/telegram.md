@@ -83,6 +83,20 @@ What it does with the message is entirely up to it. [`examples/telegram-assistan
 
 dotagent itself interprets nothing. There is no model, no provider and no prompt in the daemon.
 
+## Commands
+
+[Commands](commands.md) put a `/` menu in the chat. The daemon registers it with `setMyCommands` on start and every reload, scoped to each allowlisted chat rather than globally — the allowlist gates execution already, but a global menu would publish every command name to anyone who finds the bot.
+
+An invoked command arrives beside the text rather than instead of it:
+
+```json
+{ "text": "/standup disk-alert", "command": { "name": "standup", "args": "disk-alert" } }
+```
+
+`command` is `null` for ordinary prose. The daemon parses `/name args` — Telegram wire syntax, the same class of thing as reading `update_id` — and stops there. Resolving a name to a prompt is `command-get`, over MCP, and belongs to the dispatcher.
+
+Two answers do come straight from the daemon: `/help` and "no command named /typo". Both are questions about *what exists*, which is the catalog the daemon already publishes. Letting `/typo` fall through would mean a model improvising an answer to something meant to be exact.
+
 ## Replies
 
 The dispatcher's stdout goes back to the chat that asked. Sent as plain text, not MarkdownV2 — the body is agent output, and an unescaped backtick or underscore in a log line would otherwise turn into a Bot API 400. Delivery beats formatting.
@@ -113,5 +127,6 @@ Message bodies do not reach the audit log. `trigger_received` records the sender
 
 - [Triggers](triggers.md) — the general concept
 - [MCP server](../reference/mcp.md) — how a model picks an agent
+- [Skills](skills.md) — teaching the dispatcher a procedure without growing its prompt
 - [Threat model](../security/threat-model.md) — what changes when this is on
 - [Notifications](notifications.md) — the outbound driver

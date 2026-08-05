@@ -72,6 +72,16 @@ rate_limit_per_minute = 10           # accepted messages per sender
 [memory]
 enabled = true                       # default; false removes the memory tools
 workspace = ""                       # empty = $DOTAGENT_HOME/outl
+
+[skills]
+enabled = true                       # default; false removes the skill tools
+claude_skills = true                 # default; also read ~/.claude/skills
+paths = []                           # extra roots, searched before the defaults
+
+[commands]
+enabled = true                       # default; false removes the menu and tools
+claude_commands = false              # default; opt in to ~/.claude/commands
+paths = []                           # extra roots, searched before the defaults
 ```
 
 ---
@@ -120,6 +130,45 @@ The default workspace is scaffolded when the daemon starts, so memory works with
 Pointing this at a workspace you already use puts what an agent remembers next to your own notes, synced to your peers. Convenient, and also means an agent writes where you write.
 
 Full behavior in [Memory](../concepts/memory.md).
+
+---
+
+## `[skills]`
+
+Procedures exposed to MCP clients as `skill-*` tools. On by default, with an empty catalog that costs nothing.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Expose `skill-*`, `skill-read` and `skill-run` from `dotagent mcp`. |
+| `claude_skills` | `true` | Also search `~/.claude/skills/` and `$CWD/.claude/skills/`. |
+| `paths` | `[]` | Extra roots, each holding one subdirectory per skill. Searched **first**, so a name declared here overrides one found later. |
+
+`claude_skills` defaults to on because the skills worth exposing are usually already written for Claude Code, and requiring a copy would mean two versions drifting apart. Turn it off when that catalog is large and mostly irrelevant to an assistant that has no shell.
+
+---
+
+## `[commands]`
+
+Procedures **you** invoke by name, published as a Telegram menu and resolved through `command-get`. On by default, with an empty catalog that costs nothing. See [Commands](../concepts/commands.md).
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Register the `/` menu and expose `command-get` / `command-list`. |
+| `claude_commands` | `false` | Also search `~/.claude/commands/` and `$CWD/.claude/commands/`. |
+| `paths` | `[]` | Extra roots, each holding one `.md` file per command. Searched **first**, so a name declared here overrides one found later. |
+
+`claude_commands` defaults to **off**, unlike `claude_skills`. A skill costs a line in a list until a model judges it relevant; a command is published as a menu, and a Claude Code catalog is typically full of things that assume a shell and a working directory. Menu entries that cannot work are worse than absent ones. Turn it on when the catalog was written for an assistant rather than a terminal.
+
+Use `paths` for a bundle that keeps its skills one level down — discovery does not walk recursively:
+
+```toml
+[skills]
+paths = ["/Users/me/.claude/skills/radar/skills"]
+```
+
+`dotagent doctor` reports how many skills were found, which failed to parse, and any two names that collapse to the same tool name.
+
+Full behavior in [Skills](../concepts/skills.md).
 
 ---
 

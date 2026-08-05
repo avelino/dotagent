@@ -218,14 +218,96 @@ pub fn run_input_schema() -> serde_json::Value {
     })
 }
 
-/// Turn an agent name into a valid MCP tool name.
+/// JSON Schema for `skill-<name>`: no arguments. Loading a procedure is not a
+/// call that needs tuning — the model either wants it or does not.
+pub fn skill_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for `skill-read`.
+pub fn skill_read_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "skill": { "type": "string", "description": "Skill name, as listed in the catalog." },
+            "path": {
+                "type": "string",
+                "description": "File to read, relative to the skill directory — one of the paths \
+    the skill listed. Absolute paths and `..` are refused."
+            }
+        },
+        "required": ["skill", "path"],
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for `skill-run`.
+pub fn skill_run_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "skill": { "type": "string", "description": "Skill name, as listed in the catalog." },
+            "script": {
+                "type": "string",
+                "description": "Executable to run, relative to the skill directory. Must live \
+    under scripts/ and carry the executable bit."
+            },
+            "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Arguments passed to the script. Never interpreted by a shell."
+            }
+        },
+        "required": ["skill", "script"],
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for `command-get`.
+pub fn command_get_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "Command name, exactly as it arrived in the trigger payload's \
+    command.name — not a guess and not a rewording."
+            },
+            "args": {
+                "type": "string",
+                "description": "Everything the sender typed after the command name, verbatim. \
+    Pass command.args through unchanged."
+            }
+        },
+        "required": ["name"],
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for `command-list`: no arguments.
+pub fn command_list_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    })
+}
+
+/// Turn a skill name into a valid MCP tool name.
 ///
-/// MCP restricts tool names to `[a-zA-Z0-9_-]`, which agent names are not
-/// bound by. The mapping is lossy (`a.b` and `a-b` both become `a-b`), so the
-/// caller must detect collisions rather than assume this is injective.
-pub fn tool_name_for(agent: &str) -> String {
-    let sanitized: String = agent
-        .chars()
+/// Same sanitizer as [`tool_name_for`], different prefix — which is what keeps
+/// a skill from ever colliding with an agent. Two *skills* can still collide,
+/// so the caller dedupes the same way.
+pub fn skill_tool_name_for(skill: &str) -> String {
+    format!("skill-{}", sanitize(skill))
+}
+
+fn sanitize(name: &str) -> String {
+    name.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
                 c
@@ -233,8 +315,16 @@ pub fn tool_name_for(agent: &str) -> String {
                 '-'
             }
         })
-        .collect();
-    format!("run-{sanitized}")
+        .collect()
+}
+
+/// Turn an agent name into a valid MCP tool name.
+///
+/// MCP restricts tool names to `[a-zA-Z0-9_-]`, which agent names are not
+/// bound by. The mapping is lossy (`a.b` and `a-b` both become `a-b`), so the
+/// caller must detect collisions rather than assume this is injective.
+pub fn tool_name_for(agent: &str) -> String {
+    format!("run-{}", sanitize(agent))
 }
 
 #[cfg(test)]
@@ -291,11 +381,50 @@ mod tests {
     }
 
     #[test]
+    fn skill_tool_names_use_their_own_prefix() {
+        assert_eq!(skill_tool_name_for("weekly"), "skill-weekly");
+        // The namespaced form Claude Code writes: `plugin:skill`.
+        assert_eq!(
+            skill_tool_name_for("dotagent:doc-review"),
+            "skill-dotagent-doc-review"
+        );
+    }
+
+    #[test]
+    fn a_skill_can_never_collide_with_an_agent() {
+        // Distinct prefixes are the whole guarantee — worth a test, because
+        // dropping one would silently let a skill shadow a runnable agent.
+        assert_ne!(skill_tool_name_for("x"), tool_name_for("x"));
+    }
+
+    #[test]
     fn call_tool_result_marks_agent_failure_without_jsonrpc_error() {
         let r = CallToolResult::text("exited 1", true);
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""isError":true"#), "{s}");
         assert!(s.contains(r#""type":"text""#), "{s}");
+    }
+
+    #[test]
+    fn args_means_a_list_for_an_agent_and_a_string_for_a_command() {
+        // Not an accident to be harmonized away. An agent's args are argv; a
+        // command's are whatever the sender typed after the name, spaces and
+        // all. The server must therefore parse `RunArguments` only after it
+        // knows the tool is an agent — parsing up front rejected
+        // `{"args": "src/"}` for `command-get` with the *agent* schema's error.
+        let type_of = |schema: serde_json::Value| {
+            schema["properties"]["args"]["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(type_of(run_input_schema()), "array");
+        assert_eq!(type_of(command_get_input_schema()), "string");
+
+        assert!(
+            serde_json::from_value::<RunArguments>(serde_json::json!({"args": "src/"})).is_err(),
+            "a string would have to be rejected, which is why order matters"
+        );
     }
 
     #[test]

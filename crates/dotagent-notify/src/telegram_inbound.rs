@@ -260,6 +260,72 @@ pub async fn reply(bot_token: &str, chat_id: i64, reply_to: Option<i64>, text: &
     .await
 }
 
+// ---------------------------------------------------------------------
+// Command menu
+// ---------------------------------------------------------------------
+
+/// Telegram's cap on a command description.
+const MAX_COMMAND_DESCRIPTION: usize = 256;
+
+/// One entry in the `/` menu.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BotCommand {
+    /// Already in Telegram's `[a-z0-9_]{1,32}` form — the caller owns that
+    /// mapping, because it is also the one it must dedupe on.
+    pub command: String,
+    pub description: String,
+}
+
+impl BotCommand {
+    pub fn new(command: impl Into<String>, description: impl Into<String>) -> Self {
+        let description = description.into();
+        let description = description.trim();
+        // Telegram rejects the whole batch over one long description, which
+        // would cost every other command its menu entry.
+        let description = if description.chars().count() > MAX_COMMAND_DESCRIPTION {
+            description
+                .chars()
+                .take(MAX_COMMAND_DESCRIPTION - 1)
+                .collect::<String>()
+                + "…"
+        } else {
+            description.to_string()
+        };
+        Self {
+            command: command.into(),
+            description,
+        }
+    }
+}
+
+/// Publish the `/` menu to one chat.
+///
+/// Scoped to a single chat rather than `BotCommandScopeDefault`. The allowlist
+/// already gates execution, so a default-scope menu would not be an
+/// authorization hole — but it would publish every command name and description
+/// to anyone who finds the bot, and those names are not always things worth
+/// making public. Per-chat costs one call per allowlisted id and leaks nothing.
+///
+/// An empty list is meaningful: it clears the menu. A command you deleted must
+/// stop being offered, or the menu keeps promising something that no longer
+/// resolves.
+pub async fn set_my_commands(bot_token: &str, chat_id: i64, commands: &[BotCommand]) -> Result<()> {
+    let token = expand_env(bot_token).map_err(NotifyError::Config)?;
+    let url = format!("https://api.telegram.org/bot{token}/setMyCommands");
+    let body = serde_json::json!({
+        "commands": commands,
+        "scope": { "type": "chat", "chat_id": chat_id },
+    });
+    match client().post(&url).json(&body).send().await {
+        Ok(r) if r.status().is_success() => Ok(()),
+        Ok(r) => Err(NotifyError::Backend(format!(
+            "telegram setMyCommands returned {}",
+            r.status()
+        ))),
+        Err(e) => Err(NotifyError::Backend(sanitize_reqwest_err(&e))),
+    }
+}
+
 /// How often to re-send the typing indicator.
 ///
 /// Telegram clears it after ~5s, so a run that takes 15 seconds needs the

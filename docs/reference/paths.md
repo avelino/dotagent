@@ -33,6 +33,8 @@ Everything below is relative to this root.
 ```text
 $DOTAGENT_HOME/
 ├── agents/                       # YOUR manifests (or symlinks to them)
+├── skills/                       # YOUR procedures (optional; also read from ~/.claude/skills)
+├── commands/                     # YOUR commands (optional; one .md each)
 ├── plugins/                      # YOUR custom plugin binaries (optional)
 ├── config.toml                   # global config (optional)
 ├── secrets.env                   # daemon-loaded KEY=VALUE secrets (optional, 0600)
@@ -44,6 +46,8 @@ $DOTAGENT_HOME/
 | Path             | Who writes         | Who reads           | Notes                                                                  |
 |------------------|--------------------|---------------------|------------------------------------------------------------------------|
 | `agents/`        | **you**            | daemon, CLI         | Manifests OR symlinks to manifests living elsewhere (e.g., dotfiles).  |
+| `skills/`        | **you** (optional) | `dotagent mcp`      | One directory per procedure. `~/.claude/skills/` is searched too, so a skill written for Claude Code needs no copy. See [`concepts/skills.md`](../concepts/skills.md). |
+| `commands/`      | **you** (optional) | daemon, `dotagent mcp` | One `.md` per command, subdirectories namespaced with `:`. Published as the Telegram menu. `~/.claude/commands/` is **not** searched unless `[commands] claude_commands = true`. See [`concepts/commands.md`](../concepts/commands.md). |
 | `plugins/`       | **you**            | `PluginClient`      | Per-user plugin binaries. Skip if you install plugins via brew / cargo. |
 | `config.toml`    | **you** (optional) | daemon              | Schema in [`config-reference.md`](../guides/config-reference.md).      |
 | `secrets.env`    | **you** (optional) | daemon              | KEY=VALUE secrets for `${VAR}` interpolation in notifier configs. **Must be mode 0600.** See [`concepts/secrets.md`](../concepts/secrets.md). |
@@ -78,6 +82,64 @@ agents/<name>/
 Each direct subdirectory of a search root that has an `agent.toml`
 becomes one agent. dotagent indexes by `agent.name` from the manifest,
 not by directory name — duplicates resolve to first-found.
+
+---
+
+## `skills/<name>/`
+
+Each direct subdirectory containing a `SKILL.md` is a skill — a procedure an
+assistant loads on demand, not something that runs on a schedule.
+
+```text
+skills/<name>/
+├── SKILL.md            # REQUIRED — frontmatter (name, description) + procedure
+├── scripts/            # optional — the only files `skill-run` will execute
+└── references/         # optional — fetched one at a time with `skill-read`
+```
+
+**Discovery roots** (first match wins a name):
+
+1. `[skills] paths` from `config.toml`
+2. `$DOTAGENT_ROOT` and `$DOTAGENT_ROOT/skills`
+3. `$DOTAGENT_HOME/skills/` ← typical
+4. `~/.claude/skills/` and `$CWD/.claude/skills/` — unless
+   `[skills] claude_skills = false`
+5. `$CWD/skills/`
+
+Not scaffolded: an empty catalog is a valid state, and step 4 means a skill you
+already wrote for Claude Code is reachable without being copied. Symlinks work
+here the same way they do under `agents/`. See
+[`concepts/skills.md`](../concepts/skills.md).
+
+---
+
+## `commands/`
+
+Each `.md` file is one command — a prompt **you** invoke by name from the
+Telegram menu. Not a directory, unlike a skill: a command is text and nothing
+else, so there is nothing to package alongside it.
+
+```text
+commands/
+├── standup.md          # → /standup
+└── git/
+    └── status.md       # → /git_status  (namespaced `git:status`)
+```
+
+**Discovery roots** (first match wins a name):
+
+1. `[commands] paths` from `config.toml`
+2. `$DOTAGENT_ROOT/commands`
+3. `$DOTAGENT_HOME/commands/` ← typical
+4. `~/.claude/commands/` and `$CWD/.claude/commands/` — **only** when
+   `[commands] claude_commands = true`
+5. `$CWD/commands/`
+
+Step 4 is opt-in, the reverse of skills: a command becomes a published menu
+entry, and a Claude Code catalog usually assumes a shell it will not have.
+
+Nesting goes three levels deep. Not scaffolded, same as `skills/`. See
+[`concepts/commands.md`](../concepts/commands.md).
 
 ---
 

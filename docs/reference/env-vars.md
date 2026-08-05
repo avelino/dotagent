@@ -30,7 +30,7 @@ SDK to import.
 | `AGENT_TRIGGER_SOURCE` | string   | `telegram`                                         | Only on [triggered](../concepts/triggers.md) runs. One of `telegram`, `mcp`, `cli`. |
 | `AGENT_TRIGGER_ACTOR`  | string   | `123456789`                                        | Triggered runs, when the source can attest an identity. Telegram: numeric user id. |
 | `AGENT_TRIGGER_REPLY_TO` | string | `123456789`                                        | Triggered runs, when the source can be answered. Telegram: chat id. |
-| `AGENT_TRIGGER_PAYLOAD` | JSON object | `{"text":"how's disk?","chat_id":1,"user_id":2}` | Triggered runs. Body travels here, never in argv. |
+| `AGENT_TRIGGER_PAYLOAD` | JSON object | `{"text":"/standup x","chat_id":1,"user_id":2,"command":{"name":"standup","args":"x"}}` | Triggered runs. Body travels here, never in argv. `command` is present only when the sender invoked one — see [Commands](../concepts/commands.md#the-payload). |
 
 The positional `argv` of your process is `[run].command` + `[run].args`
 + schedule's `args`, so most scripts don't actually need `AGENT_ARGV`
@@ -102,6 +102,30 @@ DISK_FREE_MIN_PCT  = "20"
 Set `inherit = false` if you want a hermetic environment (no parent env
 leaks in — careful, that removes `$PATH` too unless you re-add it under
 `extra`).
+
+---
+
+## Injected into a skill script
+
+A [skill](../concepts/skills.md) may package executables under `scripts/`,
+which `skill-run` executes. Those get a **different, much smaller** set of
+variables — a skill script is not an agent run: it has no schedule, no
+heartbeat and no manifest.
+
+| Variable     | Type     | Example                                        | When                       |
+|--------------|----------|------------------------------------------------|----------------------------|
+| `SKILL_NAME` | string   | `triage`                                       | Always.                    |
+| `SKILL_DIR`  | abs path | `/Users/avelino/.config/dotagent/skills/triage` | Always — also the working directory. |
+
+Everything else in the environment is inherited from whatever spawned
+`dotagent mcp`. Arguments arrive through argv, never a shell string.
+
+```bash
+#!/usr/bin/env bash
+# scripts/report.sh — reach a sibling file without assuming the cwd.
+set -euo pipefail
+cat "$SKILL_DIR/references/template.md"
+```
 
 ---
 

@@ -48,6 +48,97 @@ pub struct Config {
     pub telegram: TelegramIngressConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub skills: SkillsConfig,
+    #[serde(default)]
+    pub commands: CommandsConfig,
+}
+
+/// Commands — procedures a human invokes by name, published as a Telegram menu.
+///
+/// On by default with an empty catalog, which costs nothing: no commands
+/// installed means no menu registered and no tools listed.
+///
+/// ```toml
+/// [commands]
+/// enabled = false                 # drop commands entirely
+/// claude_commands = true          # also search ~/.claude/commands
+/// paths = ["/opt/team-commands"]  # extra roots, searched first
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandsConfig {
+    /// Register the Telegram menu and expose the `command-*` tools.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Also search `~/.claude/commands` and `$CWD/.claude/commands`.
+    ///
+    /// **Off by default, unlike [`SkillsConfig::claude_skills`].** The two
+    /// catalogs are not equally safe to inherit. A skill is loaded only when a
+    /// model judges it relevant, so an irrelevant one costs a line in a list. A
+    /// command is *published as a menu* — and a Claude Code command catalog is
+    /// typically full of things that assume a shell and a working directory
+    /// (`/apply` switching a Nix profile, `/dx` opening a terminal layout).
+    /// Publishing those to a chat produces menu entries that cannot work, which
+    /// is worse than not listing them.
+    ///
+    /// Turn it on when the catalog is written for an assistant rather than for
+    /// a terminal.
+    #[serde(default)]
+    pub claude_commands: bool,
+    /// Extra directories to scan, each holding one `.md` file per command.
+    /// Searched before the defaults, so a name declared here wins.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+impl Default for CommandsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            claude_commands: false,
+            paths: Vec::new(),
+        }
+    }
+}
+
+/// Skills — procedures exposed to MCP clients as `skill-*` tools.
+///
+/// On by default with an empty catalog, which costs nothing: no skills
+/// installed means no tools listed.
+///
+/// ```toml
+/// [skills]
+/// enabled = false                  # drop skill tools entirely
+/// claude_skills = false            # stop searching ~/.claude/skills
+/// paths = ["/opt/team-skills"]     # extra roots, searched first
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillsConfig {
+    /// Expose skill tools from `dotagent mcp`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Also search `~/.claude/skills` and `$CWD/.claude/skills`.
+    ///
+    /// On by default: a skill written for Claude Code is the common case, and
+    /// asking someone to copy or symlink it first would make the feature look
+    /// broken on arrival. Turn it off when the Claude Code catalog is large
+    /// and mostly irrelevant to an assistant that has no shell.
+    #[serde(default = "default_true")]
+    pub claude_skills: bool,
+    /// Extra directories to scan, each holding one subdirectory per skill.
+    /// Searched before the defaults, so a name declared here wins.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            claude_skills: true,
+            paths: Vec::new(),
+        }
+    }
 }
 
 /// Long-term memory for agents, stored in an embedded outl workspace.
@@ -339,6 +430,50 @@ mod tests {
         let c = Config::default();
         assert!(!c.secrets.is_set());
         assert_eq!(c.secrets.file, "");
+    }
+
+    #[test]
+    fn skills_are_on_by_default_including_the_claude_catalog() {
+        let c = Config::default();
+        assert!(c.skills.enabled);
+        assert!(c.skills.claude_skills, "reuse is the default promise");
+        assert!(c.skills.paths.is_empty());
+    }
+
+    #[test]
+    fn skills_can_be_narrowed_from_toml() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(
+            &p,
+            "[skills]\nclaude_skills = false\npaths = [\"/opt/team\"]\n",
+        )
+        .unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(c.skills.enabled, "unset fields keep their default");
+        assert!(!c.skills.claude_skills);
+        assert_eq!(c.skills.paths, vec!["/opt/team".to_string()]);
+    }
+
+    #[test]
+    fn commands_are_on_by_default_but_the_claude_catalog_is_not() {
+        // The asymmetry with skills is deliberate: a command is published as a
+        // menu, and a terminal-shaped catalog would fill it with entries that
+        // cannot work in a chat.
+        let c = Config::default();
+        assert!(c.commands.enabled);
+        assert!(!c.commands.claude_commands);
+        assert!(c.commands.paths.is_empty());
+    }
+
+    #[test]
+    fn commands_can_be_widened_from_toml() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[commands]\nclaude_commands = true\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(c.commands.enabled, "unset fields keep their default");
+        assert!(c.commands.claude_commands);
     }
 
     #[test]

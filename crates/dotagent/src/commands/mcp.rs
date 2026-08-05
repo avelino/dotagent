@@ -157,8 +157,140 @@ fn tools_list() -> Result<serde_json::Value> {
         .collect();
     tools.extend(introspection_tools());
     tools.extend(memory_tools());
+    tools.extend(skill_tools());
+    tools.extend(command_tools());
 
     serde_json::to_value(ToolsListResult { tools }).context("serializing tool list")
+}
+
+/// Two tools for the whole command catalog — **not** one tool per command.
+///
+/// This is the one place commands deliberately break the pattern skills follow.
+/// A `skill-<name>` per skill is right because the model is meant to *choose*;
+/// the catalog is the menu it picks from. A command was already chosen, by a
+/// human, before the model saw anything. Publishing N command tools would
+/// re-open that decision — the model could pick `command-weekly-numbers` when
+/// the sender typed `/simplify`, which is precisely the failure commands exist
+/// to make impossible.
+///
+/// So the dispatcher resolves a name it was handed, and the model never browses.
+fn command_tools() -> Vec<Tool> {
+    if !commands_enabled() {
+        return Vec::new();
+    }
+    let found = crate::slash::discover();
+    for bad in &found.invalid {
+        warn!(path = %bad.path.display(), error = %bad.error, "skipping unloadable command");
+    }
+    if found.commands.is_empty() {
+        return Vec::new();
+    }
+    vec![
+        Tool {
+            name: "command-get".into(),
+            description: "Resolve a command the sender invoked into the prompt to follow. Pass \
+                command.name and command.args from the trigger payload exactly as they arrived. \
+                Returns the prompt — it does not perform it."
+                .into(),
+            input_schema: dotagent_mcp::command_get_input_schema(),
+        },
+        Tool {
+            name: "command-list".into(),
+            description: "List every installed command with what it does and what it takes. For \
+                answering \"what can you do?\" — not for choosing a command on the sender's \
+                behalf."
+                .into(),
+            input_schema: dotagent_mcp::command_list_input_schema(),
+        },
+    ]
+}
+
+fn commands_enabled() -> bool {
+    dotagent_core::Config::load(dotagent_state::paths::config_file())
+        .unwrap_or_default()
+        .commands
+        .enabled
+}
+
+/// One tool per installed skill, plus the two verbs that reach inside one.
+///
+/// A broken `SKILL.md` does **not** fail the catalog the way a broken manifest
+/// does. The blast radius is different: a manifest that fails to parse means an
+/// agent silently never runs, while a skill that fails to parse means a
+/// procedure is missing from an answer. `doctor` reports them; a model that
+/// still has its agents is more useful than an error.
+fn skill_tools() -> Vec<Tool> {
+    if !skills_enabled() {
+        return Vec::new();
+    }
+    let found = crate::skills::discover();
+    for bad in &found.invalid {
+        warn!(path = %bad.path.display(), error = %bad.error, "skipping unloadable skill");
+    }
+    if found.skills.is_empty() {
+        return Vec::new();
+    }
+
+    let mut tools: Vec<Tool> = skill_catalog(&found.skills)
+        .into_iter()
+        .map(|(name, skill)| Tool {
+            name,
+            // The description leads, because it is what the model matches on.
+            // The sentence after it exists because half these descriptions are
+            // written in the imperative ("Cut a new release") and a model could
+            // reasonably read the call itself as doing the thing.
+            description: format!(
+                "{}\n\nCalling this returns the written procedure — it does not perform it.",
+                skill.manifest.description.trim()
+            ),
+            input_schema: dotagent_mcp::skill_input_schema(),
+        })
+        .collect();
+
+    tools.push(Tool {
+        name: "skill-read".into(),
+        description: "Read a supporting file belonging to a skill — the reference documents a \
+            procedure points at. Use the paths the skill listed; nothing outside its directory \
+            is reachable."
+            .into(),
+        input_schema: dotagent_mcp::skill_read_input_schema(),
+    });
+    tools.push(Tool {
+        name: "skill-run".into(),
+        description: "Run an executable packaged inside a skill (its scripts/ directory) and \
+            return the output. Only for scripts a skill listed — this is not a shell."
+            .into(),
+        input_schema: dotagent_mcp::skill_run_input_schema(),
+    });
+    tools
+}
+
+/// Pair each skill with its tool name, dropping collisions. Same rule as
+/// [`catalog`]: sanitization is lossy, first discovered wins.
+fn skill_catalog(
+    skills: &[crate::skills::DiscoveredSkill],
+) -> Vec<(String, &crate::skills::DiscoveredSkill)> {
+    let mut out: Vec<(String, &crate::skills::DiscoveredSkill)> = Vec::with_capacity(skills.len());
+    for skill in skills {
+        let name = dotagent_mcp::skill_tool_name_for(&skill.manifest.name);
+        if out.iter().any(|(taken, _)| taken == &name) {
+            warn!(
+                skill = %skill.manifest.name,
+                tool = %name,
+                "tool name collides with an earlier skill — skipping"
+            );
+            continue;
+        }
+        out.push((name, skill));
+    }
+    out
+}
+
+fn skills_enabled() -> bool {
+    dotagent_core::Config::load(dotagent_state::paths::config_file())
+        .unwrap_or_default()
+        .skills
+        .enabled
 }
 
 /// Introspection tools. Always available — reading a log has nothing to do
@@ -456,6 +588,294 @@ fn call_memory(tool: &str, args: &serde_json::Value) -> Option<CallToolResult> {
     })
 }
 
+// -------------------------------------------------------------------------
+// Skills
+// -------------------------------------------------------------------------
+
+/// Cap on a procedure returned by `skill-<name>`.
+///
+/// A tool result is context. A skill long enough to evict what the assistant
+/// needs in order to *act* on it has defeated its own purpose, so the tail is
+/// dropped with a marker rather than silently — following half a procedure
+/// while believing it is whole is the failure worth preventing.
+const SKILL_BODY_MAX_BYTES: usize = 32 * 1024;
+
+/// Cap on a supporting file returned by `skill-read`. Larger than a procedure:
+/// reference material is asked for deliberately, one file at a time.
+const SKILL_FILE_MAX_BYTES: usize = 64 * 1024;
+
+/// Cap on what a script prints back.
+const SKILL_OUTPUT_MAX_BYTES: usize = 16 * 1024;
+
+/// Truncate on a char boundary, saying so.
+fn cap(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n\n[truncated: {} of {} bytes shown]",
+        &text[..end],
+        end,
+        text.len()
+    )
+}
+
+/// Serve a skill tool. `None` means "not a skill tool".
+async fn call_skill(tool: &str, args: &serde_json::Value) -> Option<CallToolResult> {
+    if !tool.starts_with("skill-") || !skills_enabled() {
+        return None;
+    }
+    match tool {
+        "skill-read" => Some(read_skill_file(args)),
+        "skill-run" => Some(run_skill_script(args).await),
+        _ => resolve_skill(tool).map(|skill| load_skill(&skill)),
+    }
+}
+
+/// Map a tool name back to a skill through the same catalog the model saw.
+/// Never reconstructed from the string — that direction is lossy.
+fn resolve_skill(tool: &str) -> Option<crate::skills::DiscoveredSkill> {
+    let skills = crate::skills::discover().skills;
+    skill_catalog(&skills)
+        .into_iter()
+        .find(|(name, _)| name == tool)
+        .map(|(_, skill)| skill.clone())
+}
+
+/// Return the procedure, followed by an index of what sits next to it.
+///
+/// The index is not decoration. Skills written for Claude Code routinely say
+/// "see references/x.md", relying on a filesystem tool the caller may not have.
+/// Listing the files — and naming the tool that fetches them — is what keeps
+/// that instruction followable instead of a dead end.
+fn load_skill(skill: &crate::skills::DiscoveredSkill) -> CallToolResult {
+    let mut body = cap(&skill.manifest.body, SKILL_BODY_MAX_BYTES);
+    let files = skill.files();
+    if !files.is_empty() {
+        body.push_str(
+            "\n\n---\nFiles in this skill (fetch with skill-read, \
+            passing skill=\"",
+        );
+        body.push_str(&skill.manifest.name);
+        body.push_str("\"):\n");
+        for f in files {
+            body.push_str("  ");
+            body.push_str(&f);
+            // Labeled by what would actually run, not by the directory name.
+            if skill.resolve_script(&f).is_ok() {
+                body.push_str("  (executable — run with skill-run)");
+            }
+            body.push('\n');
+        }
+    }
+    CallToolResult::text(body, false)
+}
+
+/// A trimmed string argument. Shared by the skill and command tools —
+/// every one of them takes strings and nothing else.
+fn str_arg<'a>(args: &'a serde_json::Value, key: &str) -> &'a str {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+}
+
+fn read_skill_file(args: &serde_json::Value) -> CallToolResult {
+    let name = str_arg(args, "skill");
+    let rel = str_arg(args, "path");
+    if name.is_empty() || rel.is_empty() {
+        return CallToolResult::text("Both skill and path are required.", true);
+    }
+    let skill = match crate::skills::find_by_name(name) {
+        Ok(s) => s,
+        Err(e) => return CallToolResult::text(e.to_string(), true),
+    };
+    let path = match skill.resolve_readable(rel) {
+        Ok(p) => p,
+        Err(e) => return CallToolResult::text(e.to_string(), true),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => CallToolResult::text(cap(&text, SKILL_FILE_MAX_BYTES), false),
+        // Binary assets are a legitimate thing to package and a useless thing
+        // to return as text; say which it was rather than emit replacement
+        // characters the model would try to reason about.
+        Err(e) => CallToolResult::text(format!("Could not read {rel}: {e}"), true),
+    }
+}
+
+/// Run a `scripts/` executable under the supervisor.
+///
+/// Through `dotagent-supervisor` for the same reason every other orchestrated
+/// subprocess is: a deadline that is actually enforced, and kill-tree so a
+/// script that spawns children cannot leave orphans behind when it is killed.
+async fn run_skill_script(args: &serde_json::Value) -> CallToolResult {
+    let name = str_arg(args, "skill");
+    let rel = str_arg(args, "script");
+    if name.is_empty() || rel.is_empty() {
+        return CallToolResult::text("Both skill and script are required.", true);
+    }
+    let extra: Vec<String> = args
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let skill = match crate::skills::find_by_name(name) {
+        Ok(s) => s,
+        Err(e) => return CallToolResult::text(e.to_string(), true),
+    };
+    let script = match skill.resolve_script(rel) {
+        Ok(p) => p,
+        Err(e) => return CallToolResult::text(e.to_string(), true),
+    };
+
+    // Arguments go through argv, never a shell — the same posture as
+    // `[run] args` in a manifest.
+    let mut cmd = tokio::process::Command::new(&script);
+    cmd.args(&extra)
+        .current_dir(&skill.dir)
+        .env("SKILL_NAME", &skill.manifest.name)
+        .env("SKILL_DIR", &skill.dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let plugins = PluginClient::from_environment();
+    let spec = dotagent_supervisor::SpawnSpec {
+        kind: dotagent_supervisor::ProcessKind::Skill,
+        owner: dotagent_supervisor::ProcessOwner {
+            agent: skill.manifest.name.clone(),
+            ..Default::default()
+        },
+        deadline: std::time::Duration::from_secs(skill.manifest.timeout_seconds),
+        label: format!("skill-run:{rel}"),
+    };
+
+    let handle = match plugins.supervisor().spawn_supervised(cmd, spec).await {
+        Ok(h) => h,
+        Err(e) => return CallToolResult::text(format!("Could not start {rel}: {e}"), true),
+    };
+
+    let (body, is_error, exit_code, timed_out) = match handle.wait_with_output().await {
+        Ok(out) => {
+            let code = out.status.code().unwrap_or(-1);
+            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            if code == 0 {
+                let text = if stdout.is_empty() {
+                    format!("{rel} finished with no output.")
+                } else {
+                    cap(&stdout, SKILL_OUTPUT_MAX_BYTES)
+                };
+                (text, false, code, false)
+            } else {
+                // stderr first: on failure it is the part that explains.
+                let text = format!(
+                    "{rel} exited {code}.\n{}",
+                    cap(&stderr, SKILL_OUTPUT_MAX_BYTES)
+                );
+                (text, true, code, false)
+            }
+        }
+        Err(dotagent_supervisor::SupervisorError::TimedOut { elapsed, .. }) => (
+            format!(
+                "{rel} timed out after {}s and was killed.",
+                elapsed.as_secs()
+            ),
+            true,
+            -1,
+            true,
+        ),
+        Err(e) => (format!("{rel} could not run: {e}"), true, -1, false),
+    };
+
+    // Audited because this is code executing outside any manifest — without
+    // the entry, "what ran on this machine" has a hole in it.
+    if let Ok(audit) = AuditLog::from_home() {
+        let _ = audit.append(dotagent_core::AuditEvent::SkillInvoked {
+            skill: skill.manifest.name.clone(),
+            script: rel.to_string(),
+            exit_code,
+            timed_out,
+        });
+    }
+    CallToolResult::text(body, is_error)
+}
+
+// -------------------------------------------------------------------------
+// Commands
+// -------------------------------------------------------------------------
+
+/// Cap on a rendered command body. Same reasoning as `SKILL_BODY_MAX_BYTES`.
+const COMMAND_BODY_MAX_BYTES: usize = 32 * 1024;
+
+/// Serve a command tool. `None` means "not a command tool".
+fn call_command(tool: &str, args: &serde_json::Value) -> Option<CallToolResult> {
+    if !commands_enabled() {
+        return None;
+    }
+    match tool {
+        "command-get" => Some(get_command(args)),
+        "command-list" => Some(list_commands()),
+        _ => None,
+    }
+}
+
+/// Resolve a name to its rendered prompt.
+fn get_command(args: &serde_json::Value) -> CallToolResult {
+    let name = str_arg(args, "name");
+    if name.is_empty() {
+        return CallToolResult::text("Which command? Pass command.name from the payload.", true);
+    }
+    let found = crate::slash::discover();
+    let Some(cmd) = found.resolve(name) else {
+        // Naming the alternatives beats a bare "not found": the sender
+        // mistyped, and the dispatcher can say which one they meant.
+        let tail = match found.installed().as_str() {
+            "" => String::new(),
+            installed => format!(" Installed: {installed}."),
+        };
+        return CallToolResult::text(format!("No command named '{name}'.{tail}"), true);
+    };
+
+    let rendered = cap(
+        &cmd.manifest.render(str_arg(args, "args")),
+        COMMAND_BODY_MAX_BYTES,
+    );
+    // The hint is carried but flagged. dotagent does not control the
+    // dispatcher's harness, so presenting it as a constraint would describe a
+    // guarantee that does not exist.
+    let body = match &cmd.manifest.allowed_tools {
+        Some(tools) => format!(
+            "{rendered}\n\n---\nThe command suggests these tools: {tools}\n\
+             (A hint from its author, not a restriction dotagent enforces.)"
+        ),
+        None => rendered,
+    };
+    CallToolResult::text(body, false)
+}
+
+fn list_commands() -> CallToolResult {
+    let found = crate::slash::discover();
+    let menu = found.telegram_menu();
+    if menu.is_empty() {
+        return CallToolResult::text("No commands installed.", false);
+    }
+    let lines: Vec<String> = menu
+        .into_iter()
+        .map(|(tg, cmd)| cmd.menu_line(&tg))
+        .collect();
+    CallToolResult::text(lines.join("\n"), false)
+}
+
 /// Pair each agent with its tool name, dropping collisions.
 ///
 /// Sanitization is lossy, so two agent names can map to one tool name. First
@@ -513,19 +933,28 @@ async fn tools_call(id: serde_json::Value, params: Option<serde_json::Value>) ->
             return JsonRpcResponse::err(id, error_code::INVALID_PARAMS, e.to_string());
         }
     };
-    // Kept as raw JSON for the memory tools, whose shape differs from
-    // RunArguments. Agent tools parse the typed form below.
+    // Raw JSON, because every non-agent tool has its own argument shape.
+    // `RunArguments` is parsed further down, once the tool is known to be an
+    // agent: doing it here would reject `{"args": "src/"}` for `command-get`,
+    // whose `args` is a string, before the handler that understands it ever
+    // ran — a tool failing on the schema of a *different* tool.
     let raw_args = call.arguments.clone().unwrap_or(serde_json::Value::Null);
 
-    let arguments: RunArguments = match call.arguments {
-        Some(a) => match serde_json::from_value(a) {
-            Ok(a) => a,
-            Err(e) => {
-                return JsonRpcResponse::err(id, error_code::INVALID_PARAMS, e.to_string());
-            }
-        },
-        None => RunArguments::default(),
-    };
+    // Skills are text and (occasionally) a script — never an agent run.
+    if let Some(result) = call_skill(&call.name, &raw_args).await {
+        return match serde_json::to_value(result) {
+            Ok(v) => JsonRpcResponse::ok(id, v),
+            Err(e) => JsonRpcResponse::err(id, error_code::INTERNAL_ERROR, e.to_string()),
+        };
+    }
+
+    // Commands are text a human already picked — resolved, never run.
+    if let Some(result) = call_command(&call.name, &raw_args) {
+        return match serde_json::to_value(result) {
+            Ok(v) => JsonRpcResponse::ok(id, v),
+            Err(e) => JsonRpcResponse::err(id, error_code::INTERNAL_ERROR, e.to_string()),
+        };
+    }
 
     // Memory tools are served by this process, not by spawning an agent.
     if let Some(result) = call_memory(&call.name, &raw_args) {
@@ -550,6 +979,17 @@ async fn tools_call(id: serde_json::Value, params: Option<serde_json::Value>) ->
         Err(e) => {
             return JsonRpcResponse::err(id, error_code::INTERNAL_ERROR, e.to_string());
         }
+    };
+
+    // Now that the tool is known to be an agent, its schema applies.
+    let arguments: RunArguments = match call.arguments {
+        Some(a) => match serde_json::from_value(a) {
+            Ok(a) => a,
+            Err(e) => {
+                return JsonRpcResponse::err(id, error_code::INVALID_PARAMS, e.to_string());
+            }
+        },
+        None => RunArguments::default(),
     };
 
     let result = match execute(&agent_name, &arguments).await {
@@ -713,6 +1153,122 @@ mod tests {
         let s = serde_json::to_string(&res).unwrap();
         assert!(s.contains("-32602"), "{s}");
         assert!(s.contains("unknown tool"), "{s}");
+    }
+
+    // --- skills ---
+
+    fn skill_fixture(
+        dir: &std::path::Path,
+        name: &str,
+        body: &str,
+    ) -> crate::skills::DiscoveredSkill {
+        crate::skills::DiscoveredSkill {
+            manifest: dotagent_core::SkillManifest {
+                name: name.to_string(),
+                description: "Does a thing.".into(),
+                timeout_seconds: 300,
+                body: body.to_string(),
+            },
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn cap_leaves_short_text_untouched() {
+        assert_eq!(cap("hello", 100), "hello");
+    }
+
+    #[test]
+    fn cap_marks_the_truncation_instead_of_hiding_it() {
+        let long = "x".repeat(100);
+        let out = cap(&long, 10);
+        assert!(out.starts_with("xxxxxxxxxx"));
+        assert!(out.contains("truncated"), "{out}");
+        assert!(out.contains("100"), "must say how much was dropped: {out}");
+    }
+
+    #[test]
+    fn cap_never_splits_a_multibyte_char() {
+        // "é" is two bytes; cutting at 1 would panic on a naive slice.
+        let text = "é".repeat(20);
+        let out = cap(&text, 5);
+        assert!(out.contains("truncated"));
+        assert!(out.starts_with("éé"), "{out}");
+    }
+
+    #[test]
+    fn loading_a_skill_lists_the_files_beside_it() {
+        // Without this index, a procedure that says "see references/x.md" is a
+        // dead end for a caller with no filesystem tool.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("references")).unwrap();
+        std::fs::write(dir.path().join("references/glossary.md"), "g").unwrap();
+        std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
+        std::fs::write(dir.path().join("scripts/report.sh"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                dir.path().join("scripts/report.sh"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+
+        let skill = skill_fixture(dir.path(), "weekly", "Step one.");
+        let result = load_skill(&skill);
+        let rendered = serde_json::to_string(&result).unwrap();
+
+        assert!(rendered.contains("Step one."));
+        assert!(rendered.contains("references/glossary.md"), "{rendered}");
+        assert!(rendered.contains("skill-read"), "{rendered}");
+        assert!(rendered.contains("skill-run"), "{rendered}");
+        assert!(rendered.contains(r#""isError":false"#));
+    }
+
+    #[test]
+    fn a_skill_with_no_extra_files_returns_only_the_procedure() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = skill_fixture(dir.path(), "bare", "Just this.");
+        let result = load_skill(&skill);
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(rendered.contains("Just this."));
+        assert!(!rendered.contains("Files in this skill"), "{rendered}");
+    }
+
+    #[test]
+    fn skill_catalog_drops_a_colliding_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // `a.b` and `a/b` both sanitize to `skill-a-b`.
+        let skills = vec![
+            skill_fixture(dir.path(), "a.b", "one"),
+            skill_fixture(dir.path(), "a/b", "two"),
+        ];
+        let catalog = skill_catalog(&skills);
+        assert_eq!(
+            catalog.len(),
+            1,
+            "shadowing must not be silent in the catalog"
+        );
+        assert_eq!(catalog[0].0, "skill-a-b");
+        assert_eq!(catalog[0].1.manifest.body, "one", "first discovered wins");
+    }
+
+    #[tokio::test]
+    async fn skill_read_requires_both_arguments() {
+        let result = read_skill_file(&serde_json::json!({ "skill": "x" }));
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(rendered.contains(r#""isError":true"#), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn a_non_skill_tool_is_not_claimed_by_the_skill_handler() {
+        assert!(call_skill("run-something", &serde_json::Value::Null)
+            .await
+            .is_none());
+        assert!(call_skill("memory-recall", &serde_json::Value::Null)
+            .await
+            .is_none());
     }
 
     #[test]

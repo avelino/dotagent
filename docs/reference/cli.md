@@ -314,6 +314,32 @@ memory: /Users/avelino/.config/dotagent/outl (default)
 A path set in `[memory] workspace` that holds no outl workspace is a warning —
 the default path is scaffolded automatically, a configured one is not.
 
+And how many skills it found, across every search root:
+
+```
+skills: 8 found, including ~/.claude/skills
+```
+
+A `SKILL.md` that fails to parse is a warning, not an error — nothing stops
+running, an assistant just answers without a procedure it should have had. Two
+skill names that sanitize to the same tool name are also warned about: only the
+first is callable, and a skill you wrote and cannot call is otherwise a mystery.
+
+Commands get the same treatment, with one extra check. They carry two derived
+names — the MCP tool and the Telegram menu entry — and Telegram's
+`[a-z0-9_]{1,32}` has no hyphens, so two commands can be distinct in the catalog
+and collide in the menu:
+
+```text
+commands: 4 found
+    ⚠ weekly-numbers (…/a/weekly-numbers.md), weekly_numbers (…/b/weekly_numbers.md)
+      all want /weekly_numbers — only the first is in the menu
+```
+
+The files are named, not just the commands: two names differing only by `-`
+versus `_` are near-identical on screen, and the useful question is which one to
+rename. See [Commands](../concepts/commands.md#two-names-two-collision-rules).
+
 Manifests that fail to parse are listed with `✗` and counted as errors. They
 no longer abort the scan — the healthy agents are still reported below them.
 
@@ -516,6 +542,12 @@ any MCP client at it:
 printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | dotagent mcp
 # → {"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"run-disk-alert",...}]}}
 ```
+
+The catalog is not only agents: `skill-*` tools carry the procedures found
+under `~/.config/dotagent/skills/` and `~/.claude/skills/`, `command-get` and
+`command-list` resolve the commands under `~/.config/dotagent/commands/`, and
+`memory-*` tools appear when `[memory]` is on. See
+[Skills](../concepts/skills.md) and [Commands](../concepts/commands.md).
 
 Agents run in **this** process, like `run-now` — not through the daemon — so
 the subprocess tree does not appear in `dotagent status`. State is keyed off

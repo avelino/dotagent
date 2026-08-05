@@ -162,12 +162,49 @@ pub enum AuditEvent {
         path: String,
         error: String,
     },
+    /// A script packaged inside a skill was executed.
+    ///
+    /// Skills are text by default; `scripts/` makes one executable, and that
+    /// is a distinct path into running code on this machine — it does not go
+    /// through a manifest, so `AgentRun` never records it. Anyone auditing
+    /// "what ran and why" needs this entry to see the whole picture.
+    SkillInvoked {
+        skill: String,
+        /// Path relative to the skill directory. Absolute paths and traversal
+        /// are refused before this event is written.
+        script: String,
+        exit_code: i32,
+        timed_out: bool,
+    },
+    /// A `SKILL.md` exists but failed to parse or validate.
+    ///
+    /// Same reasoning as [`AuditEvent::ManifestInvalid`], one notch quieter:
+    /// a broken skill removes a procedure from the catalog, which degrades an
+    /// assistant's answers rather than stopping a scheduled run.
+    SkillInvalid {
+        path: String,
+        error: String,
+    },
     /// A run started from a trigger rather than a schedule window.
     AgentTriggered {
         source: String,
         actor: Option<String>,
         agent: String,
         schedule: String,
+    },
+    /// An inbound message named a command.
+    ///
+    /// The **name only**. Arguments are content, the same reason
+    /// [`AuditEvent::TriggerReceived`] records who and where but never the
+    /// message body — `/review ~/notes/salary.md` would otherwise put a path
+    /// somebody typed into a chat onto disk forever.
+    ///
+    /// `known: false` is the interesting one: repeated unknown commands from an
+    /// allowlisted sender is what probing looks like.
+    CommandDispatched {
+        command: String,
+        actor: Option<String>,
+        known: bool,
     },
 }
 
@@ -189,6 +226,13 @@ impl AuditEvent {
             | AuditEvent::SecretsLoaded { .. }
             | AuditEvent::TriggerReceived { .. }
             | AuditEvent::AgentTriggered { .. }
+            | AuditEvent::SkillInvoked { .. }
+            | AuditEvent::SkillInvalid { .. }
+            // Notice even when unknown: a typo is the common cause, and
+            // crying Critical over one would train the reader to skip them.
+            // The signal is repetition, which a query over `known: false`
+            // finds without the severity being wrong the rest of the time.
+            | AuditEvent::CommandDispatched { .. }
             | AuditEvent::PluginInvoked { ok: false, .. } => Severity::Notice,
 
             AuditEvent::AgentRun { .. } /* non-zero exit */

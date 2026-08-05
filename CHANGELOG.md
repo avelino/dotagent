@@ -11,6 +11,68 @@ schema and the plugin protocol are flagged in each entry.
 
 ### Added
 
+- **Commands** — procedures *you* pick, published as a Telegram menu. A command
+  is one markdown file in [Claude Code slash command][cc-slash] format under
+  `~/.config/dotagent/commands/`, so a catalog you already keep is reusable
+  rather than transcribed. Type `/` in the chat and the client renders
+  everything installed; pick one and it runs. Skills cover the case where a
+  model decides what applies — commands cover the case where you already know,
+  and paying for a dispatch decision that was already made is latency plus a
+  chance of picking something else. `$ARGUMENTS` and `$1`…`$N` substitute what
+  was typed after the name; arguments given to a body with no placeholder are
+  appended rather than silently dropped. Configurable under `[commands]`,
+  including `claude_commands` — **off** by default, unlike its skills
+  counterpart, because a command becomes a published menu entry and a Claude
+  Code catalog is usually full of things that assume a shell. Docs:
+  [`concepts/commands.md`](docs/concepts/commands.md).
+- Commands carry **two derived names**, and they collide under different rules.
+  Telegram allows `[a-z0-9_]{1,32}` — no hyphens — so `commit-message`
+  registers as `/commit_message` while the MCP tool is
+  `command-commit-message`. The catalog is deduped twice, a name Telegram would
+  refuse fails validation instead of being truncated into a menu entry that
+  resolves to nothing, and `dotagent doctor` names the *files* in a collision so
+  you know which to rename.
+- `dotagent mcp` gains `command-get` and `command-list` — **two tools for the
+  whole catalog, not one per command**, deliberately unlike `skill-*`. There the
+  catalog is a menu a model picks from; here a human already picked, and
+  publishing N tools would re-open that decision and let a model call the wrong
+  one. The daemon parses `/name args` lexically and publishes the catalog via
+  `setMyCommands`; it never resolves a command to its body, which keeps
+  "dotagent itself interprets nothing" true.
+- The Telegram menu registers per allowlisted chat rather than globally. The
+  allowlist already gates execution, so a global menu would not be an
+  authorization hole — but it would publish every command name and description
+  to anyone who finds the bot. New audit event `command_dispatched` records the
+  name and whether it was known, never the arguments.
+- Built-in `/help` lists what is installed, and an unknown `/typo` is answered
+  from the catalog instead of falling through to a model that would improvise.
+  Writing your own `help.md` replaces the built-in.
+
+[cc-slash]: https://docs.claude.com/en/docs/claude-code/slash-commands
+
+### Fixed
+
+- `tools/call` parsed the agent argument schema before dispatching, so a tool
+  whose `args` is not a list — `command-get`, whose `args` is the string the
+  sender typed — was rejected with the *agent* schema's error before its handler
+  ran. The typed parse now happens once the tool is known to be an agent.
+
+- **Skills** — procedures an assistant loads when they apply. A skill is a
+  directory with a `SKILL.md` (frontmatter + markdown), and `dotagent mcp`
+  exposes one `skill-<name>` tool per installed skill: the description is the
+  trigger a model matches on, the body arrives only when it calls. Agents are
+  verbs and memory is facts; this is the third thing, *how to do something* —
+  which previously had to bloat a system prompt or be forced into a script.
+  Two more tools reach inside one: `skill-read` for the reference files a
+  procedure points at (without it, "see references/x.md" is a dead end for a
+  caller with no filesystem tool) and `skill-run` for executables under
+  `scripts/`, supervised with a deadline and kill-tree, audited as
+  `skill_invoked`. `~/.claude/skills/` is searched by default — the format is
+  Anthropic's Agent Skills layout, so a skill written for Claude Code needs no
+  copy, with the honest caveat that a skill whose steps assume that harness
+  (Bash, Read, nested skills) does not port. Configurable under `[skills]`.
+  Docs: [`concepts/skills.md`](docs/concepts/skills.md), threat vector V10.
+
 - **Long-term memory** — new crate `dotagent-memory` embeds
   [outl](https://github.com/avelino/outl) (`outl-ws` + `outl-actions`) as an
   agent memory backend, and `dotagent mcp` exposes `memory-remember` /

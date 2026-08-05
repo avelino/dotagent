@@ -63,6 +63,10 @@ pub enum ProcessKind {
     Sink,
     /// `dotagent-plugin-<name> invoke` for an `[[on_failure]]` or notifier.
     Notify,
+    /// A `scripts/` executable packaged inside a skill, run on request from an
+    /// MCP client. Not declared by any manifest, which is exactly why it needs
+    /// its own label in `status` and the audit log.
+    Skill,
 }
 
 impl std::fmt::Display for ProcessKind {
@@ -74,6 +78,7 @@ impl std::fmt::Display for ProcessKind {
             ProcessKind::Preflight => "preflight",
             ProcessKind::Sink => "sink",
             ProcessKind::Notify => "notify",
+            ProcessKind::Skill => "skill",
         };
         f.write_str(s)
     }

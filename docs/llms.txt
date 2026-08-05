@@ -238,6 +238,10 @@ above, so a payload can never redefine `AGENT_NAME` or
 | `AGENT_TRIGGER_REPLY_TO` | string | `123456789` (chat id to answer)            |
 | `AGENT_TRIGGER_PAYLOAD`  | JSON   | `{"text":"sim","chat_id":1,"user_id":2,"message_id":9,"reply_to_text":"Posso criar?"}` |
 
+When the sender invoked a command, the payload also carries
+`{"command":{"name":"standup","args":"disk-alert"}}` — the resolved catalog
+name, ready to pass to `command-get`. It is `null` for ordinary prose.
+
 The message body travels in `AGENT_TRIGGER_PAYLOAD`, never in argv.
 When the sender used Telegram's reply, `reply_to_text` carries what they
 replied to — a bare "sim" is meaningless without it.

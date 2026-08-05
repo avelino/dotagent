@@ -18,6 +18,8 @@
 * [Triggers](concepts/triggers.md)
 * [Telegram](concepts/telegram.md)
 * [Memory](concepts/memory.md)
+* [Skills](concepts/skills.md)
+* [Commands](concepts/commands.md)
 
 ## Guides
 

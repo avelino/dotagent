@@ -76,6 +76,59 @@ recall is substring rather than semantic.
 
 Turn them off with `[memory] enabled = false`.
 
+## Skill tools
+
+One tool per installed skill, plus two verbs that reach inside one:
+
+| Tool | Arguments | Behavior |
+|---|---|---|
+| `skill-<name>` | — | Return the procedure, plus an index of the files beside it. |
+| `skill-read` | `skill`, `path` | Return one supporting file from that skill. |
+| `skill-run` | `skill`, `script`, `args[]` | Execute one `scripts/` entry, return its output. |
+
+Loading a skill returns **text**. The tool description says so explicitly,
+because these are usually written in the imperative ("Cut a new release") and a
+model could otherwise read the call as performing the procedure.
+
+`skill-read` exists because a skill is often more than one file. A procedure
+that says "see `references/glossary.md`" assumes a filesystem tool the caller
+may not have; without a way to fetch it, the model follows half a procedure and
+never notices. The index returned alongside the body is what makes the request
+possible.
+
+Skills come from `~/.config/dotagent/skills/` **and** `~/.claude/skills/` — the
+format is Anthropic's Agent Skills layout, so one written for Claude Code is
+already installed. See [Skills](../concepts/skills.md), including what does not
+port.
+
+A broken `SKILL.md` does not fail `tools/list` the way a broken manifest does.
+The consequences differ: an unparseable manifest means an agent silently never
+runs, while an unparseable skill means one procedure is missing. It is logged
+and reported by `doctor`; the catalog still serves.
+
+Turn them off with `[skills] enabled = false`.
+
+## Command tools
+
+Two more when `[commands]` is enabled (the default) and at least one command is
+installed:
+
+| Tool | Arguments | Behavior |
+|---|---|---|
+| `command-get` | `name`, `args` | Resolve an invoked command into the prompt to follow, arguments substituted. |
+| `command-list` | — | Every installed command, with what it does and takes. |
+
+**Two tools, not one per command** — deliberately unlike `skill-*`. There, the
+catalog is a menu the model picks from. A command was already picked by a human
+before the model saw anything, so publishing N command tools would re-open that
+decision and let a model call the wrong one. Pass `command.name` and
+`command.args` from the trigger payload through unchanged.
+
+Note `args` is a **string** here and an array for `run-*`: an agent's arguments
+are argv, a command's are whatever the sender typed after the name.
+
+See [Commands](../concepts/commands.md).
+
 ## Tool naming
 
 MCP restricts tool names to `[a-zA-Z0-9_-]`, which agent names are not bound by. Each agent becomes `run-<sanitized-name>`:
@@ -85,6 +138,11 @@ MCP restricts tool names to `[a-zA-Z0-9_-]`, which agent names are not bound by.
 | `disk-alert` | `run-disk-alert` |
 | `hn.digest` | `run-hn-digest` |
 | `buser/finops` | `run-buser-finops` |
+
+Skills use the same sanitizer under a different prefix, `skill-<name>`, which is
+what keeps a skill from ever colliding with an agent. Two *skills* can still
+collide, and the same rule applies: first discovered wins, the loser is dropped
+with a warning, and `doctor` names both.
 
 The mapping is lossy — `a.b` and `a/b` both produce `run-a-b`. On a collision the first agent discovered wins and the later one is dropped from the catalog with a warning in the log. Shadowing silently would mean `tools/call` running an agent nobody chose.
 

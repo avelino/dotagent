@@ -163,6 +163,8 @@ pub async fn doctor() -> Result<()> {
     // toward errors (daemon still runs without secrets).
     let (mut errors, mut warnings) = report_secrets_status();
     warnings += report_memory_status();
+    warnings += report_skills_status();
+    warnings += report_commands_status();
 
     let found = discovery::discover();
     // After the scan, so the dispatcher check reuses it instead of triggering
@@ -358,6 +360,98 @@ pub async fn plugin_invoke(name: String, _payload: String) -> Result<()> {
 /// is fine (single-digit refs in practice). If a future CI gate calls
 /// `doctor` in a tight loop with many refs, cache inside this function
 /// rather than reaching for `snapshot()`.
+/// Report the skill catalog. Returns a warning count.
+///
+/// Skills come from several roots — including `~/.claude/skills`, which the
+/// operator did not create for dotagent — so the count alone is not enough.
+/// A skill that fails to parse is a warning, not an error: nothing stops
+/// running, an assistant just answers without a procedure it should have had.
+fn report_skills_status() -> usize {
+    let config =
+        dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
+    if !config.skills.enabled {
+        println!("skills: off ([skills] enabled = false)");
+        return 0;
+    }
+
+    let found = crate::skills::discover();
+    let claude = if config.skills.claude_skills {
+        ", including ~/.claude/skills"
+    } else {
+        ""
+    };
+    println!("skills: {} found{claude}", found.skills.len());
+
+    let mut warnings = 0;
+    for bad in &found.invalid {
+        println!("    ⚠ {}: {}", bad.path.display(), bad.error);
+        warnings += 1;
+    }
+    // Collisions are silent in the catalog (first wins), so say them out loud
+    // here — a skill you wrote and cannot call is otherwise a mystery.
+    let mut taken: std::collections::HashMap<String, String> = Default::default();
+    for skill in &found.skills {
+        let tool = dotagent_mcp::skill_tool_name_for(&skill.manifest.name);
+        if let Some(first) = taken.get(&tool) {
+            println!(
+                "    ⚠ {} maps to the same tool as {first} ({tool}) — only the first is callable",
+                skill.manifest.name
+            );
+            warnings += 1;
+        } else {
+            taken.insert(tool, skill.manifest.name.clone());
+        }
+    }
+    warnings
+}
+
+/// Report the command catalog. Returns a warning count.
+///
+/// Says more than the skill report because a command carries **two** derived
+/// names — the MCP tool and the Telegram menu entry — and they collide under
+/// different rules. A command shadowed on Telegram is invisible: it is in the
+/// catalog, `command-get` resolves it, and the menu never offers it.
+fn report_commands_status() -> usize {
+    let config =
+        dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
+    if !config.commands.enabled {
+        println!("commands: off ([commands] enabled = false)");
+        return 0;
+    }
+
+    let found = crate::slash::discover();
+    let claude = if config.commands.claude_commands {
+        ", including ~/.claude/commands"
+    } else {
+        ""
+    };
+    println!("commands: {} found{claude}", found.commands.len());
+
+    let mut warnings = 0;
+    for bad in &found.invalid {
+        println!("    ⚠ {}: {}", bad.path.display(), bad.error);
+        warnings += 1;
+    }
+    for (telegram, cmds) in found.telegram_collisions() {
+        // Naming the files, not just the commands: two names that differ only
+        // by `-` versus `_` are near-identical on screen, and the useful
+        // question is which file to rename.
+        let where_from: Vec<String> = cmds
+            .iter()
+            .map(|c| format!("{} ({})", c.manifest.name, c.path.display()))
+            .collect();
+        println!(
+            "    ⚠ {} all want /{telegram} — only the first is in the menu",
+            where_from.join(", ")
+        );
+        warnings += 1;
+    }
+    if !found.commands.is_empty() && !config.telegram.is_enabled() {
+        println!("    ℹ no Telegram ingress configured — no menu is published");
+    }
+    warnings
+}
+
 /// Report where long-term memory lives. Returns a warning count.
 ///
 /// Says the path out loud because memory is a directory you are meant to open

@@ -184,6 +184,8 @@ Canonical raw URL for `WebFetch`:
 - [Triggers](docs/concepts/triggers.md) — runs caused by an event, not the clock
 - [Telegram](docs/concepts/telegram.md) — talk to your agents from a chat
 - [Memory](docs/concepts/memory.md) — facts that outlive the conversation
+- [Skills](docs/concepts/skills.md) — procedures an assistant loads on demand
+- [Commands](docs/concepts/commands.md) — procedures you invoke by name, as a Telegram menu
 - [LLM agents](docs/guides/llm-agents.md) — calling `claude -p` from an agent
 
 **Reference:**

@@ -352,6 +352,7 @@ fn spawn_telegram_ingress(
             dispatcher = %cfg.dispatcher_agent,
             "telegram ingress started"
         );
+        publish_command_menu(&cfg).await;
 
         // Backs off on transport failure so a dropped network does not turn
         // into a tight retry loop against the Bot API.
@@ -370,10 +371,27 @@ fn spawn_telegram_ingress(
                 }
             };
 
+            // Re-read per batch rather than caching: a command file added
+            // while the daemon runs should work without a reload, the same way
+            // a new manifest does.
+            let catalog = crate::slash::discover();
+
             for msg in messages {
                 let actor = msg.user_id.to_string();
-                match screen(&msg, &cfg, &mut limiter) {
-                    Err(reason) => {
+                // Recorded before resolution so an unknown name is still
+                // attributable — repeated misses from one sender is what
+                // probing looks like. The name only; arguments are content.
+                if let Some((name, _)) = dotagent_core::command::parse_invocation(&msg.text) {
+                    let known = catalog.resolve(&name).is_some();
+                    let _ = audit.append(AuditEvent::CommandDispatched {
+                        command: name,
+                        actor: Some(actor.clone()),
+                        known,
+                    });
+                }
+
+                match screen(&msg, &cfg, &mut limiter, &catalog) {
+                    Screened::Reject(reason) => {
                         warn!(user_id = msg.user_id, reason, "telegram message refused");
                         let _ = audit.append(AuditEvent::TriggerRejected {
                             source: TriggerSource::Telegram.to_string(),
@@ -381,13 +399,27 @@ fn spawn_telegram_ingress(
                             reason: reason.into(),
                         });
                     }
-                    Ok(req) => {
+                    Screened::Answer(text) => {
+                        // Costs no model call, which is the point of answering
+                        // a catalog question from the catalog.
+                        if let Err(e) = dotagent_notify::telegram_inbound::reply(
+                            &cfg.bot_token,
+                            msg.chat_id,
+                            Some(msg.message_id),
+                            &text,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "could not answer a catalog question");
+                        }
+                    }
+                    Screened::Run(req) => {
                         let _ = audit.append(AuditEvent::TriggerReceived {
                             source: TriggerSource::Telegram.to_string(),
                             actor,
                             reply_to: msg.chat_id.to_string(),
                         });
-                        if tx.send(req).await.is_err() {
+                        if tx.send(*req).await.is_err() {
                             info!("trigger channel closed — stopping telegram ingress");
                             return;
                         }
@@ -398,24 +430,135 @@ fn spawn_telegram_ingress(
     })
 }
 
-/// Decide whether one inbound message may cause a run, and shape it if so.
+/// Register the `/` menu with Telegram, once per allowlisted chat.
+///
+/// Called wherever the ingress starts — boot and every SIGHUP — so adding a
+/// command file and running `dotagent reload` updates the menu. Best-effort by
+/// design: a failed registration costs autocomplete, and every command stays
+/// typable and dispatchable without it. Trading a working bot for a menu would
+/// be the wrong way round.
+///
+/// An empty catalog still publishes, clearing the menu. A command you deleted
+/// must stop being offered.
+async fn publish_command_menu(cfg: &dotagent_core::TelegramIngressConfig) {
+    if !dotagent_core::Config::load(dotagent_state::paths::config_file())
+        .unwrap_or_default()
+        .commands
+        .enabled
+    {
+        return;
+    }
+    let found = crate::slash::discover();
+    for bad in &found.invalid {
+        warn!(path = %bad.path.display(), error = %bad.error, "command not registered");
+    }
+    let menu: Vec<dotagent_notify::telegram_inbound::BotCommand> = found
+        .telegram_menu()
+        .into_iter()
+        // The name is what Telegram already renders, so only the tail goes in
+        // the description.
+        .map(|(tg, cmd)| dotagent_notify::telegram_inbound::BotCommand::new(tg, cmd.summary()))
+        .collect();
+
+    // Per chat, not BotCommandScopeDefault: the default scope would publish
+    // every command name and description to anyone who finds the bot.
+    for user_id in &cfg.allowed_user_ids {
+        match dotagent_notify::telegram_inbound::set_my_commands(&cfg.bot_token, *user_id, &menu)
+            .await
+        {
+            Ok(()) => debug!(
+                chat = user_id,
+                commands = menu.len(),
+                "command menu published"
+            ),
+            Err(e) => warn!(error = %e, chat = user_id, "could not publish command menu"),
+        }
+    }
+}
+
+/// What screening decided about one inbound message.
+enum Screened {
+    /// Hand it to the dispatcher.
+    Run(Box<TriggerRequest>),
+    /// Answer from the daemon without running anything.
+    ///
+    /// Only ever about the **catalog** — which commands exist — never about
+    /// what one means. That line is what keeps "dotagent itself interprets
+    /// nothing" true: listing what is installed is the same class of knowledge
+    /// as discovering manifests, while resolving a command to its body stays
+    /// with the dispatcher, over `command-get`.
+    Answer(String),
+    Reject(&'static str),
+}
+
+#[cfg(test)]
+impl Screened {
+    fn rejected(self) -> &'static str {
+        match self {
+            Screened::Reject(r) => r,
+            _ => panic!("expected a rejection"),
+        }
+    }
+    fn is_rejected(&self) -> bool {
+        matches!(self, Screened::Reject(_))
+    }
+    fn is_run(&self) -> bool {
+        matches!(self, Screened::Run(_))
+    }
+    fn run(self) -> TriggerRequest {
+        match self {
+            Screened::Run(r) => *r,
+            Screened::Answer(t) => panic!("expected a run, got an answer: {t}"),
+            Screened::Reject(r) => panic!("expected a run, got a rejection: {r}"),
+        }
+    }
+    fn answer(self) -> String {
+        match self {
+            Screened::Answer(t) => t,
+            _ => panic!("expected a direct answer"),
+        }
+    }
+}
+
+/// Decide what to do with one inbound message.
 ///
 /// The whole authorization decision lives here, deliberately away from IO: the
 /// allowlist is the only thing standing between a bot token and local
-/// execution, and it should be testable without a network.
+/// execution, and it should be testable without a network. The command catalog
+/// arrives as an argument for the same reason.
 fn screen(
     msg: &dotagent_notify::telegram_inbound::InboundMessage,
     cfg: &dotagent_core::TelegramIngressConfig,
     limiter: &mut dotagent_notify::telegram_inbound::RateLimiter,
-) -> std::result::Result<TriggerRequest, &'static str> {
+    catalog: &crate::slash::CommandDiscovery,
+) -> Screened {
     if !cfg.allows(msg.user_id) {
         // Someone found the bot.
-        return Err("user id not in allowed_user_ids");
+        return Screened::Reject("user id not in allowed_user_ids");
     }
     if !limiter.check(msg.user_id) {
-        return Err("rate limit exceeded");
+        return Screened::Reject("rate limit exceeded");
     }
-    Ok(TriggerRequest {
+
+    // Lexical only: `/name args` is Telegram wire syntax, the same class of
+    // thing as reading `update_id`. Nothing here resolves a name to a body.
+    let invocation = dotagent_core::command::parse_invocation(&msg.text);
+    let command = match &invocation {
+        Some((name, args)) => match catalog.resolve(name) {
+            Some(found) => Some((found.manifest.name.clone(), args.clone())),
+            // A built-in only when nobody installed their own: someone who
+            // writes help.md meant to replace this.
+            None if name == "help" => return Screened::Answer(help_text(catalog)),
+            None => {
+                // Falling through to the dispatcher would mean a model
+                // improvising an answer to something meant to be exact.
+                return Screened::Answer(unknown_command_text(name, catalog));
+            }
+        },
+        None => None,
+    };
+
+    Screened::Run(Box::new(TriggerRequest {
         source: TriggerSource::Telegram,
         agent: cfg.dispatcher_agent.clone(),
         schedule: None,
@@ -430,10 +573,39 @@ fn screen(
             // What the sender was replying to, when they used Telegram's
             // reply. "sim" means nothing without it.
             "reply_to_text": msg.reply_to_text,
+            // Present only when the sender invoked one. The dispatcher passes
+            // both fields straight to `command-get`; it does not have to parse
+            // the text or guess whether a leading slash meant anything.
+            "command": command.as_ref().map(|(name, args)| serde_json::json!({
+                "name": name,
+                "args": args,
+            })),
         })),
         actor: Some(msg.user_id.to_string()),
         reply_to: Some(msg.chat_id.to_string()),
-    })
+    }))
+}
+
+/// The built-in `/help`: what is installed, nothing about what any of it means.
+fn help_text(catalog: &crate::slash::CommandDiscovery) -> String {
+    let menu = catalog.telegram_menu();
+    if menu.is_empty() {
+        return "No commands installed. Just say what you need in plain words.".into();
+    }
+    let mut out = String::from("Commands:\n");
+    for (tg, cmd) in menu {
+        out.push_str(&cmd.menu_line(&tg));
+        out.push('\n');
+    }
+    out.push_str("\nOr just say what you need in plain words.");
+    out
+}
+
+fn unknown_command_text(name: &str, catalog: &crate::slash::CommandDiscovery) -> String {
+    match catalog.installed().as_str() {
+        "" => format!("No command named /{name}, and none are installed. Try plain words."),
+        installed => format!("No command named /{name}. Installed: {installed}. Or /help."),
+    }
 }
 
 /// Trigger context handed to the agent process.
@@ -1340,6 +1512,21 @@ mod tests {
         }
     }
 
+    /// No commands installed — the state every allowlist test wants, since a
+    /// catalog would only change what a message starting with `/` does.
+    fn empty_catalog() -> crate::slash::CommandDiscovery {
+        crate::slash::CommandDiscovery::default()
+    }
+
+    fn catalog_with(files: &[(&str, &str)]) -> (tempfile::TempDir, crate::slash::CommandDiscovery) {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, body) in files {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        let found = crate::slash::discover_in(&[dir.path().to_path_buf()]);
+        (dir, found)
+    }
+
     fn limiter() -> dotagent_notify::telegram_inbound::RateLimiter {
         dotagent_notify::telegram_inbound::RateLimiter::new(10)
     }
@@ -1349,7 +1536,13 @@ mod tests {
 
     #[test]
     fn screen_refuses_an_unlisted_user() {
-        let err = screen(&inbound(7), &cfg(vec![1, 2]), &mut limiter()).unwrap_err();
+        let err = screen(
+            &inbound(7),
+            &cfg(vec![1, 2]),
+            &mut limiter(),
+            &empty_catalog(),
+        )
+        .rejected();
         assert_eq!(err, "user id not in allowed_user_ids");
     }
 
@@ -1357,22 +1550,28 @@ mod tests {
     fn screen_refuses_everyone_when_the_allowlist_is_empty() {
         // Empty must mean nobody. Reading it as "no restriction" would turn a
         // forgotten config line into an open execution endpoint.
-        assert!(screen(&inbound(7), &cfg(vec![]), &mut limiter()).is_err());
-        assert!(screen(&inbound(0), &cfg(vec![]), &mut limiter()).is_err());
+        assert!(screen(&inbound(7), &cfg(vec![]), &mut limiter(), &empty_catalog()).is_rejected());
+        assert!(screen(&inbound(0), &cfg(vec![]), &mut limiter(), &empty_catalog()).is_rejected());
     }
 
     #[test]
     fn screen_refuses_a_negated_id() {
-        assert!(screen(&inbound(-7), &cfg(vec![7]), &mut limiter()).is_err());
+        assert!(screen(
+            &inbound(-7),
+            &cfg(vec![7]),
+            &mut limiter(),
+            &empty_catalog()
+        )
+        .is_rejected());
     }
 
     #[test]
     fn screen_refuses_past_the_rate_limit() {
         let c = cfg(vec![7]);
         let mut rl = dotagent_notify::telegram_inbound::RateLimiter::new(2);
-        assert!(screen(&inbound(7), &c, &mut rl).is_ok());
-        assert!(screen(&inbound(7), &c, &mut rl).is_ok());
-        let err = screen(&inbound(7), &c, &mut rl).unwrap_err();
+        assert!(screen(&inbound(7), &c, &mut rl, &empty_catalog()).is_run());
+        assert!(screen(&inbound(7), &c, &mut rl, &empty_catalog()).is_run());
+        let err = screen(&inbound(7), &c, &mut rl, &empty_catalog()).rejected();
         assert_eq!(err, "rate limit exceeded");
     }
 
@@ -1381,16 +1580,16 @@ mod tests {
         // Otherwise an unlisted flooder could exhaust a listed user's quota.
         let c = cfg(vec![7]);
         let mut rl = dotagent_notify::telegram_inbound::RateLimiter::new(1);
-        assert!(screen(&inbound(99), &c, &mut rl).is_err());
+        assert!(screen(&inbound(99), &c, &mut rl, &empty_catalog()).is_rejected());
         assert!(
-            screen(&inbound(7), &c, &mut rl).is_ok(),
+            screen(&inbound(7), &c, &mut rl, &empty_catalog()).is_run(),
             "the listed user's budget must be untouched"
         );
     }
 
     #[test]
     fn screen_accepts_a_listed_user_and_targets_the_dispatcher() {
-        let req = screen(&inbound(7), &cfg(vec![7]), &mut limiter()).unwrap();
+        let req = screen(&inbound(7), &cfg(vec![7]), &mut limiter(), &empty_catalog()).run();
         assert_eq!(req.agent, "telegram-assistant");
         assert_eq!(req.source, TriggerSource::Telegram);
         assert_eq!(req.actor.as_deref(), Some("7"));
@@ -1399,7 +1598,7 @@ mod tests {
 
     #[test]
     fn screen_never_puts_the_message_body_in_argv() {
-        let req = screen(&inbound(7), &cfg(vec![7]), &mut limiter()).unwrap();
+        let req = screen(&inbound(7), &cfg(vec![7]), &mut limiter(), &empty_catalog()).run();
         assert!(req.args.is_empty(), "body must travel in the payload only");
         assert_eq!(req.payload.unwrap()["text"], "how's disk?");
     }
@@ -1409,8 +1608,113 @@ mod tests {
         // The message selects nothing: the dispatcher is operator config.
         let mut msg = inbound(7);
         msg.text = "run disk-alert; rm -rf /".into();
-        let req = screen(&msg, &cfg(vec![7]), &mut limiter()).unwrap();
+        let req = screen(&msg, &cfg(vec![7]), &mut limiter(), &empty_catalog()).run();
         assert_eq!(req.agent, "telegram-assistant");
+    }
+
+    // --- commands. The daemon parses `/name`, publishes the catalog and
+    // answers about it — and resolves nothing beyond that. ---
+
+    const CMD: &str = "---\ndescription: Writes a commit message.\n---\nThe prompt.\n";
+
+    fn said(text: &str, catalog: &crate::slash::CommandDiscovery) -> Screened {
+        let mut msg = inbound(7);
+        msg.text = text.into();
+        screen(&msg, &cfg(vec![7]), &mut limiter(), catalog)
+    }
+
+    #[test]
+    fn plain_prose_carries_no_command() {
+        let payload = said("how's disk?", &empty_catalog()).run().payload.unwrap();
+        assert_eq!(payload["text"], "how's disk?");
+        assert!(
+            payload["command"].is_null(),
+            "prose must not look like an invocation"
+        );
+    }
+
+    #[test]
+    fn an_invocation_reaches_the_dispatcher_as_a_resolved_name_and_raw_args() {
+        // The sender types the Telegram spelling; the payload carries the
+        // catalog name, so the dispatcher passes it to command-get unchanged.
+        let (_dir, catalog) = catalog_with(&[("commit-message.md", CMD)]);
+        let payload = said("/commit_message --staged src/", &catalog)
+            .run()
+            .payload
+            .unwrap();
+        assert_eq!(payload["command"]["name"], "commit-message");
+        assert_eq!(payload["command"]["args"], "--staged src/");
+        // The original text survives alongside it — a dispatcher that would
+        // rather read the raw message still can.
+        assert_eq!(payload["text"], "/commit_message --staged src/");
+    }
+
+    #[test]
+    fn an_invocation_without_arguments_carries_an_empty_string() {
+        let (_dir, catalog) = catalog_with(&[("commit-message.md", CMD)]);
+        let payload = said("/commit_message", &catalog).run().payload.unwrap();
+        assert_eq!(payload["command"]["args"], "");
+    }
+
+    #[test]
+    fn an_unknown_command_is_answered_rather_than_improvised() {
+        // The whole point of exactness: `/typo` must not reach a model that
+        // would answer something plausible.
+        let (_dir, catalog) = catalog_with(&[("commit-message.md", CMD)]);
+        let answer = said("/typo", &catalog).answer();
+        assert!(answer.contains("/typo"), "{answer}");
+        assert!(answer.contains("/commit_message"), "{answer}");
+    }
+
+    #[test]
+    fn help_lists_the_catalog_without_running_anything() {
+        let (_dir, catalog) = catalog_with(&[("commit-message.md", CMD)]);
+        let answer = said("/help", &catalog).answer();
+        assert!(answer.contains("/commit_message"), "{answer}");
+        assert!(answer.contains("Writes a commit message."), "{answer}");
+    }
+
+    #[test]
+    fn help_is_still_useful_with_an_empty_catalog() {
+        let answer = said("/help", &empty_catalog()).answer();
+        assert!(answer.contains("No commands installed"), "{answer}");
+    }
+
+    #[test]
+    fn an_installed_help_command_beats_the_builtin() {
+        // Writing help.md is an explicit choice to replace the default.
+        let (_dir, catalog) = catalog_with(&[("help.md", CMD)]);
+        let payload = said("/help", &catalog).run().payload.unwrap();
+        assert_eq!(payload["command"]["name"], "help");
+    }
+
+    #[test]
+    fn the_allowlist_is_checked_before_any_command_is_answered() {
+        // Otherwise an unlisted sender could enumerate the catalog with /help
+        // — a menu that leaks is exactly what the per-chat scope avoids.
+        let (_dir, catalog) = catalog_with(&[("commit-message.md", CMD)]);
+        let mut msg = inbound(99);
+        msg.text = "/help".into();
+        assert!(screen(&msg, &cfg(vec![7]), &mut limiter(), &catalog).is_rejected());
+    }
+
+    #[test]
+    fn an_unknown_command_still_spends_rate_budget() {
+        // Answering is cheap but not free, and a sender looping `/typo` should
+        // hit the same wall as one looping prose.
+        let (_dir, catalog) = catalog_with(&[("commit-message.md", CMD)]);
+        let c = cfg(vec![7]);
+        let mut rl = dotagent_notify::telegram_inbound::RateLimiter::new(1);
+        let mut msg = inbound(7);
+        msg.text = "/typo".into();
+        assert!(matches!(
+            screen(&msg, &c, &mut rl, &catalog),
+            Screened::Answer(_)
+        ));
+        assert_eq!(
+            screen(&msg, &c, &mut rl, &catalog).rejected(),
+            "rate limit exceeded"
+        );
     }
 
     #[test]

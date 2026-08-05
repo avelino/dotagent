@@ -6,6 +6,7 @@
 //! ```text
 //! $DOTAGENT_HOME/                 # default: ~/.config/dotagent
 //!   agents/<name>/                # manifests (or symlinks to them)
+//!   skills/<name>/SKILL.md        # procedures (or symlinks to them)
 //!   plugins/                      # custom plugin binaries
 //!   state/
 //!     agents/<name>/<slug>.heartbeat.json
@@ -68,6 +69,26 @@ pub fn state_windows_dir() -> PathBuf {
 
 pub fn state_plugins_dir() -> PathBuf {
     state_dir().join("plugins")
+}
+
+/// Skills — one directory per procedure, each holding a `SKILL.md`.
+///
+/// Not scaffolded: an empty catalog is a valid state, and creating a directory
+/// nobody asked for is noise. `~/.claude/skills` is searched alongside this one
+/// so a skill written for Claude Code is reachable without being copied.
+pub fn skills_dir() -> PathBuf {
+    home().join("skills")
+}
+
+/// Commands — one `.md` file per command, subdirectories namespaced with `:`.
+///
+/// Not scaffolded, for the same reason as [`skills_dir`]. Unlike skills,
+/// `~/.claude/commands` is **not** searched by default: a command becomes a
+/// published menu entry, and a catalog written for a terminal would fill it
+/// with entries that cannot work in a chat. Opt in with
+/// `[commands] claude_commands = true`.
+pub fn commands_dir() -> PathBuf {
+    home().join("commands")
 }
 
 /// Long-term agent memory, as an outl workspace.

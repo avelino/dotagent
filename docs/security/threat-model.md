@@ -189,6 +189,80 @@ installed agent as a callable tool.
 installed agent. That is user-equivalent capability, which the premise above
 already places outside the boundary.
 
+### V10 — Skill script execution
+
+A skill ([`concepts/skills.md`](../concepts/skills.md)) may package executables
+under `scripts/`, and `skill-run` executes one on request from an MCP client.
+Two things are new. Code runs **outside any manifest**, so nothing in
+`agent.toml` describes or bounds it. And the search path includes
+`~/.claude/skills/`, a directory that exists for another tool and that the
+operator did not create for dotagent.
+
+**Mitigations:**
+- **Path containment.** Absolute paths and `..` are refused before touching the
+  disk; the canonicalized target must still sit under the canonicalized skill
+  directory, which is what catches a symlink pointing outside.
+- **`scripts/` only, executable bit required.** A `references/` document is not
+  runnable, and dropping a helper beside an entry point does not silently make
+  it callable — the author names entry points by chmod.
+- **Supervised.** Every execution goes through `dotagent-supervisor`: enforced
+  deadline (`timeout_seconds`, default 300) and kill-tree on expiry, so a
+  script that spawns children cannot leave orphans.
+- **Arguments are a token list**, never a shell string — same rule as V5.
+- **Audited.** Each run appends `skill_invoked` (skill, script, exit code,
+  whether it timed out). Without it, "what ran on this machine" would have a
+  hole exactly where a manifest cannot answer.
+
+**Not mitigated:** anyone who can write to a skill directory can put a script
+there and have it run. That is the same statement V1 makes about manifests, and
+it now applies to `~/.claude/skills/` too — a directory whose contents may have
+been installed for a different tool with different expectations. Narrow the
+search path if that matters:
+
+```toml
+[skills]
+claude_skills = false
+paths = ["/Users/me/.config/dotagent/skills"]
+```
+
+Turning skills off entirely (`[skills] enabled = false`) removes both the tools
+and the execution path.
+
+### V11 — Commands
+
+A command ([`concepts/commands.md`](../concepts/commands.md)) is a prompt with
+no `scripts/` equivalent. Installing one grants **no execution**: everything it
+can cause is already reachable through the tools the dispatcher holds. That is
+the whole difference from V10, and it is why this entry is short.
+
+What remains is **influence** — a command file is text a model is told to
+follow, so anyone who can write the directory can steer an assistant that has
+real tools. Two smaller edges come from Telegram itself.
+
+**Mitigations:**
+- **No new execution vector.** The daemon resolves nothing; `command-get`
+  returns text. Arguments are substituted textually and never reach a shell.
+- **`~/.claude/commands/` is off by default**, the reverse of `claude_skills`.
+  A directory maintained for another tool does not become a published menu
+  because dotagent happened to find it.
+- **Per-chat menu scope.** `setMyCommands` is registered against each
+  allowlisted chat rather than `BotCommandScopeDefault`, so command names and
+  descriptions are not published to anyone who finds the bot. The allowlist
+  already gates execution; this keeps the *catalog* from leaking too.
+- **Screening order.** The allowlist and rate limit are checked before any
+  command is parsed or answered, so an unlisted sender cannot enumerate the
+  catalog with `/help`, and a sender looping `/typo` spends the same budget as
+  one looping prose.
+- **Audited by name only.** `command_dispatched` records the command and
+  whether it was `known`; arguments are content, the same reason
+  `trigger_received` never records a message body. Repeated `known: false` from
+  one sender is what probing looks like.
+
+**Not mitigated:** a command file is trusted input to the model, exactly as a
+skill body is. Write access to the commands directory is write access to what
+the assistant is told. `[commands] enabled = false` removes the menu and both
+tools.
+
 ## Defenses shipped in v0 (with the daemon engine)
 
 | Defense | Status | Scope |

@@ -50,7 +50,7 @@ Trigger context arrives as environment variables, alongside the usual `AGENT_*` 
 | `AGENT_TRIGGER_REPLY_TO` | opaque handle for the conversation to answer |
 | `AGENT_TRIGGER_PAYLOAD` | source-specific JSON body |
 
-`AGENT_TRIGGER_PAYLOAD` carries the message text. It rides in the environment rather than argv on purpose: a body that reached argv would be one quoting bug away from a shell problem, and every current producer is bounded well under `ARG_MAX` (a Telegram message caps at 4096 characters). A source with unbounded payloads should write a file into `AGENT_TMPDIR` rather than grow this variable.
+`AGENT_TRIGGER_PAYLOAD` carries the message text, plus a `command` object when the sender invoked one — see [Commands](commands.md#the-payload). It rides in the environment rather than argv on purpose: a body that reached argv would be one quoting bug away from a shell problem, and every current producer is bounded well under `ARG_MAX` (a Telegram message caps at 4096 characters). A source with unbounded payloads should write a file into `AGENT_TMPDIR` rather than grow this variable.
 
 These variables are applied *before* the `AGENT_*` block, so a payload can never redefine `AGENT_NAME` or `AGENT_HEARTBEAT_FILE`.
 

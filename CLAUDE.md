@@ -65,6 +65,8 @@ plugins/                 # plugins oficiais (cada um seu binário) — só prefl
   sink-{roam,file}/
 
 examples/                # agents minimais (hello-*) + casos reais (disk-alert)
+  skills/                # skills de exemplo (triage) — procedimento + scripts/ + references/
+  commands/              # commands de exemplo (standup) — um .md por command
 
 docs/
   concepts/              # agents.md, plugins.md (guias humanos)
@@ -91,6 +93,9 @@ docs/
 | Ingress (receber evento externo) | `dotagent-notify/src/<source>_inbound.rs` (transporte) + política no daemon |
 | Tipo do protocolo MCP | `dotagent-mcp/src/lib.rs` + `docs/reference/mcp.md` |
 | Memória de agent (outl) | `dotagent-memory/src/lib.rs` + `docs/concepts/memory.md` |
+| Skill (procedimento carregado sob demanda) | `dotagent-core/src/skill.rs` (parse) + `dotagent/src/skills.rs` (discovery + containment) + `docs/concepts/skills.md` |
+| Command (procedimento invocado por nome) | `dotagent-core/src/command.rs` (parse + args + nome Telegram) + `dotagent/src/slash.rs` (discovery) + `docs/concepts/commands.md` |
+| Parser de frontmatter (skill/command) | `dotagent-core/src/frontmatter.rs` — compartilhado, lenient de propósito |
 | Novo campo em `[telegram]` | `dotagent-core/src/config.rs` + `docs/guides/config-reference.md` + `docs/concepts/telegram.md` |
 | Novo preflight/sink | novo crate em `plugins/` |
 | Novo notifier de terceiro (não built-in) | novo crate em `plugins/` (kind = `notify`) |

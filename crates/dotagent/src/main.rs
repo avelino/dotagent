@@ -10,6 +10,8 @@ use clap_complete::Shell;
 
 mod commands;
 mod discovery;
+mod skills;
+mod slash;
 
 #[derive(Parser, Debug)]
 #[command(name = "dotagent", about = "Polyglot agent orchestrator.", version)]
