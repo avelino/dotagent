@@ -93,8 +93,8 @@ impl RunSpec<'_> {
 // stdout_tail is consumed by:
 // - sink plugins (need the full Roam-formatted output — root + children)
 // - notify plugins (need a short summary)
-// Bumping to 500 covers typical agent outputs (linkedin: ~10 lines, dora
-// standup: ~50, finops: ~100) without ballooning memory. A proper split
+// Bumping to 500 covers typical agent outputs (a post draft: ~10 lines, a
+// standup: ~50, a cost report: ~100) without ballooning memory. A proper split
 // (full stdout for sinks, tail for notifies) is a future refactor.
 const TAIL_LINES: usize = 500;
 const SIGKILL_GRACE_SECONDS: u64 = 5;
@@ -540,11 +540,21 @@ fn apply_env_for(
     heartbeat: &Path,
     persist_key: Option<&str>,
 ) {
-    if let Some(env_cfg) = &spec.manifest.env {
-        if !env_cfg.inherit {
-            cmd.env_clear();
-        }
-        for (k, v) in &env_cfg.extra {
+    let env_cfg = spec.manifest.env.as_ref();
+    let inherit = env_cfg.map_or(true, |e| e.inherit);
+    if !inherit {
+        cmd.env_clear();
+    }
+    // Before `[env.extra]`, so a manifest that names a locale still wins.
+    if let Some(lang) = default_locale(
+        inherit,
+        std::env::var_os("LANG"),
+        std::env::var_os("LC_ALL"),
+    ) {
+        cmd.env("LANG", lang);
+    }
+    if let Some(cfg) = env_cfg {
+        for (k, v) in &cfg.extra {
             cmd.env(k, v);
         }
     }
@@ -572,6 +582,48 @@ fn apply_env_for(
     }
     let argv_json = serde_json::to_string(spec.args).unwrap_or_else(|_| "[]".into());
     cmd.env("AGENT_ARGV", argv_json);
+}
+
+/// The locale to fall back to when the parent process names none.
+///
+/// macOS ships no `C.UTF-8`, and glibc only grew one in 2.35 — so neither
+/// value works everywhere and the target decides. On a system without the
+/// chosen locale `setlocale` fails and the process lands back in `C`, which is
+/// exactly where it started: no regression, just no fix.
+#[cfg(target_os = "macos")]
+const FALLBACK_LOCALE: &str = "en_US.UTF-8";
+#[cfg(not(target_os = "macos"))]
+const FALLBACK_LOCALE: &str = "C.UTF-8";
+
+/// Pick a `LANG` for the agent, or `None` when the parent already named one.
+///
+/// launchd and systemd start a daemon with no `LANG` and no `LC_ALL`, and
+/// every agent inherits that gap. A process in the resulting `C` locale has
+/// `MB_CUR_MAX == 1`, so it reads each **byte** of an environment variable as
+/// one character — Latin-1 — and writes it back out as UTF-8. The UTF-8 "é" a
+/// Telegram message puts in `AGENT_TRIGGER_PAYLOAD` reaches the agent as "Ã©",
+/// and the agent has no way to tell that apart from text that really said
+/// "Ã©".
+///
+/// Observed with fish 3.7.1: an env var round-trips as `c3 a9 -> c3 83 c2 a9`
+/// under `C` and unchanged under `en_US.UTF-8`. Command-substitution output is
+/// *not* affected, which is why the same run logged a mangled prompt beside a
+/// clean answer for two months without anyone being able to place the bug.
+///
+/// Kept pure so the decision is testable without mutating the process
+/// environment, which every other test in this file would then race against.
+fn default_locale(
+    inherit: bool,
+    parent_lang: Option<std::ffi::OsString>,
+    parent_lc_all: Option<std::ffi::OsString>,
+) -> Option<&'static str> {
+    // `env_clear()` drops whatever the parent had, so an inherited locale only
+    // counts when the agent is actually inheriting.
+    let inherited = inherit && (parent_lang.is_some() || parent_lc_all.is_some());
+    if inherited {
+        return None;
+    }
+    Some(FALLBACK_LOCALE)
 }
 
 fn tail_lines(s: &str, n: usize) -> (String, usize) {
@@ -636,6 +688,110 @@ command = "true"
             .into_iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v)
+    }
+
+    // --- locale: the `C` locale mangles every non-ASCII byte we inject ---
+
+    fn os(s: &str) -> Option<std::ffi::OsString> {
+        Some(std::ffi::OsString::from(s))
+    }
+
+    #[test]
+    fn locale_is_named_when_the_parent_named_none() {
+        // launchd and systemd both start a daemon this way.
+        assert_eq!(default_locale(true, None, None), Some(FALLBACK_LOCALE));
+    }
+
+    #[test]
+    fn fallback_locale_is_utf8() {
+        // The whole point is `MB_CUR_MAX > 1`. A locale without a UTF-8
+        // charset would satisfy "is set" and still corrupt the payload.
+        assert!(
+            FALLBACK_LOCALE.to_ascii_uppercase().ends_with("UTF-8"),
+            "fallback must name a UTF-8 charset, got {FALLBACK_LOCALE}"
+        );
+    }
+
+    #[test]
+    fn an_inherited_lang_is_left_alone() {
+        assert_eq!(default_locale(true, os("pt_BR.UTF-8"), None), None);
+    }
+
+    #[test]
+    fn an_inherited_lc_all_is_left_alone() {
+        // LC_ALL outranks LANG, so naming LANG under it would be a no-op that
+        // reads like a fix.
+        assert_eq!(default_locale(true, None, os("pt_BR.UTF-8")), None);
+    }
+
+    #[test]
+    fn a_cleared_environment_gets_the_locale_back() {
+        // `inherit = false` calls `env_clear()`, so whatever the parent had is
+        // gone and the agent is back in `C` — the case that needs it most.
+        assert_eq!(
+            default_locale(false, os("pt_BR.UTF-8"), os("pt_BR.UTF-8")),
+            Some(FALLBACK_LOCALE)
+        );
+    }
+
+    #[test]
+    fn the_manifest_can_override_the_locale() {
+        let m = manifest(
+            r#"
+[agent]
+name = "x"
+[run]
+command = "true"
+[env.extra]
+LANG = "pt_BR.UTF-8"
+"#,
+        );
+        let args: Vec<String> = vec![];
+        let spec = spec_with(&m, &args, None, &[]);
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "x",
+            "default",
+            &Local::now(),
+            Path::new("/tmp"),
+            Path::new("/tmp/hb.json"),
+        );
+        assert_eq!(lookup(&cmd, "LANG").as_deref(), Some("pt_BR.UTF-8"));
+    }
+
+    #[test]
+    fn a_trigger_payload_keeps_its_bytes_through_the_env() {
+        // The value the agent reads must be the value the daemon serialized,
+        // byte for byte. Anything that re-encodes it here is the bug this
+        // whole locale dance exists to prevent.
+        let m = minimal();
+        let args: Vec<String> = vec![];
+        let payload = r#"{"text":"quem é thiago avelino?"}"#.to_string();
+        let extra = vec![("AGENT_TRIGGER_PAYLOAD".to_string(), payload.clone())];
+        let spec = spec_with(&m, &args, None, &extra);
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "x",
+            "default",
+            &Local::now(),
+            Path::new("/tmp"),
+            Path::new("/tmp/hb.json"),
+        );
+        assert_eq!(lookup(&cmd, "AGENT_TRIGGER_PAYLOAD"), Some(payload));
+        // Either the runner named a locale or the parent already had one —
+        // what must never happen is the agent starting in `C` with this in
+        // its environment. (`cargo test` inherits a locale, so the second arm
+        // is the one that fires locally; under launchd it is the first.)
+        assert!(
+            lookup(&cmd, "LANG").is_some()
+                || std::env::var_os("LANG").is_some()
+                || std::env::var_os("LC_ALL").is_some(),
+            "a payload with non-ASCII needs a locale that can read it"
+        );
     }
 
     #[test]

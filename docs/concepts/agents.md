@@ -135,7 +135,7 @@ command = "./target/release/my-agent"
 # Bash one-liner directly
 [run]
 command = "/bin/sh"
-args = ["-c", "curl -s https://example.com/data | jq . > $AGENT_TMPDIR/data.json"]
+args = ["-c", "curl -sf --max-time 20 https://example.com/data | jq . > $AGENT_TMPDIR/data.json"]
 ```
 
 ### Discovery
@@ -185,11 +185,14 @@ cat > agent.fish <<'EOF'
 #   $AGENT_HOME    — this directory
 #   $AGENT_DRY_RUN — "true" / "false"
 
-set -l stories (curl -s 'https://hacker-news.firebaseio.com/v0/topstories.json' \
+# --max-time on every call: `timeout_seconds` in the manifest is the
+# backstop that kills a wedged run, not the thing that keeps one call
+# from eating the whole budget.
+set -l stories (curl -sf --max-time 20 'https://hacker-news.firebaseio.com/v0/topstories.json' \
     | jq -r '.[:5][]')
 
 for id in $stories
-    curl -s "https://hacker-news.firebaseio.com/v0/item/$id.json" \
+    curl -sf --max-time 20 "https://hacker-news.firebaseio.com/v0/item/$id.json" \
         | jq -r '"- \(.title)  (\(.score) points)\n  \(.url // "n/a")"'
 end
 EOF
@@ -219,7 +222,7 @@ minute = 0
 # Persist the agent's stdout to a file we can grep later.
 [[on_success]]
 plugin = "sink-file"
-config = { path = "/Users/avelino/reports/hn-today.md", mode = "overwrite" }
+config = { path = "/Users/me/reports/hn-today.md", mode = "overwrite" }
 EOF
 ```
 
@@ -228,7 +231,7 @@ EOF
 ```bash
 dotagent doctor                                 # validate
 dotagent run hn-morning --schedule daily        # run once, foreground
-cat /Users/avelino/reports/hn-today.md          # see the output
+cat /Users/me/reports/hn-today.md               # see the output
 ```
 
 If the manifest is right and `agent.fish` is executable, the file shows
@@ -263,7 +266,7 @@ flowchart LR
     apis[APIs] --> jq["jq filter"] --> sink["sink-file / sink-roam"]
 ```
 
-**Examples:** roam-hugo-sync, sync-calendars, gemini-notes-to-roam.
+**Examples:** notes-to-blog, calendar-to-webhook.
 
 **When to pick this:** the output is structured data, not prose. You
 know exactly what fields you need.
@@ -301,7 +304,7 @@ flowchart LR
     haiku --> apply2["batchModify labels"]
 ```
 
-**Examples:** gmail-triage.
+**Examples:** inbox-triage.
 
 **When to pick this:** 60-80% of cases are deterministic. Pay tokens
 only for the hard 20%.
@@ -315,7 +318,7 @@ flowchart LR
     sources["HN + Reddit + Lobsters"] --> claude --> roam["sink-roam<br/>(replace block)"]
 ```
 
-**Examples:** linkedin-hot-take, gemini-notes-to-roam.
+**Examples:** post-draft, meeting-notes-sync.
 
 **When to pick this:** output is drafted prose. Re-running shouldn't
 duplicate — use a sink that supports `marker_regex` (sink-roam) or
@@ -360,6 +363,7 @@ inherited environment (unless `env.inherit = false` in the manifest):
 | `AGENT_LIFECYCLE`      | `persistent` when the agent stays alive between runs; absent otherwise |
 | `AGENT_PERSIST_KEY`    | which slice a persistent instance answers for              |
 | `AGENT_HEARTBEAT_FILE` | path to the heartbeat file (empty if `dry_run`)       |
+| `LANG`                 | a UTF-8 locale, **only** when neither `LANG` nor `LC_ALL` was inherited — see [agent-spec](../reference/agent-spec.md#lang) |
 
 Use them. Don't reinvent (no need for your own tempdir, no need to write
 your own state).
@@ -487,7 +491,7 @@ end
 
 **Use sparingly.** It couples A to B and bypasses B's own schedule logic.
 Right when the trigger is genuinely event-driven, not time-driven —
-"after every gmail-triage success, run the unsubscribe sweep if it
+"after every inbox-triage success, run the unsubscribe sweep if it
 flagged anything."
 
 ### 4. Schedule alignment
@@ -548,26 +552,25 @@ Otherwise it's something else.
 
 ## Examples gallery
 
-The Fish framework that dotagent grew out of has nine agents in
-production. The shapes:
+A realistic set, once you have a handful of agents running side by side.
+Every row is one of the five patterns above, wired to a different source:
 
-| Agent                       | Pattern              | Notes                                                    |
-|-----------------------------|----------------------|----------------------------------------------------------|
-| `hourly-briefing`            | Brief / digest       | Sentry + Slack → haiku → iMessage. 14 runs/day weekday.  |
-| `team-standup`   | Brief / digest       | GitHub (30+ repos) + Sentry → sonnet → Roam. WARP preflight, retry 20x. |
-| `finops-weekly`              | Pure collector       | AWS multi-account → sonnet → file. Weekly.               |
-| `calendar-to-resend`        | Connector            | gcal → Resend HTTP. No LLM.                              |
-| `gemini-notes-to-roam`      | Generator + idempotent| Gmail (Gemini Notes) → sonnet → Roam. Every 4h.          |
-| `gmail-triage`              | Triage / classifier  | Gmail → heuristic + haiku → labels. Every 90 min.        |
-| `linkedin-hot-take`         | Generator + idempotent| HN + Reddit + Lobsters → claude → Roam draft. Weekday 7am.|
-| `roam-hugo-sync`            | Pure collector       | Roam → Hugo blog. 10am + 22h.                             |
-| `agent-orchestrator` (legacy)| Watchdog            | Now replaced by `dotagent daemon`.                        |
+| Agent                  | Pattern               | Notes                                                     |
+|------------------------|-----------------------|-----------------------------------------------------------|
+| `hourly-briefing`      | Brief / digest        | Sentry + Slack → haiku → iMessage. 14 runs/day weekday.    |
+| `team-standup`         | Brief / digest        | GitHub (30+ repos) + Sentry → sonnet → Roam. WARP preflight, retry 20x. |
+| `finops-weekly`        | Pure collector        | AWS multi-account → sonnet → file. Weekly.                 |
+| `calendar-to-webhook`  | Connector             | gcal → HTTP webhook. No LLM.                               |
+| `meeting-notes-sync`   | Generator + idempotent| Mailbox (meeting recaps) → sonnet → Roam. Every 4h.        |
+| `inbox-triage`         | Triage / classifier   | Gmail → heuristic + haiku → labels. Every 90 min.          |
+| `post-draft`           | Generator + idempotent| HN + Reddit + Lobsters → claude → Roam draft. Weekday 7am. |
+| `notes-to-blog`        | Pure collector        | Roam → static-site blog. 10am + 22h.                       |
+| `backup-offsite`       | Watchdog / preflight  | VPN preflight, then rsync. Nightly, retry until the link is up. |
 
-Each agent's directory in [avelino/dotfiles](https://github.com/avelino/dotfiles)
-has a `CLAUDE.md` documenting the pipeline + decisions. Read those for
-real-world wiring of the patterns above.
+The point of the table is the middle column: pick the pattern first, then
+decide which source and sink it hangs off.
 
-For the **simplest possible agent**, see [`examples/hello-fish/`](../examples/hello-fish/)
+For the **simplest possible agent**, see [`examples/hello-fish/`](../../examples/hello-fish/)
 in this repo (and the parallel `hello-python/`, `hello-go/`, `hello-rust/`).
 
 For a **complete agent that calls a model**, see

@@ -9,7 +9,7 @@
 //! exit code — the run already happened. Errors are logged and audited.
 
 use dotagent_core::{audit::AuditEvent, manifest::AgentManifest};
-use dotagent_notify::{NotifierConfig, NotifyContext, NotifyError};
+use dotagent_notify::{NotifierConfig, NotifierEntry, NotifyContext, NotifyError};
 use dotagent_plugin::{InvokePayload, PluginClient, PluginKind};
 use dotagent_state::AuditLog;
 use tracing::{debug, warn};
@@ -25,14 +25,43 @@ pub async fn fire_notifiers(
     plugins: Option<&PluginClient>,
     audit: Option<&AuditLog>,
 ) {
+    fire_notifier_entries(
+        &manifest.agent.name,
+        &manifest.notifiers,
+        schedule_id,
+        event,
+        message,
+        plugins,
+        audit,
+    )
+    .await
+}
+
+/// Same dispatch, for entries that do not come from a manifest.
+///
+/// The daemon's daily summary is not an agent — it has no `agent.toml`, no
+/// schedule and no run — but it is delivered by the same drivers, and it wants
+/// the same audit trail and the same reply correlation. Taking the entries
+/// directly is what lets it reuse this without fabricating a manifest that no
+/// file backs.
+#[allow(clippy::too_many_arguments)]
+pub async fn fire_notifier_entries(
+    agent: &str,
+    entries: &[NotifierEntry],
+    schedule_id: &str,
+    event: &str,
+    message: &str,
+    plugins: Option<&PluginClient>,
+    audit: Option<&AuditLog>,
+) {
     let ctx = NotifyContext {
-        agent: &manifest.agent.name,
+        agent,
         schedule: schedule_id,
         event,
         message,
     };
 
-    for entry in &manifest.notifiers {
+    for entry in entries {
         if !entry.matches_event(event) {
             continue;
         }
@@ -46,7 +75,7 @@ pub async fn fire_notifiers(
             };
             let payload = InvokePayload {
                 kind: PluginKind::Notify,
-                agent: manifest.agent.name.clone(),
+                agent: agent.to_string(),
                 schedule: schedule_id.to_string(),
                 event: event.into(),
                 message: Some(message.into()),
@@ -61,7 +90,7 @@ pub async fn fire_notifiers(
             };
             if let Some(log) = audit {
                 let _ = log.append(AuditEvent::PluginInvoked {
-                    agent: manifest.agent.name.clone(),
+                    agent: agent.to_string(),
                     plugin: p.name.clone(),
                     plugin_kind: "notify".into(),
                     ok,
@@ -76,7 +105,7 @@ pub async fn fire_notifiers(
             Ok(None) => continue, // shouldn't happen — plugin branch handled above
             Err(e) => {
                 warn!(driver, error = %e, "failed to build notifier");
-                audit_notifier(audit, manifest, driver, false);
+                audit_notifier(audit, agent, driver, false);
                 continue;
             }
         };
@@ -116,20 +145,15 @@ pub async fn fire_notifiers(
                 (false, false)
             }
         };
-        audit_notifier(audit, manifest, driver, ok);
+        audit_notifier(audit, agent, driver, ok);
         let _ = skipped;
     }
 }
 
-fn audit_notifier(
-    audit: Option<&AuditLog>,
-    manifest: &AgentManifest,
-    driver: &'static str,
-    ok: bool,
-) {
+fn audit_notifier(audit: Option<&AuditLog>, agent: &str, driver: &'static str, ok: bool) {
     if let Some(log) = audit {
         let _ = log.append(AuditEvent::PluginInvoked {
-            agent: manifest.agent.name.clone(),
+            agent: agent.to_string(),
             plugin: format!("notifier:{driver}"),
             plugin_kind: "notify".into(),
             ok,

@@ -251,21 +251,33 @@ In another terminal, see the dashboard:
 
 ```bash
 dotagent status
-# → ═══ Agent Health · 2026-05-19 14:32 ═══
-# →
-# →   ✅ ok       1/1
-# →
-# →   AGENT/SCHEDULE                         STATE       LAST RUN              REASON
-# →   ──────────────────────────────────────────────────────────────────
-# →   hello/every-2min                       ✅ ok       2026-05-19T14:30:01    last_success_at fresh
 ```
+
+```text
+═══ Agent Health · 2026-08-06 14:32 ═══
+
+  ✅ ok       1/1
+  ⚠️  degraded 0
+  ❌ failing  0
+  🕑 stale    0
+
+AGENT/SCHEDULE                       STATE       LAST RUN                   REASON
+────────────────────────────────────────────────────────────────────────────────────────────────────
+hello/every-2min                     ✅ ok        2026-08-06T14:30:01-0300   ok
+```
+
+One row per `(agent, schedule)`, and `REASON` says which piece of state
+decided the verdict — see
+[`reference/cli.md`](../reference/cli.md#reading-the-reason-column).
 
 Wait for a "demo failure" minute (`:00`, `:05`, `:10`...) and you'll
 see:
 
 - A **desktop banner** ("hello — free space low" style) pop up
-- The dashboard shifts the agent into `failing`
-- After 2 retries it transitions to `given_up`
+- The dashboard shifts the agent into `failing`, with the attempts
+  burned so far in `REASON` (`2 attempts, will retry`)
+- After the retry budget runs out it transitions to `given_up`, and
+  `REASON` switches to `gave up after 3 attempts`
 - The audit log records every step
 
 ```bash

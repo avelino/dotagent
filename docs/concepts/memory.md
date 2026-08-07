@@ -29,7 +29,7 @@ flowchart TD
 
 Ask for the day and you get what happened. Ask for `dotagent` and you get everything known about it, gathered across months. One copy, two ways in.
 
-Topics are normalized before they become slugs: `Roam Research`, `roam research` and `  Roam   Research  ` all land on `roam-research`. Without that, capitalization alone would split a subject into disconnected pages and each half would look incomplete. A `/` survives, because hierarchy is a real thing in outl — `buser/finops` is a page path.
+Topics are normalized before they become slugs: `Roam Research`, `roam research` and `  Roam   Research  ` all land on `roam-research`. Without that, capitalization alone would split a subject into disconnected pages and each half would look incomplete. A `/` survives, because hierarchy is a real thing in outl — `ops/cost-report` is a page path.
 
 **Reuse topics.** The value is in the gathering, and gathering only works if the same subject keeps the same name. `memory-topics` exists so an agent can check before inventing one.
 

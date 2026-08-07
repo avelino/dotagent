@@ -14,6 +14,9 @@
 //! per_agent_retention_days = 14
 //! compress_after_days = 1   # gzip rotated files older than N days
 //!
+//! [state]
+//! window_retention_days = 30   # state/windows/*.json; 0 keeps them forever
+//!
 //! [telemetry]
 //! # Empty / absent = OTel disabled (default).
 //! otlp_endpoint = ""        # e.g., "https://api.honeycomb.io:443"
@@ -27,11 +30,24 @@
 //! [telemetry.resource]
 //! # Resource attributes attached to every span/log.
 //! "deployment.environment" = "production"
+//!
+//! [daily_summary]
+//! time = "22:45"            # local HH:MM the daemon delivers the summary
+//! grace_minutes = 30        # how late a wake-up is still allowed to deliver
+//! enabled = true
+//!
+//! [[daily_summary.notifiers]]
+//! # Same shape as a manifest's `[[notifiers]]`. Absent = desktop.
+//! driver = "telegram"
+//! bot_token = "${TELEGRAM_BOT_TOKEN}"
+//! chat_id = "123456789"
 //! ```
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use chrono::NaiveTime;
+use dotagent_notify::NotifierEntry;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -40,6 +56,8 @@ use crate::error::{Error, Result};
 pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub state: StateConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     #[serde(default)]
@@ -52,6 +70,101 @@ pub struct Config {
     pub skills: SkillsConfig,
     #[serde(default)]
     pub commands: CommandsConfig,
+    #[serde(default)]
+    pub daily_summary: DailySummaryConfig,
+}
+
+/// End-of-day health summary — when it goes out, and to whom.
+///
+/// Works with no config file: on by default, at 22:45 local, delivered to the
+/// `desktop` driver. Desktop is the fallback because it is the only driver
+/// with nothing to fill in and nothing to leak — no credential, no network,
+/// no address that could be wrong. Every other destination needs a chat id, a
+/// phone number or a webhook, and there is no universal default for those.
+///
+/// ```toml
+/// [daily_summary]
+/// time = "07:30"        # a morning report reads better than a bedtime one
+/// grace_minutes = 60    # laptop opens late; still deliver
+/// enabled = false       # or drop it entirely
+///
+/// [[daily_summary.notifiers]]
+/// driver = "telegram"
+/// bot_token = "${TELEGRAM_BOT_TOKEN}"
+/// chat_id = "123456789"
+/// ```
+///
+/// `notifiers` takes the same entries a manifest's `[[notifiers]]` takes,
+/// including `driver = "plugin"`. Listing more than one delivers to all of
+/// them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DailySummaryConfig {
+    /// Deliver the summary at all.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Local time of day, `HH:MM` (or `HH:MM:SS`).
+    ///
+    /// A value that does not parse falls back to [`DEFAULT_DAILY_SUMMARY_TIME`]
+    /// rather than disabling delivery: a typo here should cost you a wrong
+    /// hour, not a silent month.
+    #[serde(default = "default_daily_summary_time")]
+    pub time: String,
+    /// How long after [`Self::time`] a delivery still counts.
+    ///
+    /// The daemon schedules a wake-up for `time`, so under normal operation
+    /// this is unused. It covers the cases where the wake-up cannot happen at
+    /// all — laptop asleep, machine off, a tick that overran its own sleep
+    /// budget. Clamped to at least 1 minute, because a zero-width window is
+    /// an empty one and would silently deliver nothing.
+    #[serde(default = "default_daily_summary_grace")]
+    pub grace_minutes: u32,
+    /// Where the summary goes. Empty means the `desktop` driver.
+    #[serde(default)]
+    pub notifiers: Vec<NotifierEntry>,
+}
+
+/// Time of day used when `[daily_summary].time` is absent or unparseable.
+pub const DEFAULT_DAILY_SUMMARY_TIME: NaiveTime = match NaiveTime::from_hms_opt(22, 45, 0) {
+    Some(t) => t,
+    None => unreachable!(),
+};
+
+fn default_daily_summary_time() -> String {
+    "22:45".into()
+}
+fn default_daily_summary_grace() -> u32 {
+    30
+}
+
+impl Default for DailySummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            time: default_daily_summary_time(),
+            grace_minutes: default_daily_summary_grace(),
+            notifiers: Vec::new(),
+        }
+    }
+}
+
+impl DailySummaryConfig {
+    /// Parsed [`Self::time`], or `None` when it is not a valid time of day.
+    pub fn time_of_day(&self) -> Option<NaiveTime> {
+        let raw = self.time.trim();
+        NaiveTime::parse_from_str(raw, "%H:%M:%S")
+            .or_else(|_| NaiveTime::parse_from_str(raw, "%H:%M"))
+            .ok()
+    }
+
+    /// [`Self::time_of_day`] with the documented fallback applied.
+    pub fn time_or_default(&self) -> NaiveTime {
+        self.time_of_day().unwrap_or(DEFAULT_DAILY_SUMMARY_TIME)
+    }
+
+    /// Grace window in minutes, never zero.
+    pub fn effective_grace_minutes(&self) -> u32 {
+        self.grace_minutes.clamp(1, 24 * 60)
+    }
 }
 
 /// Commands — procedures a human invokes by name, published as a Telegram menu.
@@ -294,6 +407,51 @@ impl SecretsConfig {
     }
 }
 
+/// Retention for what dotagent writes under `state/`.
+///
+/// Works with no config file: the defaults already bound the only directory
+/// that grows without limit. A schedule produces one window file per fired
+/// window and never revisits it, so a 15-minute agent alone leaves ~96 files
+/// a day behind — pairs of `.json` + `.lock` that nothing ever reclaimed
+/// before this existed.
+///
+/// ```toml
+/// [state]
+/// window_retention_days = 90   # keep a quarter of retry history
+/// # window_retention_days = 0  # or keep everything, forever
+/// ```
+///
+/// Heartbeats are deliberately not covered: there is exactly one per
+/// `(agent, schedule)` and it is rewritten in place, so the directory is
+/// bounded by how many schedules exist.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateConfig {
+    /// Days to keep `state/windows/<agent>-<slug>-<window>.json` (and the
+    /// `.lock` beside it). `0` disables the sweep entirely.
+    ///
+    /// The horizon has to clear the oldest window the daemon might still
+    /// consult. A window stops being actionable once it is older than the
+    /// schedule's `stale_after_minutes` (default 120), which the default here
+    /// exceeds by ~360×. Even a wildly permissive `stale_after_minutes` of a
+    /// full week still has four days of headroom. Erring high costs a few MB;
+    /// erring low deletes retry state under a running daemon, which resets
+    /// `attempts` and re-fires an alert someone already gave up on.
+    #[serde(default = "default_window_retention_days")]
+    pub window_retention_days: u32,
+}
+
+fn default_window_retention_days() -> u32 {
+    30
+}
+
+impl Default for StateConfig {
+    fn default() -> Self {
+        Self {
+            window_retention_days: default_window_retention_days(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default = "default_level")]
@@ -474,6 +632,154 @@ mod tests {
         let c = Config::load(&p).unwrap();
         assert!(c.commands.enabled, "unset fields keep their default");
         assert!(c.commands.claude_commands);
+    }
+
+    // --- state retention: the knob that decides whether a window a retry
+    // still depends on survives the nightly sweep. ---
+
+    #[test]
+    fn window_retention_works_without_a_config_file() {
+        // The whole point: nobody should have to write config.toml to stop
+        // state/windows from growing forever.
+        let c = Config::default();
+        assert_eq!(c.state.window_retention_days, 30);
+    }
+
+    #[test]
+    fn window_retention_survives_an_unrelated_config_file() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[logging]\nlevel = \"debug\"\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.state.window_retention_days, 30);
+    }
+
+    #[test]
+    fn window_retention_can_be_widened() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[state]\nwindow_retention_days = 90\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.state.window_retention_days, 90);
+    }
+
+    #[test]
+    fn window_retention_zero_means_keep_everything() {
+        // Zero is an opt-out, not "delete everything" — the reading that would
+        // wipe live retry state must not be the one a typo selects.
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[state]\nwindow_retention_days = 0\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert_eq!(c.state.window_retention_days, 0);
+    }
+
+    // --- daily summary: the section that decides whether the end-of-day
+    // report reaches a human at all. It used to reach a hardcoded phone
+    // number that belonged to nobody. ---
+
+    #[test]
+    fn daily_summary_works_without_a_config_file() {
+        let c = Config::default();
+        assert!(c.daily_summary.enabled);
+        assert_eq!(
+            c.daily_summary.time_or_default(),
+            NaiveTime::from_hms_opt(22, 45, 0).unwrap()
+        );
+        assert_eq!(c.daily_summary.effective_grace_minutes(), 30);
+        assert!(
+            c.daily_summary.notifiers.is_empty(),
+            "empty means the desktop fallback, resolved at delivery"
+        );
+    }
+
+    #[test]
+    fn daily_summary_time_parses_both_shapes() {
+        let c = DailySummaryConfig {
+            time: "07:05".into(),
+            ..Default::default()
+        };
+        assert_eq!(c.time_of_day(), NaiveTime::from_hms_opt(7, 5, 0));
+        let c = DailySummaryConfig {
+            time: " 23:59:30 ".into(),
+            ..Default::default()
+        };
+        assert_eq!(c.time_of_day(), NaiveTime::from_hms_opt(23, 59, 30));
+    }
+
+    #[test]
+    fn daily_summary_bad_time_falls_back_instead_of_silencing() {
+        // A typo must cost the wrong hour, not the whole feature.
+        for bad in ["", "25:00", "22.45", "quarter to eleven", "22:60"] {
+            let c = DailySummaryConfig {
+                time: bad.into(),
+                ..Default::default()
+            };
+            assert_eq!(c.time_of_day(), None, "{bad} should not parse");
+            assert_eq!(c.time_or_default(), DEFAULT_DAILY_SUMMARY_TIME, "{bad}");
+        }
+    }
+
+    #[test]
+    fn daily_summary_grace_is_never_zero() {
+        // grace_minutes = 0 would make the window half-open on itself: empty.
+        // Delivery would stop with no error anywhere — the exact failure mode
+        // this section exists to end.
+        let c = DailySummaryConfig {
+            grace_minutes: 0,
+            ..Default::default()
+        };
+        assert_eq!(c.effective_grace_minutes(), 1);
+    }
+
+    #[test]
+    fn daily_summary_grace_is_capped_at_a_day() {
+        let c = DailySummaryConfig {
+            grace_minutes: u32::MAX,
+            ..Default::default()
+        };
+        assert_eq!(c.effective_grace_minutes(), 24 * 60);
+    }
+
+    #[test]
+    fn daily_summary_parses_notifiers_from_toml() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(
+            &p,
+            "[daily_summary]\ntime = \"07:30\"\n\n[[daily_summary.notifiers]]\ndriver = \"telegram\"\nbot_token = \"${TG}\"\nchat_id = \"42\"\n",
+        )
+        .unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(c.daily_summary.enabled, "unset fields keep their default");
+        assert_eq!(
+            c.daily_summary.time_of_day(),
+            NaiveTime::from_hms_opt(7, 30, 0)
+        );
+        assert_eq!(c.daily_summary.notifiers.len(), 1);
+        assert_eq!(c.daily_summary.notifiers[0].driver_name(), "telegram");
+    }
+
+    #[test]
+    fn daily_summary_survives_an_unrelated_config_file() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[logging]\nlevel = \"debug\"\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(c.daily_summary.enabled);
+        assert_eq!(
+            c.daily_summary.time_or_default(),
+            DEFAULT_DAILY_SUMMARY_TIME
+        );
+    }
+
+    #[test]
+    fn daily_summary_can_be_turned_off() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[daily_summary]\nenabled = false\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(!c.daily_summary.enabled);
     }
 
     #[test]

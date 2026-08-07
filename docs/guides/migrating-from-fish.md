@@ -15,7 +15,7 @@ and new run side by side until you migrate the last agent.
 | `lib/run-with-timeout.fish`         | built into `dotagent run` (`agent.timeout_seconds`)  |
 | `agents/agent-orchestrator` (tick)  | `dotagent daemon` (adaptive, single plist) + `dotagent tick` (one-shot) |
 | `agents/agent-orchestrator --status`| `dotagent status` (read-only dashboard)              |
-| `agents/agent-orchestrator --daily-summary` | `dotagent daily-summary` + daemon's internal 22:45 fire |
+| `agents/agent-orchestrator --daily-summary` | `dotagent daily-summary` + the daemon's own fire at `[daily_summary].time` (default 22:45) |
 | `cron.nix` launchd config           | `dotagent install` (single `run.avelino.dotagent` plist) |
 | `agent_output_imessage`             | built-in notifier `[[notifiers]] driver = "imessage"` (with `rate_limit_minutes`) |
 | `lib/roam.fish` (`roam_publish`)    | plugin `sink-roam` (full port: sanitize + parse + idempotent replace) |

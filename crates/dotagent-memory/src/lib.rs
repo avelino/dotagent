@@ -260,7 +260,7 @@ fn is_journal_slug(slug: &str) -> bool {
 
 /// Normalize a topic into an outl slug.
 ///
-/// Lowercase, `/` preserved for hierarchy (`buser/finops` is a real page
+/// Lowercase, `/` preserved for hierarchy (`ops/cost-report` is a real page
 /// path in outl), everything else collapsed to a single dash. Without this,
 /// "Roam Research" and "roam research" would be two disconnected pages and
 /// the graph would fragment on capitalization.
@@ -421,7 +421,7 @@ mod tests {
         assert_eq!(slugify("roam research"), "roam-research");
         assert_eq!(slugify("  Roam   Research  "), "roam-research");
         // Hierarchy is a real thing in outl, so `/` survives.
-        assert_eq!(slugify("buser/finops"), "buser/finops");
+        assert_eq!(slugify("ops/cost-report"), "ops/cost-report");
         assert_eq!(slugify("Reunião!!"), "reunião");
         assert_eq!(slugify("---"), "");
     }
@@ -429,7 +429,7 @@ mod tests {
     #[test]
     fn title_is_readable_and_keeps_only_the_leaf() {
         assert_eq!(title_for("roam-research"), "Roam Research");
-        assert_eq!(title_for("buser/finops"), "Finops");
+        assert_eq!(title_for("ops/cost-report"), "Cost Report");
     }
 
     #[test]

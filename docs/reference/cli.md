@@ -123,7 +123,7 @@ how to install / start / stop / reload the daemon end-to-end.
 ## `status`
 
 Textual health dashboard. Read-only — never writes to audit, never
-dispatches.
+dispatches. Takes no flags.
 
 ```bash
 dotagent status
@@ -132,47 +132,168 @@ dotagent status
 **Output**:
 
 ```text
-═══ Agent Health · 2026-05-19 14:32 ═══
+═══ Agent Health · 2026-08-06 17:51 ═══
 
-  ✅ ok       3/5
+  ✅ ok       2/5
   ⚠️  degraded 1
   ❌ failing  1
-  🕑 stale    0
+  🕑 stale    1
 
-AGENT/SCHEDULE                         STATE        LAST RUN                  REASON
-────────────────────────────────────────────────────────────────────────────────────
-team-standup/daily          ❌ failing   2026-05-19T08:30:01      WARP disconnected
-finops-weekly/weekly                    ⚠️  degraded 2026-05-18T17:00:01      recovered after 3 attempts
-hello/every-2min                       ✅ ok        2026-05-19T14:30:01      last_success_at fresh
-...
+AGENT/SCHEDULE                       STATE       LAST RUN                   REASON
+────────────────────────────────────────────────────────────────────────────────────────────────────
+disk-alert/every-15min               ❌ failing   2026-08-06T16:00:04-0300   2 attempts, will retry
+hn-digest/weekday-morning            ⚠️  degraded  2026-08-06T08:12:41-0300   recovered after 1 attempt
+backup-offsite/nightly               🕑 stale     2026-08-01T11:40:23-0300   window missed 7330min ago (stale)
+inbox-triage/every-90min             ✅ ok        2026-08-06T17:42:58-0300   ok
+inbox-triage/weekly-cleanup          ✅ ok        2026-08-03T10:44:53-0300   no window today · last success ok
 
-Logs:    /Users/avelino/.config/dotagent/logs/
-State:   /Users/avelino/.config/dotagent/state/agents/
-Audit:   /Users/avelino/.config/dotagent/audit.log
+Logs:    ~/.config/dotagent/logs/
+State:   ~/.config/dotagent/state/agents/
+Audit:   ~/.config/dotagent/audit.log
 ```
+
+One row per `(agent, schedule)` pair — `inbox-triage` above declares
+two schedules and gets two rows, each with its own health. The counter
+at the top counts rows, not agents: `2/5` there is five schedules
+across four agents.
+
+Rows are ordered **most-urgent-first**: `failing` → `degraded` →
+`stale` → `ok`. Within a bucket, discovery order.
+
+| Column           | Meaning                                                                    |
+|------------------|----------------------------------------------------------------------------|
+| `AGENT/SCHEDULE` | `agent.name` + the schedule's `id`.                                        |
+| `STATE`          | One of the four [health states](agent-spec.md#health-states).              |
+| `LAST RUN`       | `finished_at_iso` from the heartbeat — when the run **ended**, success or not. `never` if there is no heartbeat yet. |
+| `REASON`         | Why that state, see below.                                                 |
 
 Agents with `monitor = false` in their manifest are excluded (those are
 typically one-shot/manual examples).
+
+### Reading the `REASON` column
+
+The state comes from the heartbeat *and* from the window file for the
+window currently due — the same file the daemon writes retries against.
+The reason tells you which of the two decided:
+
+| State      | Reason                             | What produced it                                                 |
+|------------|------------------------------------|------------------------------------------------------------------|
+| `ok`       | `ok`                               | The due window succeeded on the first try.                       |
+| `ok`       | `no window today · last success ok` | Nothing is due — a weekday-only schedule on a Sunday, an hour outside `hours` — and the last run succeeded. |
+| `degraded` | `recovered after N attempts`       | The window did succeed, but burned `N` **failed** attempts first. |
+| `failing`  | `N attempts, will retry`           | The window passed without success; the retry budget is not spent yet. |
+| `failing`  | `gave up after N attempts`         | Retry budget exhausted — the window is marked `given_up`.         |
+| `failing`  | `window due Nmin ago, no attempt`  | The window is overdue and **no window file exists** — the daemon never dispatched. Usually means the daemon is not running. |
+| `stale`    | `window missed Nmin ago (stale)`   | Older than `stale_after_minutes`; retrying is no longer useful.   |
+| `stale`    | `never ran`                        | No heartbeat and no window due — the schedule has never fired.    |
+
+The count is singular-aware: `1 attempt`, `2 attempts`.
+
+`N` in `recovered after N attempts` counts **failed** attempts, not
+dispatches. The window file's `attempts` counter is bumped after every
+dispatch including the one that succeeded, so a first-try success lands
+on disk as `attempts: 1` and still reports `ok`. See
+[Health states](agent-spec.md#health-states).
+
+For `stale`, an `interval` schedule is judged against the **first**
+window it missed after its last success, not the rolling window
+dispatch uses — so a schedule broken for weeks reports the full age.
+
+### Live subprocesses
+
+When the daemon is running and has children alive, `status` appends a
+second table read from the supervisor snapshot
+(`state/supervisor.json`). It is omitted entirely when the snapshot is
+missing or empty.
+
+```text
+─── Live subprocesses (2 running) ───
+KIND       PID      OWNER          LABEL                          AGE / DEADLINE
+────────────────────────────────────────────────────────────────────────────────────────────────────
+⚠️  agent    41207    hn-digest      hn-digest.weekday-morning      246s / 300s (82%)
+   sink     41219    hn-digest      sink-file.invoke               3s / 30s (10%)
+```
+
+`KIND` is one of `agent`, `persistent`, `preflight`, `sink`, `notify`,
+`skill`, `plugin_info`, `plugin_validate`. Rows sort by deadline
+pressure, highest first, and are flagged `⚠️` at ≥80% of the deadline
+and `🔴` at ≥100%.
+
+A `persistent` row never gets a warning icon: its clock is the idle
+window before recycling, not a run running late, so reaching it is the
+pool working as designed. Those rows mark the clock `idle`, and their
+`AGE` is time since the last answer. See
+[Lifecycle](../concepts/lifecycle.md).
+
+Agents launched by `dotagent mcp` or `run-now` run in **that** process,
+not under the daemon, so they never appear here.
+
+The snapshot carries two fields this table deliberately does not show:
+`pgid` and `command`. They are identity proof for the next daemon's
+[boot orphan reap](../guides/daemon-lifecycle.md#boot-orphan-reap), not
+information an operator reads at a glance. Full schema in
+[`paths.md`](paths.md#statesupervisorjson).
 
 ---
 
 ## `daily-summary`
 
-Send the end-of-day health summary. The daemon fires this internally at
-**22:45 local time** (hardcoded). The CLI command is for testing.
+Send the end-of-day health summary. The daemon delivers it once a day
+at `[daily_summary].time` (default `22:45` local) and schedules its own
+wake-up for that moment. `grace_minutes` (default `30`) is the tail
+that still counts as on-time when the wake-up could not happen at all —
+laptop closed, machine off. Both are configurable; see
+[`[daily_summary]`](../guides/config-reference.md#daily_summary).
 
 ```bash
 dotagent daily-summary [--dry-run]
 ```
 
-| Flag        | Meaning                                                                  |
-|-------------|--------------------------------------------------------------------------|
-| `--dry-run` | Print the message to stdout instead of delivering it via the notifier.   |
+| Flag        | Meaning                                                                        |
+|-------------|--------------------------------------------------------------------------------|
+| `--dry-run` | Print the message and its destinations to stdout instead of delivering it.     |
 
-> **Known gap**: the live delivery currently uses a hardcoded notifier
-> target (`notify-imessage` plugin → a specific phone number). This
-> will be moved into `config.toml` before 1.0. For now, `--dry-run`
-> is the reliably-useful mode.
+Typing the command delivers even when `enabled = false`. That flag
+governs the daemon's scheduled delivery; someone who ran this asked for
+this one.
+
+**Destinations** come from `[[daily_summary.notifiers]]`, which takes
+the same entries a manifest's `[[notifiers]]` takes. With none
+configured the summary goes to the `desktop` driver — the only one that
+needs no address and sends nothing off the machine.
+
+**Output** — the same classification `status` renders, folded into a
+message short enough for a phone. Healthy schedules collapse into the
+count; only the unhealthy ones are named, and empty buckets are
+dropped:
+
+```text
+📊 Agents · 2026-08-06
+2/5 ok
+
+❌ Failing:
+  · disk-alert/every-15min — 2 attempts, will retry
+
+⚠️ Degraded:
+  · hn-digest/weekday-morning — recovered after 1 attempt
+
+🕑 Stale:
+  · backup-offsite/nightly — window missed 7330min ago (stale)
+```
+
+An all-green day is three lines: the header, `N/N ok`, and nothing
+else.
+
+`--dry-run` appends where it would have gone:
+
+```text
+→ would deliver to: telegram, desktop
+```
+
+Each delivery is audited as `plugin_invoked` with
+`plugin: "notifier:<driver>"`, on failure as well as on success — a
+summary that reached nobody is answerable from `dotagent audit` instead
+of from silence.
 
 ---
 
@@ -308,7 +429,7 @@ accepted message would fail after passing the allowlist.
 It also prints where long-term memory lives:
 
 ```
-memory: /Users/avelino/.config/dotagent/outl (default)
+memory: /Users/me/.config/dotagent/outl (default)
 ```
 
 A path set in `[memory] workspace` that holds no outl workspace is a warning —
@@ -445,7 +566,7 @@ dotagent inspect <NAME>
 
 ```text
 agent:        hello
-manifest_dir: /Users/avelino/.config/dotagent/agents/hello
+manifest_dir: /Users/me/.config/dotagent/agents/hello
 manifest_sha: a3f9... (first seen 2026-05-19T14:00:00-0300)
 monitor:      true
 timeout:      30s
@@ -496,20 +617,39 @@ Force-run an agent immediately, ignoring schedule windows. Unlike
 single-shot version of what the daemon would do.
 
 ```bash
-dotagent run-now <NAME> [--schedule ID]
+dotagent run-now <NAME> [--schedule ID] [--json]
 ```
 
 | Arg/flag          | Meaning                                                                                |
 |-------------------|----------------------------------------------------------------------------------------|
 | `NAME`            | The agent's `agent.name`.                                                              |
 | `--schedule ID`   | Which schedule's `args` to use. If omitted, uses the first schedule declared.          |
+| `--json`          | Emit one machine-parseable JSON line instead of the human report.                      |
 
 **Example**:
 
 ```bash
 dotagent run-now finops-weekly --schedule weekly
-# → run-now finops-weekly/weekly done in 47s — Ran(RunOutcome { exit_code: 0, ... })
 ```
+
+```text
+✓ finops-weekly/weekly  ok  47s
+
+stdout:
+  wrote 12 rows to /Users/me/reports/weekly.md
+```
+
+A preflight abort names the plugin that stopped it instead of a run
+result:
+
+```text
+⊘ finops-weekly/weekly  aborted by preflight  1s
+  plugin: preflight-warp
+  suggest: warp-cli connect
+```
+
+Colour follows the TTY and honours `NO_COLOR`. Truncated output says so
+explicitly rather than trailing off.
 
 Use this to:
 

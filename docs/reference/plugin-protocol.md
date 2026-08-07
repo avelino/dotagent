@@ -81,7 +81,7 @@ Stdin: an `InvokePayload` (see schema below).
   "kind": "sink",                  // matches plugin kind
   "agent": "finops-weekly",
   "schedule": "weekly",
-  "event": "success",              // "attempt_failed" | "given_up" | "recovered" | "success" | "preflight"
+  "event": "success",              // "attempt_failed" | "given_up" | "stale" | "recovered" | "success" | "preflight"
   "message": "captured stdout from the agent...",
   "config": { "page": "today", "marker_regex": "#finops" }
 }

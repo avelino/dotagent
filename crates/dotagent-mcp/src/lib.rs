@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(tool_name_for("disk-alert"), "run-disk-alert");
         assert_eq!(tool_name_for("hn.digest"), "run-hn-digest");
         assert_eq!(tool_name_for("my agent"), "run-my-agent");
-        assert_eq!(tool_name_for("buser/finops"), "run-buser-finops");
+        assert_eq!(tool_name_for("ops/cost-report"), "run-ops-cost-report");
     }
 
     #[test]

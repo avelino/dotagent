@@ -158,7 +158,11 @@ What's worth pointing out:
 - **Step 4 (sleep).** No polling. The daemon computes `ts` once and
   `tokio::time::sleep` until then. `MAX_SLEEP_MINUTES = 30` is the
   safety cap so a new manifest dropped into `agents/` is picked up
-  within that window even if no scheduled event fires.
+  within that window even if no scheduled event fires. The
+  [daily summary](../guides/config-reference.md#daily_summary) is a
+  third input to that `min()`: it is the one scheduled thing the daemon
+  does that no agent schedule accounts for, so it schedules its own
+  wake-up rather than relying on the cap to land inside its window.
 - **Step 7-9 (preflight).** If any preflight returns `ok=false`, the
   agent is **never spawned**. dotagent emits `PreflightFailed` to audit
   and fires the matching notifier.
@@ -224,7 +228,7 @@ flowchart LR
 | Plugin panics                   | Subprocess dies. dotagent records `PluginInvoked { ok: false }` and continues. No retry of the plugin. |
 | Notifier driver fails (e.g., Slack 503) | The notifier call returns `Err` but the **run already happened**. Audit records the failure. The run is still considered successful. |
 | Daemon crashes                  | launchd `KeepAlive=true` / systemd `Restart=always` brings it back. Audit reconstructs state on startup. |
-| Audit log tampered              | `verify_chain()` on startup catches it. Emits `AuditChainBroken` (which is itself a chained audit entry) and fires the configured `Critical`-severity notifier. |
+| Audit log tampered              | `verify_chain()` on startup catches it. Emits `AuditChainBroken` (which is itself a chained audit entry) and fires the configured `Critical`-severity notifier. A log that merely **rotated** (32MB → `audit.log.<stamp>` + a hash seam) verifies clean, and a segment the operator deleted reads as "intact since `<ts>`" rather than broken — see [`security/threat-model.md`](../security/threat-model.md#what-the-hash-chain-guarantees-and-what-it-does-not). |
 
 The trade-off: **fork+exec per plugin (~5-10ms)**. Plugins fire on
 discrete events (preflight, sink-on-success, third-party notify),
@@ -258,15 +262,18 @@ write is committed to disk first. The full layout is at
 │   ├── daemon/dotagent.log                   # structured JSON, daily rotation
 │   ├── daemon/run.avelino.dotagent.log       # launchd/systemd stdout
 │   └── agents/<name>/<name>.log              # raw agent stdout+stderr
-└── audit.log                                 # append-only, hash-chained, NEVER rotates
+├── audit.log                                 # append-only, hash-chained (live)
+└── audit.log.20260806T101500                 # sealed segment, never deleted
 ```
 
 Two important properties:
 
 1. **`audit.log` is the source of truth for "did this happen".** It is
-   append-only, hash-chained (`prev_hash` field), and never rotated.
-   Operational logs are dense (debug-grade) and disposable; the audit
-   log is sparse and forever.
+   append-only and hash-chained (`prev_hash` field). Past 32MB it rotates
+   into a sealed `audit.log.<stamp>` segment, stitched to the new file by
+   a hash **seam** so the chain never has a gap — and no segment is ever
+   deleted automatically. Operational logs are dense (debug-grade) and
+   disposable; the audit log is sparse and forever.
 2. **`known_manifests.json` is how drift / phantom agents are detected.**
    sha256 of every loaded manifest is cached. On the next load, mismatch
    → `ManifestDriftDetected`; new agent not in the cache →

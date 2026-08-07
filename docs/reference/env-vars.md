@@ -19,7 +19,7 @@ SDK to import.
 | Variable               | Type     | Example                                            | When set                         |
 |------------------------|----------|----------------------------------------------------|----------------------------------|
 | `AGENT_NAME`           | string   | `finops-weekly`                                     | Always.                          |
-| `AGENT_HOME`           | abs path | `/Users/avelino/.config/dotagent/agents/finops-weekly` | Always — the manifest directory. |
+| `AGENT_HOME`           | abs path | `/Users/me/.config/dotagent/agents/finops-weekly`  | Always — the manifest directory. |
 | `AGENT_TMPDIR`         | abs path | `/var/folders/.../tmpAbCdEf`                       | Always — fresh per run, auto-cleaned on exit. |
 | `AGENT_DRY_RUN`        | `"true"` / `"false"` | `"false"`                              | Always.                          |
 | `AGENT_SCHEDULE_ID`    | string   | `daily`                                            | Always — matches `[[schedules]].id`. |
@@ -33,6 +33,29 @@ SDK to import.
 | `AGENT_TRIGGER_ACTOR`  | string   | `123456789`                                        | Triggered runs, when the source can attest an identity. Telegram: numeric user id. |
 | `AGENT_TRIGGER_REPLY_TO` | string | `123456789`                                        | Triggered runs, when the source can be answered. Telegram: chat id. |
 | `AGENT_TRIGGER_PAYLOAD` | JSON object | `{"text":"/standup x","chat_id":1,"user_id":2,"command":{"name":"standup","args":"x"}}` | Triggered runs. Body travels here, never in argv. `command` is present only when the sender invoked one — see [Commands](../concepts/commands.md#the-payload). `reply_to_run` is present when the sender replied to a notification dotagent sent — see below. |
+| `LANG`                 | string   | `en_US.UTF-8`                                      | Only when neither `LANG` nor `LC_ALL` was inherited — see below. |
+
+### `LANG`, and why a daemon has to name one
+
+launchd and systemd start a daemon with **no locale at all**, and every agent
+inherits that gap. A process in the resulting `C` locale has `MB_CUR_MAX == 1`:
+it reads each **byte** of an environment variable as one character (Latin-1)
+and writes it back out as UTF-8. `AGENT_TRIGGER_PAYLOAD` carrying `é` (`c3 a9`)
+reaches the agent as `Ã©` (`c3 83 c2 a9`) — still valid UTF-8, so nothing errors
+and the agent just acts on mangled text.
+
+So dotagent fills the gap: `en_US.UTF-8` on macOS, `C.UTF-8` elsewhere. Only
+when the value is missing — an inherited `LANG` or `LC_ALL` is never
+overridden, and `[env.extra]` wins over both:
+
+```toml
+[env.extra]
+LANG = "pt_BR.UTF-8"
+```
+
+Reproduced with fish 3.7.1, whose command-substitution output is *not*
+affected — which is why an agent could log a mangled prompt beside a clean
+answer and look like a model problem.
 
 #### `reply_to_run`
 
@@ -42,10 +65,10 @@ which run it came from:
 ```jsonc
 {
   "text": "por que falhou?",
-  "reply_to_text": "🚨 calendar-prep-1h/hourly-00 gave up after 2 attempts (exit 1)…",
+  "reply_to_text": "🚨 disk-alert/every-15min gave up after 3 attempts (exit 1)…",
   "reply_to_run": {
-    "agent": "calendar-prep-1h",
-    "schedule": "hourly-00",
+    "agent": "disk-alert",
+    "schedule": "every-15min",
     "event": "given_up"
   }
 }
@@ -161,7 +184,7 @@ heartbeat and no manifest.
 | Variable     | Type     | Example                                        | When                       |
 |--------------|----------|------------------------------------------------|----------------------------|
 | `SKILL_NAME` | string   | `triage`                                       | Always.                    |
-| `SKILL_DIR`  | abs path | `/Users/avelino/.config/dotagent/skills/triage` | Always — also the working directory. |
+| `SKILL_DIR`  | abs path | `/Users/me/.config/dotagent/skills/triage`     | Always — also the working directory. |
 
 Everything else in the environment is inherited from whatever spawned
 `dotagent mcp`. Arguments arrive through argv, never a shell string.
@@ -186,6 +209,8 @@ everything works out-of-the-box.
 | `DOTAGENT_ROOT`                | Extra (colon-separated) directories to scan for manifests, prepended to the default search list. | (empty)            |
 | `DOTAGENT_PLUGIN_PATH`         | Extra (colon-separated) directories to search for plugin binaries.     | (empty)                            |
 | `RUST_LOG`                     | Tracing filter — overrides `[logging].level` in `config.toml`.         | `info`                             |
+| `DOTAGENT_LOG_STDERR`          | Force the stderr mirror layer on (`1`/`true`/`yes`/`on`) or off (`0`/`false`/`no`/`off`). | (unset — mirror follows TTY) |
+| `NO_COLOR`                     | Set to any value to suppress ANSI escapes in the daemon and every subcommand. | (unset)                     |
 | `OTEL_EXPORTER_OTLP_HEADERS`   | OTLP auth headers (comma-separated `k=v`). Used when `[telemetry].otlp_endpoint` is set. | (empty)         |
 
 ### `DOTAGENT_HOME`
@@ -282,6 +307,37 @@ The `RUST_LOG` env var only affects the **CLI subcommand it's set
 for**. To make it sticky for the daemon, put it in the launchd plist /
 systemd unit `Environment=`.
 
+### `DOTAGENT_LOG_STDERR`
+
+Whether the daemon mirrors its `tracing` stream to stderr in addition to
+`logs/daemon/dotagent.log`.
+
+The default is **only when stderr is a terminal**. Run `dotagent daemon` by
+hand and you get the familiar compact stream; run it under launchd or systemd
+and you do not — there stderr is an appended plain file
+(`run.avelino.dotagent-error.log`) that no rotation policy covers, so the
+mirror would duplicate an already-rotated log into one that grows forever.
+What still reaches that file is what has nowhere else to go: panics, and
+startup failures that happen before logging is up.
+
+```bash
+# Unit rewired to journald, which does rotate — take the stream back.
+DOTAGENT_LOG_STDERR=1 dotagent daemon
+
+# Interactive run, but you only want the JSON file.
+DOTAGENT_LOG_STDERR=0 dotagent daemon
+```
+
+Accepted: `1`, `true`, `yes`, `on` / `0`, `false`, `no`, `off`. Anything else
+is ignored and the TTY default applies.
+
+### `NO_COLOR`
+
+Set to any value (including empty) and dotagent emits no ANSI escapes —
+in the daemon's stderr mirror and in every subcommand's output. Colour is
+otherwise enabled only when the stream is a terminal, so redirecting to a
+file already gives you plain text. Follows [no-color.org](https://no-color.org).
+
 ### `OTEL_EXPORTER_OTLP_HEADERS`
 
 Vendor-specific authentication for the OTLP exporter. Format is
@@ -331,12 +387,15 @@ AGENT_SLUG            default
 AGENT_START_EPOCH     1700000000
 AGENT_ARGV            []
 AGENT_HEARTBEAT_FILE  ~/.config/dotagent/state/agents/finops-weekly/default.heartbeat.json
+LANG                  en_US.UTF-8                (only if none was inherited)
 
 # Caller — overrides for the dotagent CLI / daemon
 DOTAGENT_HOME             /var/lib/dotagent          (default: ~/.config/dotagent)
 DOTAGENT_ROOT             /tmp/test-agents           (prepended to manifest search)
 DOTAGENT_PLUGIN_PATH      $PWD/target/release        (prepended to plugin search)
 RUST_LOG                  info,dotagent_runner=debug
+DOTAGENT_LOG_STDERR       1                          (default: mirror only on a TTY)
+NO_COLOR                  1                          (default: colour only on a TTY)
 OTEL_EXPORTER_OTLP_HEADERS x-honeycomb-team=KEY
 ```
 

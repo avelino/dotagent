@@ -135,7 +135,9 @@ a helper next to them does not silently make it callable.
 Execution goes through the supervisor, like every other orchestrated
 subprocess: a deadline that is enforced, and kill-tree so a script that spawns
 children cannot leave orphans. `timeout_seconds` in the frontmatter overrides
-the 300-second default.
+the 300-second default. If the daemon itself dies before the deadline lands,
+the next boot collects what it left behind — see
+[boot orphan reap](../guides/daemon-lifecycle.md#boot-orphan-reap).
 
 The script gets `SKILL_NAME` and `SKILL_DIR` in its environment, runs with the
 skill directory as its working directory, and receives arguments through argv —

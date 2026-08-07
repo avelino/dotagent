@@ -40,7 +40,8 @@ $DOTAGENT_HOME/
 ├── secrets.env                   # daemon-loaded KEY=VALUE secrets (optional, 0600)
 ├── state/                        # daemon state (read-write, machine-managed)
 ├── logs/                         # operational logs (rotated)
-└── audit.log                     # append-only hash-chained event log
+├── audit.log                     # append-only hash-chained event log
+└── audit.log.20260806T101500     # rotated segment (kept forever)
 ```
 
 | Path             | Who writes         | Who reads           | Notes                                                                  |
@@ -53,7 +54,7 @@ $DOTAGENT_HOME/
 | `secrets.env`    | **you** (optional) | daemon              | KEY=VALUE secrets for `${VAR}` interpolation in notifier configs. **Must be mode 0600.** See [`concepts/secrets.md`](../concepts/secrets.md). |
 | `state/`         | daemon, runner     | daemon, CLI         | **Don't edit by hand.**                                                |
 | `logs/`          | daemon             | you (via `dotagent logs` / `tail`) | Rotated daily, gzipped after 1d, deleted after retention horizon. |
-| `audit.log`      | daemon             | you (`tail`, `jq`)  | Append-only, hash-chained. **NEVER rotated.**                          |
+| `audit.log`      | daemon             | you (`tail`, `jq`)  | Append-only, hash-chained. Rotates at 32MB into `audit.log.<stamp>` segments, which are **never deleted automatically**. |
 
 ---
 
@@ -189,6 +190,7 @@ state/
 ├── windows/<name>-<slug>-<YYYY-MM-DD-HHMM>.json
 ├── plugins/<plugin>/<key>.json
 ├── notify/<driver>/<slug>.json
+├── notify/alerts.json              # re-notification ladder for ongoing alerts
 ├── known_manifests.json
 ├── supervisor.json                 # live subprocess registry (daemon → CLI)
 └── daemon.pid
@@ -208,22 +210,37 @@ surface live processes with age vs deadline. Cleared on daemon exit.
     "pid": 3980,
     "kind": "sink",
     "owner": {
-      "agent": "databricks-cost-daily",
-      "schedule": "weekly",
+      "agent": "hn-digest",
+      "schedule": "weekday-morning",
       "hook_event": "success",
-      "plugin": "sink-roam"
+      "plugin": "sink-file"
     },
-    "label": "sink-roam.invoke",
+    "label": "sink-file.invoke",
     "started_at": "2026-05-21T15:00:00.123456-03:00",
     "deadline_seconds": 300,
     "age_seconds": 47,
-    "deadline_pct": 15
+    "deadline_pct": 15,
+    "pgid": 3980,
+    "command": "dotagent-plugin-sink-file invoke"
   }
 ]
 ```
 
-Missing file ⇒ daemon not running. Stale file (>5s) ⇒ daemon may have
-crashed without graceful shutdown; treat with suspicion.
+`pgid` and `command` are not for display — `dotagent status` shows
+neither. They exist so a **later** daemon can prove that a pid it read
+off disk is still the process that was recorded, before it signals
+anything. Both are optional on read: a snapshot written by an older
+build has neither, and such a record must deserialize into one that is
+refused rather than fail the whole file.
+
+Missing file ⇒ daemon not running. Stale file (>5s) ⇒ the previous
+daemon did not run its shutdown path (`SIGKILL`, panic, `launchctl
+kickstart -k`), because that path deletes this file. The next daemon
+treats the leftover as a record of possible orphans: it reaps the
+entries whose identity it can confirm, leaves every other entry alone,
+and then removes the file. An unreadable or unparseable snapshot
+signals nothing and is left on disk as evidence. See
+[Boot orphan reap](../guides/daemon-lifecycle.md#boot-orphan-reap).
 
 > **Scope**: `supervisor.json` reflects ONLY the daemon's supervisor.
 > `dotagent run-now` / `dotagent run` invoked standalone instantiate their
@@ -268,18 +285,34 @@ collapse `_`, trim trailing `_`. Empty → `default`.
 
 ### `state/windows/<name>-<slug>-<YYYY-MM-DD-HHMM>.json`
 
-One file per `(agent, schedule, expected_at)`. Tracks whether the
-expected window has been satisfied — drives the retry policy and
-health computation.
+One file per `(agent, schedule, expected_at)`, plus a `.lock` beside
+it. Tracks whether the expected window has been satisfied — drives the
+retry policy and health computation.
+
+The only state directory with a retention horizon: a schedule never
+revisits a window once it passes, so the directory would otherwise grow
+forever. The daily 03:00 sweep deletes each pair older than
+[`[state] window_retention_days`](../guides/config-reference.md#state)
+(default 30).
 
 ```jsonc
 {
+  "agent": "hn-digest",
+  "schedule_id": "weekday-morning",
+  "expected_at": 1700000000,
   "attempts": 1,
-  "first_attempt_at": 1700000000,
   "last_attempt_at": 1700000000,
-  "succeeded_at": null
+  "last_attempt_exit_code": 0,
+  "last_attempt_stderr": null,
+  "given_up": false,
+  "given_up_at": null
 }
 ```
+
+`attempts` counts **dispatches**, not retries — the one that finally
+succeeded is in there too. So a window that worked on the first try
+reads `attempts: 1` with `last_attempt_exit_code: 0`, and that is `ok`,
+not `degraded`.
 
 ### `state/plugins/<plugin>/<key>.json`
 
@@ -341,6 +374,33 @@ state/telegram-assistant/
 An agent that keeps state here should declare the path in `[security]
 filesystem_writable`, so `doctor` can audit what it writes.
 
+### `state/notify/alerts.json`
+
+When each ongoing alert last spoke, so a condition that stays true does not
+notify on every tick.
+
+```jsonc
+{
+  "episodes": {
+    "disk-alert/every-15min/stale": {
+      "first_notified_at": 1785925367,
+      "last_notified_at": 1786011767,
+      "count": 2
+    }
+  }
+}
+```
+
+Keyed `agent/schedule/event`. An episode starts at the first notification and
+is **deleted** when that schedule succeeds again, so the next failure alerts
+immediately instead of inheriting the previous episode's spacing. Re-notify
+ladder: on entry, then 1h, 6h, and daily thereafter.
+
+Losing the file costs at most one duplicate alert — the opposite failure
+(losing the alert) is the expensive one, so a missing or corrupt table is read
+as "nothing has been notified yet". See
+[notifications](../concepts/notifications.md#stale-and-why-alerts-repeat).
+
 ### `state/notify/telegram/sent.json`
 
 What each outbound notification was about, so a reply to one resolves to the
@@ -350,8 +410,8 @@ run that caused it.
 {
   "entries": {
     "4821": {
-      "agent": "calendar-prep-1h",
-      "schedule": "hourly-00",
+      "agent": "disk-alert",
+      "schedule": "every-15min",
       "event": "given_up",
       "at": 1785925367
     }
@@ -386,7 +446,7 @@ Cache of `sha256(agent.toml)` for every loaded manifest. Drives
   "entries": {
     "finops-weekly": {
       "sha256": "a3f9...",
-      "path": "/Users/avelino/.config/dotagent/agents/finops-weekly/agent.toml",
+      "path": "/Users/me/.config/dotagent/agents/finops-weekly/agent.toml",
       "first_seen_at_iso": "2026-05-19T14:00:00-0300"
     }
   }
@@ -416,7 +476,7 @@ logs/
 │   ├── dotagent.log.2026-05-19            # yesterday's rolled file
 │   ├── dotagent.log.2026-05-18.gz         # older, gzipped
 │   ├── run.avelino.dotagent.log           # launchd / systemd stdout capture
-│   └── run.avelino.dotagent-error.log     # launchd / systemd stderr capture
+│   └── run.avelino.dotagent-error.log     # launchd / systemd stderr — crashes only
 ├── agents/
 │   └── <name>/
 │       ├── <name>.log                     # raw stdout+stderr from the agent
@@ -435,7 +495,31 @@ logs/
 
 Compression: rotated files older than `compress_after_days` (default 1)
 get gzipped in-place. Deletion: files older than the retention horizon
-are removed by the 03:00 sweep.
+are removed by the 03:00 sweep. The **active** (non-rotated) file is never
+deleted, whatever the horizon says: launchd and systemd hold an open fd on
+it, so unlinking it would strand every subsequent write in a file with no
+name.
+
+### The stderr file is a crash channel, not an activity log
+
+`run.avelino.dotagent-error.log` receives panics and pre-logging startup
+failures. It does **not** receive the daemon's `tracing` stream.
+
+The daemon installs its stderr mirror layer only when stderr is a terminal.
+Under launchd / systemd stderr is an appended plain file that no rotation
+policy covers, so mirroring there would duplicate `dotagent.log` into a file
+that grows without bound. On a healthy daemon this file stays empty — that is
+the intended state, not a symptom.
+
+| `DOTAGENT_LOG_STDERR` | Effect                                                |
+|-----------------------|-------------------------------------------------------|
+| unset (default)       | mirror on **only** if stderr is a TTY                  |
+| `1` / `true` / `yes` / `on`  | force the mirror on — for units rewired to journald, which does rotate |
+| `0` / `false` / `no` / `off` | force it off, even in a terminal               |
+| anything else         | ignored; falls back to the TTY default                 |
+
+ANSI colour follows the same rule and additionally honours `NO_COLOR`: set it
+to any value and escapes are suppressed in the daemon and in every subcommand.
 
 The full schema + jq examples are in
 [`guides/observability.md`](../guides/observability.md).
@@ -448,13 +532,54 @@ The full schema + jq examples are in
 audit.log
 ```
 
-**Hash-chained, append-only, never rotated.**
+**Hash-chained, append-only. Rotates by size; segments are never
+deleted automatically.**
 
 One JSON object per line. Each line carries `prev_hash = sha256(previous
-line's full JSON)`. The first line has `prev_hash = "GENESIS"`. On
-startup the daemon verifies the chain; if it breaks, an
-`AuditChainBroken` entry is appended (which itself becomes a chained
-entry — anchoring the new chain to the broken position).
+line's full JSON)`. The very first line ever written has
+`prev_hash = "GENESIS"`. On startup the daemon verifies the chain; if it
+breaks, an `AuditChainBroken` entry is appended (which itself becomes a
+chained entry — anchoring the new chain to the broken position).
+
+### Rotation and the seam
+
+Past 32MB the live file is renamed to `audit.log.<YYYYMMDDTHHMMSS>` and a
+fresh `audit.log` opens with a **seam** as its first line:
+
+```jsonc
+{
+  "ts": "2026-08-06T10:15:00-0300",
+  "severity": "notice",
+  "event": {
+    "event_type": "audit_log_rotated",
+    "rotated_to": "audit.log.20260806T101500",
+    "entries": 38513,
+    "first_ts": "2026-05-19T08:31:07-0300",
+    "tail_hash": "c8d2..."
+  },
+  "prev_hash": "c8d2..."          // == tail_hash: the chain crosses the rename
+}
+```
+
+The seam's `prev_hash` **is** the rotated segment's tail hash, so the chain
+has no gap at the rename. And because the seam names what left, deleting an
+old segment is legible: verification reports *"intact since `first_ts`;
+38513 earlier entries lived in `audit.log.20260806T101500`, which is gone"*
+rather than *"chain broken"*. Cutting lines off the head of the live file
+takes the seam with them, and the orphaned `prev_hash` that remains is
+accounted for by nothing — which is the case that fires
+`audit_chain_broken`.
+
+Segments are **never removed by dotagent**. The log rotation sweeper in
+`[logs]` does not touch them; this is the only forensic artifact dotagent
+keeps and pruning it is the operator's call. `rm` them when you mean to.
+
+Verification has two scopes:
+
+| Scope | What it walks | Used by |
+|---|---|---|
+| current segment | the live `audit.log` only | daemon at boot — the live file is the only one that changes |
+| full | follows seams backwards through every segment still present | on demand, when you want the guarantee to reach `GENESIS` |
 
 Example line (pretty-printed):
 
@@ -482,8 +607,8 @@ Audit events emitted by dotagent:
 |---------------------------|-----------------------------------------------------------------------------|---------------|
 | `daemon_started`          | Daemon process boots                                                        | info          |
 | `daemon_stopped`          | Daemon receives SIGTERM / SIGINT                                            | info          |
-| `tick_started`            | A scheduler tick begins                                                     | info          |
-| `tick_completed`          | Tick finishes; `next_event_iso` recorded                                    | info          |
+| `tick_started`            | **No longer emitted.** Parsed so existing logs stay readable — see below     | info          |
+| `tick_completed`          | **No longer emitted.** Parsed so existing logs stay readable — see below     | info          |
 | `agent_run`               | An agent completed (success or failure)                                     | info / critical |
 | `agent_recovered`         | A previously-failing schedule passed                                        | notice        |
 | `agent_given_up`          | All retries exhausted for a window                                          | critical      |
@@ -492,7 +617,8 @@ Audit events emitted by dotagent:
 | `manifest_loaded`         | Manifest read on daemon start / SIGHUP                                      | info          |
 | `manifest_drift_detected` | sha256(manifest) doesn't match cache                                        | critical      |
 | `phantom_agent_detected`  | Discovered agent not in `known_manifests.json`                              | critical      |
-| `audit_chain_broken`      | Hash chain verification failed at line N                                    | critical      |
+| `audit_chain_broken`      | Hash chain verification failed at line N, or the head of the log was removed with nothing accounting for it | critical      |
+| `audit_log_rotated`       | The log passed 32MB; the seam naming the segment it came from and that segment's tail hash | notice        |
 | `config_reloaded`         | SIGHUP picked up changes to `config.toml`                                   | notice        |
 | `secrets_loaded`          | Daemon read `secrets.env`; payload has `path`, `key_count`, `unresolved_references` (no values, no `op://` paths) | notice |
 | `secrets_refused`         | Daemon rejected `secrets.env` (insecure mode, parse, or IO)                 | critical      |
@@ -504,9 +630,25 @@ Audit events emitted by dotagent:
 | `skill_invoked`           | A `scripts/` executable inside a skill ran — code outside any manifest, which `agent_run` would not record | notice |
 | `skill_invalid`           | A `SKILL.md` exists but failed to parse; that procedure is missing from the catalog, the rest keep working | notice |
 | `remediation_invoked`     | A declared `[[preflight]] remediation` ran. The one event where a chat message changed the machine | critical |
+| `orphan_reaped`           | A process a previous daemon left running was killed at boot, after its identity was confirmed against the snapshot | critical |
 
 `Critical` severity drives out-of-band notifier dispatch. Defined in
 [`crates/dotagent-core/src/audit.rs`](../../crates/dotagent-core/src/audit.rs).
+
+### Retired: `tick_started` / `tick_completed`
+
+The daemon no longer writes these. A tick is telemetry, not an auditable
+event — "woke up and looked at 17 agents" tells a forensic reader nothing,
+and it dominated the file: on one real 38,510-entry log the two variants were
+64% of every line. Because each append re-reads the log to find the tail hash,
+that noise also made every event worth recording more expensive to write. The
+daemon emits `tracing` at `debug` level instead, which already rotates — see
+[observability](../guides/observability.md).
+
+The enum variants are **kept** so existing logs stay parseable. Removing them
+would make `dotagent status --audit` and chain verification fail the moment
+they reached a historic tick entry, and a chain you can no longer verify is
+worse than one carrying dead weight.
 
 ---
 

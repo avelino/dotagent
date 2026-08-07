@@ -9,6 +9,375 @@ schema and the plugin protocol are flagged in each entry.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-07
+
+### Security
+
+- **A failing notifier could write its own credential to disk.**
+  `reqwest::Error`'s `Display` appends ` for url (…)`, and for Slack the URL
+  *is* the webhook secret (Telegram's carries the bot token in the path). A
+  `?` on any HTTP call converted that into a `NotifyError`, which reached
+  `warn!(driver, error = %e, "notifier failed")` and landed in
+  `~/.config/dotagent/logs/daemon/dotagent.log.*` — live credentials on disk,
+  for the whole retention window, from a failure as mundane as a DNS blip.
+
+  **Breaking (public API):** `NotifyError::Http(#[from] reqwest::Error)` is
+  **removed from the enum**. Deleting the variant rather than just editing the
+  log line is the point — without the `From` impl, `?` on a `reqwest` call no
+  longer compiles, so the next driver cannot reintroduce the leak by accident.
+  Transport failures are reduced at the call site to a kind plus a status
+  (`slack transport error (timeout)`) and surface as `NotifyError::Backend`.
+  Anything matching on `NotifyError::Http` must be updated; anything matching
+  `_` or using `Display` is unaffected.
+
+- **Every credential-bearing notifier field now accepts `${VAR}`.** Previously
+  only `telegram.bot_token` did, so a Slack webhook, an ntfy token or a
+  Pushover key had to be written literally into an `agent.toml` — a file that
+  lives in a versioned repo, which makes it a credential in git history
+  forever. Now expanded, at send time, against `~/.config/dotagent/secrets.env`
+  first and `std::env::var` second: `slack.webhook_url`, `ntfy.token` /
+  `base_url` / `topic`, `pushover.token` / `user`, `telegram.bot_token`.
+
+  `ntfy.base_url` and `ntfy.topic` are in the list because they are not merely
+  addresses: a self-hosted base URL can embed HTTP basic credentials, and on a
+  public `ntfy.sh` the topic name is the only thing standing between an alert
+  stream and anyone who guesses it. `telegram.chat_id` and `imessage.to` are
+  deliberately **not** expanded — they identify *where* a message goes, and
+  routing them through a secrets resolver would turn a typo into "env var
+  unset" instead of a message delivered to the wrong place.
+
+  An unresolved reference fails the send. There is no fallback to the literal
+  `"${SLACK_WEBHOOK_URL}"`: that is not a degraded credential, it is a request
+  authenticated as a placeholder, which answers 404 and reads like an outage
+  rather than a typo. The error names the field and the variable and nothing
+  else — the input is a credential template and the store holds sibling
+  credentials, so echoing either would turn a config typo into a disclosure.
+
+### Fixed
+
+- **One slow agent made the bot stop answering for twenty minutes.** Inbound
+  triggers were an arm of the daemon's main `select!`. That arm is only polled
+  *between* ticks, and a tick awaits every scheduled run inline — so for as
+  long as one scheduled agent was running, no queued message was even looked
+  at. Observed in production: a message sent at 19:45:03 was dispatched at
+  20:04:48, one second after the scheduled run holding the loop hit its
+  1200-second timeout. Nineteen minutes and forty-five seconds of silence, from
+  a component that had nothing to do with the agent that was running. The
+  sender's only signal is silence, so the behaviour is indistinguishable from a
+  dead bot, and the natural response — resend — makes it worse.
+
+  Triggers are now drained by a worker task of their own. They stay serialized
+  **against each other**: one worker consuming the channel FIFO, awaiting each
+  handler to completion, so request N+1 is not started before N answers and
+  per-conversation order survives by construction rather than by luck. One
+  worker rather than one task per message on purpose — a task per message would
+  hand ordering to the scheduler and to whichever task reached the persistent
+  pool's per-key mutex first, and would turn a burst of N messages into N
+  concurrent agent processes.
+
+  What is new is exactly one concurrent pair, a triggered run beside a
+  scheduled one, and it is safe on everything the two share: a triggered run's
+  slug is namespaced by source (`trigger-telegram`) so it never touches the
+  scheduled heartbeat file, the state store `flock`s per file regardless,
+  triggered runs never write window state, and every audit append takes an
+  exclusive lock. Scheduled runs remain serialized against each other.
+
+  One behaviour change worth knowing: SIGHUP retires persistent instances by
+  waiting for the slot each one holds, so a `dotagent reload` that lands while
+  a triggered request is in flight is applied after it finishes, bounded by
+  that agent's `timeout_seconds`. Previously a reload and a trigger could not
+  overlap at all. Lock order is always `slots` → `slot`, so there is no
+  deadlock.
+
+- **A daemon that died without shutting down orphaned its children forever.**
+  The supervisor holds every deadline in memory. `SIGKILL`, a panic, or
+  `launchctl kickstart -k` takes it down with the daemon and leaves the
+  subprocesses running with nobody enforcing anything — observed as a
+  persistent agent alive for 26 minutes against a 600-second timeout, and
+  nothing in the system was going to end it.
+
+  A starting daemon now sweeps what the last one left behind. The mere presence
+  of `state/supervisor.json` at boot is the signal that the previous exit was
+  not clean, because a clean exit deletes it. The sweep runs before the
+  snapshot writer starts, whose first tick would otherwise overwrite the only
+  record of those processes.
+
+  **It refuses to kill on doubt.** pids get recycled, and a stale record is not
+  a licence to signal whatever holds the number now. A record is reaped only
+  when every axis agrees: pid is not init and not ours, the record carries
+  `pgid` and `command` and its `pgid` equals its `pid` (every supervised spawn
+  does `setpgid(0, 0)`), the OS still reports the pid, the observed pgid still
+  equals the pid, the observed start time is within five seconds of the
+  recorded one, and the observed command line is consistent with the recorded
+  one. Anything missing, ambiguous or unparseable is a skip. An unreadable
+  snapshot signals nothing and is left on disk as evidence; a live peer daemon
+  in the pidfile aborts the sweep entirely. Confirmed orphans get the existing
+  kill-tree: `killpg(SIGTERM)`, grace, `killpg(SIGKILL)`.
+
+  `ProcessInfo` gained `pgid` and `command`, both `#[serde(default)]` — a
+  snapshot written by an older build deserializes fine and classifies as
+  un-confirmable, so nothing is killed. The reap therefore becomes effective
+  from the **second** restart after upgrading: the first one is what writes a
+  snapshot the next boot can check.
+
+- **Every non-ASCII character in a trigger payload reached the agent
+  double-encoded.** launchd and systemd start a daemon with no `LANG` and no
+  `LC_ALL`, and agents inherited that gap. A process in the resulting `C`
+  locale has `MB_CUR_MAX == 1`: it reads each **byte** of an environment
+  variable as one character — Latin-1 — and writes it back out as UTF-8. A
+  Telegram message saying `quem é thiago avelino?` arrived in
+  `AGENT_TRIGGER_PAYLOAD` and reached the agent as `quem Ã© thiago avelino?`.
+
+  It stayed invisible for months because the result is still *valid* UTF-8, so
+  nothing anywhere errored — and because only the environment is affected.
+  Command-substitution output is not, so the same run logged a mangled prompt
+  directly beside a clean answer, which reads like a model problem rather than
+  a transport one. In one production log **57 of 57** payload-derived lines
+  were corrupted and none were clean.
+
+  `dotagent-runner` now names a UTF-8 locale (`en_US.UTF-8` on macOS,
+  `C.UTF-8` elsewhere) when neither `LANG` nor `LC_ALL` reaches the agent. An
+  inherited locale is never overridden and `[env.extra]` still wins over both.
+  Reproduced against fish 3.7.1: `c3 a9` round-trips as `c3 83 c2 a9` under
+  `C`, unchanged under `en_US.UTF-8`.
+
+- **An interval agent that gave up stayed dead forever.** `expected_at` for
+  `type = "interval"` returned a frozen `last_success + interval`. Once that
+  single window aged past `stale_after_minutes` every tick skipped it, so no
+  run happened, so `last_success` never advanced, so the window could never
+  move — a closed loop with no exit. One agent observed sat dead for **55
+  days**.
+
+  The window is now a rolling one: the tick sequence anchored on
+  `last_success` (`+iv`, `+2·iv`, …) keeps advancing while runs fail, exactly
+  like the calendar keeps producing new cron windows, and `expected_at`
+  returns the greatest tick at or before now. Dispatch stays alive no matter
+  how long the agent has been broken.
+
+  Staleness is measured against a *different* window — the **first** one missed
+  after the last success, not the rolling one. Judging health against a window
+  that rolls forward would report a chronically failing agent as a fresh
+  failure forever, which trades one silence for another.
+
+- **`attempts` was read as a retry count and it is a dispatch count.** The
+  daemon bumps it on every dispatch, the successful one included, so a window
+  that worked on the first try lands on disk as `attempts: 1` — and
+  `health_state` called that `degraded`. Every healthy agent looked slightly
+  sick, which is the fastest way to teach someone to ignore the column.
+  `degraded` now requires at least one attempt that actually *failed*, with
+  the successful dispatch discounted only when the last recorded attempt is
+  the one that exited 0.
+
+- **`interval_minutes = 0` panicked the daemon** with a divide-by-zero. A
+  zero interval has no meaningful cadence, so the schedule is now simply never
+  due — it does not fire every tick and it does not take the process down.
+
+- **The daily summary reached its window by coincidence, not by design.** The
+  daemon never scheduled a wake-up for it. It landed inside the window only
+  because `MAX_SLEEP_MINUTES` happened to equal the window's width — two
+  unrelated constants with no code connecting them. The coincidence broke the
+  moment a tick overran its own sleep budget, since the next sleep then fell
+  back to 60s and pushed the following cycle past the window, and it never held
+  at all once the time became configurable. The summary is now a wake-up reason
+  in its own right, folded into the same `min()` as the next agent window.
+
+- **A summary window crossing midnight could be marked delivered by the wrong
+  day.** The once-per-day guard keyed on *today's* date rather than the date
+  the window opened on. With a `time` late enough that `grace_minutes` runs
+  past midnight the two differ, so a 00:10 delivery recorded itself against the
+  new day and left the 23:50 window that produced it looking undelivered — or,
+  read the other way, silenced the next one. The guard now keys on the window's
+  own date.
+
+- **`dotagent reload` left most of `config.toml` pinned at boot.** SIGHUP
+  re-read the file for secrets and the Telegram ingress but the tick loop kept
+  the config it started with, so retention thresholds and the daily summary's
+  time and destinations only changed on a full restart. Editing the file and
+  reloading looked like it took effect and did not — the worst shape a reload
+  can have. The whole config is now replaced.
+
+### Added
+
+- **The daily summary now has somewhere to go.** It has shipped since the
+  beginning and has never delivered anything to anyone: the window was a
+  hardcoded `[22:45, 23:15)`, the notifier was a hardcoded plugin, and the
+  recipient was a placeholder phone number nobody owned. It fired every night
+  into that constant and left no trace when the send went nowhere, which is why
+  the defect survived this long — a feature that silently does nothing looks
+  exactly like a feature with nothing to report.
+
+  It is configurable now, under **`[daily_summary]`** in `config.toml`: `time`
+  (default `22:45` local, `HH:MM` or `HH:MM:SS`), `grace_minutes` (default
+  `30`, clamped to `[1, 1440]`), `enabled` (default `true`), and
+  `[[daily_summary.notifiers]]`, which takes the same entries a manifest's
+  `[[notifiers]]` takes.
+
+  **An empty notifier list means `desktop`, not silence.** Every other driver
+  needs a chat id, a phone number or a webhook, and there is no universal
+  default for those; `desktop` is the only one with nothing to fill in and
+  nothing to leak. `[telegram]` is deliberately *not* reused as a destination —
+  that section is ingress, and wiring it to egress would send a nightly report
+  to everyone who set up a bot to talk to their agents and never asked for one.
+
+  The failure modes lean the same way. A `time` that does not parse falls back
+  to the default instead of disabling delivery, because a typo should cost the
+  wrong hour and not a silent month; `grace_minutes = 0` becomes `1`, since a
+  zero-width window is an empty one. `events` inside a summary notifier is
+  **ignored** — the list is already scoped to a single event, so a filter there
+  could only subtract, and an entry copied out of a manifest carrying
+  `events = ["given_up"]` would drop the whole summary without a word.
+  `enabled = false` stops the daemon's fire but not `dotagent daily-summary`
+  typed by hand, which is a different request. Every delivery is audited as
+  `plugin_invoked` with `plugin: "notifier:<driver>"`, failures included, so a
+  summary that reached nobody is answerable from `dotagent audit` rather than
+  from silence — the exact thing missing for its whole life so far.
+  `--dry-run` now also prints `→ would deliver to: <drivers>`. Docs:
+  [`guides/config-reference.md`](docs/guides/config-reference.md#daily_summary).
+
+- **`stale` — the failure that had no way to tell you.** Every other event
+  fires from something that happened. An agent that quietly stops being
+  scheduled does nothing at all: no run, no failure, nothing to notify on. Its
+  window ages out, the daemon stops even attempting it, and the last thing
+  anyone heard was a success weeks ago. Silence reads as fine, which is how a
+  55-day outage goes unnoticed.
+
+  `stale` fires from the *condition* instead, swept on every daemon tick by
+  `sweep_health_notifications`. `given_up` joins it: it used to be said once
+  and never again, so an agent broken for a week asked exactly once.
+
+  Because a condition is true continuously, re-notification runs on a rising
+  ladder — **on entry, then after 1h, 6h, and once a day** for as long as it
+  holds. Both extremes end in the same silence: notify once and the alert is
+  buried by whatever else arrived that hour; notify every tick and the reader
+  is trained to dismiss dotagent on sight. Rising spacing puts the density in
+  the first hours, when a fix is most likely to actually happen.
+
+  The episode is deleted the moment the schedule succeeds again, so the *next*
+  failure is loud from its first second instead of inheriting yesterday's
+  spacing. State lives in `state/notify/alerts.json` and survives restarts;
+  losing it costs at most one duplicate alert, which is the right side to be
+  wrong on.
+
+  **No manifest edit required.** `stale` is delivered on the `given_up`
+  channel when no notifier lists it explicitly — someone who wrote
+  `events = ["given_up"]` asked to be told their agent is broken, and stale is
+  the same news only worse. Listing `"stale"` makes the routing explicit.
+
+- **The audit log rotates, and the chain crosses the rename.** It was
+  append-only and unbounded, which is a promise that ends in a file nobody can
+  open. Past **32MB** the live file is sealed as `audit.log.<YYYYMMDDTHHMMSS>`
+  and a fresh one opens with an `AuditLogRotated` **seam** as its first line,
+  whose `prev_hash` is the sealed segment's tail hash — so there is no gap in
+  the chain at the rename, and rotation verifies clean.
+
+  Segments are **never deleted automatically**; the `[logs]` sweeper does not
+  touch them. This is the only forensic artifact dotagent keeps, so pruning it
+  is the operator's call.
+
+  The seam is what makes that pruning legible. `verify_chain_status()` returns
+  a four-state `ChainStatus` that distinguishes *"intact since `<ts>`, and here
+  is the segment that is gone"* from *"the head of the live file was cut off
+  and nothing accounts for it"* — the second fires `audit_chain_broken`, the
+  first does not. `verify_chain()` keeps its signature. Rotation does not move
+  the boundary between what the chain catches and what it does not; the
+  reasoning is in
+  [`security/threat-model.md`](docs/security/threat-model.md#what-the-hash-chain-guarantees-and-what-it-does-not).
+
+- **`[state] window_retention_days`** (default `30`, `0` disables) — the 03:00
+  sweep now covers `state/windows/`, the one state directory that grows without
+  bound. A schedule writes one window file per fired window and never revisits
+  it, so a 15-minute agent leaves ~96 files a day behind, each with a `.lock`
+  beside it. Windows are deleted, never gzipped — the daemon reads them as
+  JSON, so a compressed window is a corrupted one — and a window whose lock is
+  currently held is skipped until the next pass. Heartbeats are deliberately
+  not covered: there is exactly one per `(agent, schedule)` and it is rewritten
+  in place.
+
+### Changed
+
+- **Health reasons and summary headers are in English.** The strings
+  `dotagent status` prints in its `REASON` column, and the section headers of
+  the daily summary, were written in Portuguese while every other user-facing
+  surface in the project was not. They are the most-read output dotagent
+  produces, so they were also the most visible place for the project to
+  contradict itself: `2 tentativas, vai retentar` → `2 attempts, will retry`,
+  `desisti após N tentativas` → `gave up after N attempts`, `janela perdida há
+  Nmin (stale)` → `window missed Nmin ago (stale)`, `nunca rodou` →
+  `never ran`, `sem janela hoje · último sucesso ok` →
+  `no window today · last success ok`, and `❌ Falhando` / `⚠️ Degradado` →
+  `❌ Failing:` / `⚠️ Degraded:`.
+
+  The count is singular-aware now, which it was not: a first-failure window
+  read `recuperou após 1 tentativas`. Anything grepping these strings — a
+  dashboard, an alert rule — needs updating; they are output, not API, and this
+  is the moment to say so.
+
+- **The daemon's stderr is a crash channel now, not a second log.** The
+  `tracing` stderr layer is installed **only when stderr is a terminal**. Under
+  launchd / systemd stderr is an appended plain file that no rotation policy
+  covers, so mirroring there duplicated an already-rotated log into one that
+  grew forever. `run.avelino.dotagent-error.log` now receives panics and
+  startup failures that happen before logging is up, and nothing else — an
+  empty file on a healthy daemon is the intended state. Watch
+  `logs/daemon/dotagent.log` for activity. `DOTAGENT_LOG_STDERR=1` forces the
+  mirror on (units rewired to journald, which does rotate), `0` forces it off.
+  ANSI colour follows the same TTY rule and honours `NO_COLOR`, in the daemon
+  **and** in every subcommand.
+
+- **`tick_started` / `tick_completed` are no longer emitted.** A tick is
+  telemetry, not an auditable event — "woke up and looked at 17 agents" tells a
+  forensic reader nothing, and on one real 38,510-entry log the two variants
+  were **64%** of every line. Because each append re-read the log to find the
+  tail hash, that noise also made every event worth recording more expensive to
+  write; appends are now O(1) via a seek to the end. The daemon emits `tracing`
+  at `debug` instead. The enum variants are **kept** so existing logs stay
+  parseable: removing them would break `dotagent status --audit` and chain
+  verification the moment either reached a historic tick entry, and a chain you
+  can no longer verify is worse than one carrying dead weight.
+
+- **An over-long alert is trimmed instead of dropped.** Every backend rejects
+  the whole request when the body exceeds its limit, so a too-long alert was an
+  alert that never arrived. Caps are now applied before sending, with the cut
+  marked (`[truncated]` on bodies, `…` on titles): slack 40,000 characters,
+  telegram 4,096 characters, pushover 1,024 characters (title 250), ntfy 4,096
+  **bytes** (title 250 bytes).
+
+  Bytes versus characters is not pedantry here. ntfy counts bytes and alert
+  text is not ASCII — `ç` and `ã` cost 2 bytes each, an emoji costs 4 — so a
+  character-based trim could hand ntfy four times its limit while believing it
+  stayed under. The byte cutter also walks back to a UTF-8 character boundary:
+  a sliced codepoint would be rejected for a different reason than the one the
+  cap exists to avoid.
+
+- **ntfy sends `X-Title` / `X-Tags` as RFC 2047 encoded words.** A header value
+  is bytes, not text; raw UTF-8 there is `obs-text`, which RFC 9110 says a
+  sender should not generate and which ntfy's own docs warn can arrive as `?`.
+  Non-ASCII values are now emitted as `=?UTF-8?Q?…?=`, which the ntfy server
+  decodes before reading any header param, so `title = "Falha na execução 🚨"`
+  survives the wire. Control characters are flattened to spaces first — a
+  newline is not a header value at all, and it would kill the whole request in
+  the builder. The title cap bites on the **raw** text, before encoding, since
+  a 4-byte emoji becomes 12 characters of `=XX`.
+
+- **Telegram MarkdownV2 escaping covers `\`** — 19 reserved characters, not 18.
+  An unescaped backslash is itself an escape opener, so one in the body
+  desynchronized everything after it and Telegram rejected the message.
+  Truncation also moved to the **outbound** path (it was only applied inbound),
+  and escaping runs *before* the cut because escaping grows the text: a body
+  that fits under 4,096 characters plain can exceed it once every `.` and `-`
+  carries a backslash. A backslash orphaned by the cut is dropped — Telegram
+  refuses the whole message over one dangling escape.
+
+  Consequence for anyone hand-escaping: the body always goes through the
+  escaper, so pre-escaped input now comes out with doubled backslashes. Use
+  `parse_mode = "HTML"` if you need live markup.
+
+- **A refused Telegram send says why.** The Bot API answers
+  `{"ok":false,"description":"…"}` and that description was discarded in favour
+  of a bare status code. It is now carried into the log line, capped, with the
+  bot token scrubbed out of it first — the API is happy to echo the request URL
+  back inside its own error text.
+
 ### Added
 
 - **An agent can stay alive between runs.** `[lifecycle] mode = "persistent"`
@@ -45,7 +414,7 @@ schema and the plugin protocol are flagged in each entry.
   about and resolves a reply back to it, handing the dispatcher
   `AGENT_TRIGGER_PAYLOAD.reply_to_run` with the agent, schedule and event.
   Resolved from the message id rather than the text, because the text is not
-  an interface: one alert reads `calendar-prep-1h/hourly-00 gave up after 2
+  an interface: one alert reads `disk-alert/every-15min gave up after 3
   attempts` and another reads only `preflight aborted by plugin
   preflight-warp`. The table lives at `state/notify/telegram/sent.json`,
   capped at 500 entries — losing it costs correlation on old alerts, never
@@ -349,6 +718,7 @@ break only code that depends on the crates as libraries:
 - CLI run-now output pretty-prints the outcome instead of dumping
   `Debug` and tightens the renderer test suite.
 
+[0.3.0]: https://github.com/avelino/dotagent/releases/tag/v0.3.0
 [0.2.1]: https://github.com/avelino/dotagent/releases/tag/v0.2.1
 [0.2.0]: https://github.com/avelino/dotagent/releases/tag/v0.2.0
 [0.1.4]: https://github.com/avelino/dotagent/releases/tag/v0.1.4

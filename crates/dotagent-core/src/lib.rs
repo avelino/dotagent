@@ -20,8 +20,8 @@ pub mod trigger;
 pub use audit::{AuditEntry, AuditEvent, Severity, GENESIS_HASH};
 pub use command::{CommandManifest, COMMAND_EXT, NAMESPACE_SEP};
 pub use config::{
-    CommandsConfig, Config, LoggingConfig, SecretsConfig, SkillsConfig, TelegramIngressConfig,
-    TelemetryConfig,
+    CommandsConfig, Config, DailySummaryConfig, LoggingConfig, SecretsConfig, SkillsConfig,
+    TelegramIngressConfig, TelemetryConfig, DEFAULT_DAILY_SUMMARY_TIME,
 };
 pub use error::{Error, Result};
 pub use heartbeat::Heartbeat;

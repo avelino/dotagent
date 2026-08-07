@@ -45,7 +45,7 @@ dotagent-plugin-sink-file info | jq .schema
 ```toml
 [[on_success]]
 plugin = "sink-file"
-config = { path = "/Users/avelino/reports/hn-today.md" }
+config = { path = "/Users/me/reports/hn-today.md" }
 ```
 
 After today's run, the file contains exactly today's output. No
@@ -56,7 +56,7 @@ accumulation.
 ```toml
 [[on_success]]
 plugin = "sink-file"
-config = { path = "/Users/avelino/dotagent-history/standup.log", mode = "append" }
+config = { path = "/Users/me/dotagent-history/standup.log", mode = "append" }
 ```
 
 Each run grows the file. Useful for "did this agent ever generate the
@@ -70,7 +70,7 @@ to use both `sink-file` AND let the agent write its own dated copy:
 
 ```fish
 # In agent.fish — write the dated copy yourself.
-set -l dated /Users/avelino/reports/(date +%Y-%m-%d)-summary.md
+set -l dated /Users/me/reports/(date +%Y-%m-%d)-summary.md
 cp $AGENT_TMPDIR/output.txt $dated
 ```
 
@@ -79,7 +79,7 @@ And use `sink-file` for the "latest" alias:
 ```toml
 [[on_success]]
 plugin = "sink-file"
-config = { path = "/Users/avelino/reports/latest-summary.md" }
+config = { path = "/Users/me/reports/latest-summary.md" }
 ```
 
 ## Response shape
@@ -87,7 +87,7 @@ config = { path = "/Users/avelino/reports/latest-summary.md" }
 ### Success
 
 ```json
-{ "ok": true, "written_to": "/Users/avelino/reports/hn-today.md" }
+{ "ok": true, "written_to": "/Users/me/reports/hn-today.md" }
 ```
 
 ### Failed validation

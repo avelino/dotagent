@@ -2,7 +2,7 @@
 
 > Polyglot agent orchestrator. You write `agent.toml` + a script in any
 > language. dotagent schedules, supervises, retries, and notifies on
-> failure via OS-native scheduling (launchd / systemd).
+> failure from a single daemon that launchd / systemd keeps alive.
 >
 > This file is a dense, single-page reference optimized for LLMs. After
 > reading this you should be able to write a working agent without
@@ -18,19 +18,22 @@
 
 ## 1. Mental model in 60 seconds
 
-```
-┌────────────┐     ┌───────────────────┐     ┌────────────────┐
-│  launchd/  │ ──▶ │ dotagent daemon   │ ──▶ │  your script   │
-│  systemd   │     │ (single process)  │     │  (any language)│
-└────────────┘     └───────────────────┘     └────────────────┘
-       OS keeps daemon alive       daemon spawns agents on schedule
+```mermaid
+flowchart LR
+    os["launchd / systemd<br/>(keeps the daemon alive)"] --> daemon["dotagent daemon<br/>(single process)"]
+    daemon --> script["your script<br/>(any language)"]
 ```
 
 - The OS scheduler (launchd on macOS / systemd on Linux) keeps the
-  daemon alive. The daemon keeps every agent alive.
+  **daemon** alive — one unit, `run.avelino.dotagent`. It does not know
+  about individual agents or schedules.
 - One daemon, N agents, M schedules per agent.
-- The daemon **never sleeps to wait** — it computes the next event and
-  uses the OS scheduler.
+- The daemon computes the single next event across every schedule and
+  sleeps until then, waking early for signals. There is no per-agent
+  plist and no per-agent systemd timer.
+- Inbound triggers do **not** go through that loop: a worker task drains
+  them beside it, so a slow scheduled run no longer holds queued chat
+  messages.
 - Your agent script just reads env vars and exits with a code.
 - Failure path: retry → exhaust retries → fire `[[notifiers]]` (built-in,
   in-process) and/or `[[on_failure]]` plugins (subprocess, JSON stdio).
@@ -305,12 +308,13 @@ cd "$AGENT_TMPDIR" || exit
 
 ## 5. Schedules
 
-Three types. dotagent translates each into the native OS scheduler.
+Three types. A **single** daemon owns all of them — there is no per-agent
+plist and no per-agent systemd timer. launchd / systemd start the daemon;
+the daemon computes the next event across every schedule and sleeps to it.
 
 ### `type = "cron"`
 
-Fires when `weekday matches AND hour matches AND minute matches`. Uses
-launchd `StartCalendarInterval` (macOS) / systemd `OnCalendar` (Linux).
+A window is due when `weekday matches AND hour matches AND minute matches`.
 
 ```toml
 [[schedules]]
@@ -331,8 +335,19 @@ minute = 0                   # daily at 09:00 and 18:00
 
 ### `type = "interval"`
 
-Fires every `interval_minutes`. Uses launchd `StartInterval` (macOS) /
-systemd `OnUnitActiveSec` (Linux).
+An arithmetic sequence of ticks anchored on the last **success**
+(`last_success`, `+iv`, `+2·iv`, …); the window due now is the greatest tick
+`<= now`. A success re-phases the sequence.
+
+The sequence keeps advancing **while runs fail**, like the calendar keeps
+producing cron windows. A frozen `last_success + iv` window would age past
+`stale_after_minutes`, get skipped on every tick, never advance `last_success`,
+and deadlock the agent permanently (one real case: 55 days dead).
+
+Staleness is judged against the **first missed** window, not the rolling one —
+otherwise a chronically failing agent reads as a fresh failure forever.
+
+`interval_minutes = 0` never comes due (and does not panic).
 
 ```toml
 [[schedules]]
@@ -341,7 +356,12 @@ type = "interval"
 interval_minutes = 90
 ```
 
-### `type = "expression"` (Linux only)
+### `type = "expression"` — **not implemented yet**
+
+> The manifest field parses and validates, but the scheduler has no
+> expression parser: `expected_at` and `compute_next_event` both return
+> `None` for it, so the schedule **never comes due**. Use `cron` or
+> `interval`. This section documents the intended syntax only.
 
 Free-form systemd `OnCalendar` syntax. **NOT cron syntax** — this is
 systemd's calendar event format.
@@ -375,8 +395,43 @@ fork, no extra binaries on `$PATH`.
 | `slack`    | HTTPS POST to Slack Incoming Webhooks    | No                     |
 | `ntfy`     | HTTPS POST to ntfy.sh (or self-hosted)   | No                     |
 | `pushover` | HTTPS POST to api.pushover.net           | No                     |
+| `telegram` | HTTPS POST to api.telegram.org (Bot API)  | No                    |
 | `imessage` | `osascript` Messages.app automation      | **Yes** (no Apple API) |
 | `plugin`   | Escape hatch → plugin protocol           | Yes                    |
+
+### Credentials: use `${VAR}`, never a literal
+
+An `agent.toml` is a versioned file. Every credential-bearing field accepts
+`${VAR}`, resolved **at send time** against `~/.config/dotagent/secrets.env`
+first, then `std::env::var`:
+
+| Driver     | `${VAR}`-expanded                     | Left literal (address, not secret) |
+|------------|---------------------------------------|------------------------------------|
+| `slack`    | `webhook_url`                         | —                                  |
+| `ntfy`     | `token`, `base_url`, `topic`          | —                                  |
+| `pushover` | `token`, `user`                       | —                                  |
+| `telegram` | `bot_token`                           | `chat_id`                          |
+| `imessage` | —                                     | `to`                               |
+
+An unresolved reference **fails the send** — no fall-through to the literal
+`${…}` string. The error names only the field and the variable.
+
+Transport errors never carry the URL: `NotifyError` has no
+`From<reqwest::Error>`, because `reqwest`'s `Display` appends ` for url (…)`
+and for Slack/Telegram that URL is the credential.
+
+### Message size caps (body is trimmed, not dropped)
+
+| Driver     | Body              | Title            |
+|------------|-------------------|------------------|
+| `slack`    | 40,000 chars      | —                |
+| `telegram` | 4,096 chars       | —                |
+| `pushover` | 1,024 chars       | 250 chars        |
+| `ntfy`     | 4,096 **bytes**   | 250 **bytes**    |
+
+Over-limit bodies are cut with a `[truncated]` marker (`…` on titles) rather
+than rejected by the backend. ntfy counts **bytes**: `ç`/`ã` are 2 bytes, an
+emoji is 4, so a char-based trim can ship 4× the limit.
 
 ### `desktop`
 
@@ -397,7 +452,7 @@ events = ["given_up"]
 ```toml
 [[notifiers]]
 driver = "slack"
-webhook_url = "https://hooks.slack.com/services/T0/B0/XXX"
+webhook_url = "${SLACK_WEBHOOK_URL}"   # the URL *is* the credential
 channel = "#alerts"         # optional
 username = "dotagent"       # optional
 icon_emoji = ":robot_face:" # optional
@@ -409,9 +464,9 @@ events = ["given_up", "recovered"]
 ```toml
 [[notifiers]]
 driver = "ntfy"
-topic = "my-alerts"
+topic = "${NTFY_TOPIC}"        # on public ntfy.sh the topic name is the secret
 base_url = "https://ntfy.sh"   # default; self-host friendly
-token = "tk_..."               # optional bearer auth
+token = "${NTFY_TOKEN}"        # optional bearer auth
 priority = 4                   # 1..5
 title = "disk-alert"           # default: agent name
 tags = ["warning", "skull"]
@@ -423,12 +478,33 @@ events = ["given_up"]
 ```toml
 [[notifiers]]
 driver = "pushover"
-token = "<application-token>"
-user  = "<user-key>"
+token = "${PUSHOVER_TOKEN}"
+user  = "${PUSHOVER_USER}"
 priority = 1
 title = "disk-alert"           # default: agent name
 events = ["given_up"]
 ```
+
+### `telegram`
+
+```toml
+[[notifiers]]
+driver = "telegram"
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+chat_id = "-1001234567890"       # or "@my_channel". NOT ${VAR}-expanded.
+parse_mode = "MarkdownV2"        # optional: MarkdownV2 | HTML | Markdown
+disable_notification = false     # optional
+events = ["given_up"]
+```
+
+With `parse_mode = "MarkdownV2"` dotagent escapes the **19** reserved
+characters (``\_*[]()~`>#+-=|{}.!`` — backslash included). The body **always**
+goes through the escaper, so pre-escaping doubles the backslashes; use
+`parse_mode = "HTML"` if you need live markup. Escaping runs before the 4096
+cut (it grows the text), and a backslash orphaned by the cut is dropped —
+Telegram rejects the whole message over one dangling escape.
+
+API refusals log the Bot API's own `description`, with the token scrubbed.
 
 ### `imessage` (macOS only)
 
@@ -545,14 +621,41 @@ convention as `sink-roam` (root + L1/L2, fences stripped, `---` cuts).
 |-----------------|-----------------------------------------------------|
 | `attempt_failed`| Run exited non-zero (a retry may still happen)      |
 | `timed_out`     | Run exceeded `agent.timeout_seconds`                |
-| `given_up`      | All retries exhausted — operator action expected     |
+| `given_up`      | All retries exhausted — repeats while it stays true  |
+| `stale`         | Schedule stopped running at all (window aged out)    |
 | `recovered`     | A previously-failing schedule passed                 |
 | `success`       | Every successful run (use sparingly — noisy)         |
 | `preflight`     | A preflight plugin returned `ok: false`              |
-| `daily_summary` | Daemon's internal 22:45 health roll-up               |
+| `daily_summary` | Daily health roll-up at `[daily_summary].time` (22:45)|
 
 `[[notifiers]]` and `[[on_*]]` accept `events = [...]` to filter. Empty
 or absent = all events.
+
+`daily_summary` is the exception: it is the daemon's event, not an
+agent's, and only reaches `[[daily_summary.notifiers]]` in
+`config.toml`. Listing it in a manifest matches nothing.
+
+```toml
+# ~/.config/dotagent/config.toml — all defaults shown
+[daily_summary]
+enabled       = true      # governs the daemon's fire, not `dotagent daily-summary`
+time          = "22:45"   # local HH:MM; unparseable falls back here, never off
+grace_minutes = 30        # clamped to [1, 1440]
+
+[[daily_summary.notifiers]]   # none declared = `desktop`
+driver    = "telegram"
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+chat_id   = "123456789"
+```
+
+The daemon schedules its own wake-up for `time`. `events` inside those
+entries is ignored — the list is already scoped to one event.
+
+`stale` and `given_up` fire from a *condition*, not a one-off event, so they
+re-notify on a rising ladder — on entry, then 1h, 6h, daily — until the
+schedule succeeds again. State lives in `state/notify/alerts.json` and survives
+daemon restarts. `stale` is delivered on the `given_up` channel when no entry
+lists it explicitly, so an existing `events = ["given_up"]` needs no edit.
 
 ---
 
@@ -609,7 +712,7 @@ Computed per `(agent, schedule)` pair on every `tick`:
 | State     | Meaning                                                                       |
 |-----------|-------------------------------------------------------------------------------|
 | `ok`      | `last_success_at >= expected_at` and no retries needed                        |
-| `degraded`| Recovered after `attempts > 0`, OR interval-style overdue but within `2*interval` |
+| `degraded`| The window succeeded, but only after ≥1 **failed** attempt                     |
 | `failing` | Window passed without success; retrying or already given up                   |
 | `stale`   | Never ran, OR window older than `stale_after_minutes`                         |
 
@@ -682,7 +785,7 @@ events = ["attempt_failed", "given_up"]
 # Tier 2: Slack only after retries exhausted
 [[notifiers]]
 driver = "slack"
-webhook_url = "https://hooks.slack.com/services/T0/B0/XXX"
+webhook_url = "${SLACK_WEBHOOK_URL}"   # value lives in secrets.env
 channel = "#eng-ops"
 events = ["given_up", "recovered"]
 
@@ -772,7 +875,9 @@ config = { path = "/Users/me/reports/hn-today.md", mode = "overwrite" }
 - **Run your business logic.** It's a scheduler + supervisor.
 - **Provide an SDK.** Read env vars, write stdout/stderr, exit. That's
   the entire API surface.
-- **Sleep waiting for time.** The OS scheduler fires the trigger.
+- **Register one OS timer per schedule.** launchd / systemd start the
+  single daemon; the daemon computes the next event across all schedules
+  and sleeps to it.
 - **Substitute the `mcp` CLI.** `sink-roam` calls `mcp` separately.
 - **Run on Windows.** Linux + WSL works; native Windows doesn't.
 - **Template `path` or any config field.** No `{{vars}}` — your agent
@@ -787,15 +892,33 @@ config = { path = "/Users/me/reports/hn-today.md", mode = "overwrite" }
 ├── agents/<name>/agent.toml         # manifests
 ├── state/
 │   ├── agents/<name>/<slug>.heartbeat.json
-│   ├── windows/<name>-<slug>-<ts>.json
+│   ├── windows/<name>-<slug>-<ts>.json   # swept: [state] window_retention_days (30)
+│   ├── notify/alerts.json           # re-notification ladder for ongoing alerts
 │   ├── known_manifests.json
 │   └── daemon.pid
 ├── logs/
-│   ├── daemon/dotagent.log          # daemon stdio + tracing
+│   ├── daemon/dotagent.log          # daemon tracing (JSON, rotated daily)
+│   ├── daemon/run.avelino.dotagent.log        # launchd/systemd stdout
+│   ├── daemon/run.avelino.dotagent-error.log  # stderr — CRASHES ONLY
 │   └── agents/<name>/<name>.log     # rotated; per-agent
-├── audit.log                        # JSONL audit trail
+├── audit.log                        # JSONL audit trail (live)
+├── audit.log.20260806T101500        # sealed segment, never auto-deleted
+├── secrets.env                      # optional, mode 0600
 └── config.toml                      # optional dotagent config
 ```
+
+Retention notes:
+
+- `audit.log` rotates at **32MB** into `audit.log.<YYYYMMDDTHHMMSS>`, stitched
+  by an `audit_log_rotated` **seam** whose `prev_hash` is the old segment's
+  tail hash — the chain crosses the rename. Segments are never deleted
+  automatically.
+- `tick_started` / `tick_completed` are **no longer emitted** (they were 64% of
+  the file). The enum variants remain so old logs still parse.
+- The log sweeper never touches the **active** file — launchd/systemd hold an
+  open fd on it.
+- `state/windows/` is the only unbounded state dir; the 03:00 sweep applies
+  `[state] window_retention_days` (default 30, `0` disables).
 
 Discovery order for manifests:
 
@@ -821,7 +944,13 @@ Discovery order for plugin binaries:
 | `DOTAGENT_ROOT`                | Extra manifest search dirs (colon-separated), prepended to default   | (empty)              |
 | `DOTAGENT_PLUGIN_PATH`         | Extra plugin search dirs (colon-separated), prepended to default     | (empty)              |
 | `RUST_LOG`                     | Tracing filter; overrides `[logging].level` in `config.toml`         | `info`               |
+| `DOTAGENT_LOG_STDERR`          | Force the stderr mirror on (`1`/`true`/`yes`/`on`) or off (`0`/`false`/`no`/`off`) | (mirror follows TTY) |
+| `NO_COLOR`                     | Any value suppresses ANSI in the daemon and every subcommand         | (unset)              |
 | `OTEL_EXPORTER_OTLP_HEADERS`   | OTLP auth headers (comma-separated `k=v`); used when OTLP enabled    | (empty)              |
+
+The daemon mirrors `tracing` to stderr **only when stderr is a TTY**. Under
+launchd / systemd stderr is an unrotated file, so `…-error.log` receives
+crashes only — read `logs/daemon/dotagent.log` for activity.
 
 ---
 
@@ -868,6 +997,13 @@ two ways: it has **no window state** (no attempts counter, never
 consumes a retry, never marks a cron window given up) and it uses its
 **own slug** (`trigger-telegram`, `trigger-mcp`) so it can't overwrite
 `last_success_at` for a window that never fired.
+
+Triggers are drained by a single worker task, FIFO, one at a time — so
+they are serialized against each other (per-conversation order is
+preserved) but **not** against the scheduler's tick. A long scheduled
+run no longer delays a chat reply; a long triggered run still delays the
+next trigger. The channel holds 64 pending requests, then applies
+backpressure.
 
 ### MCP server — every agent as a tool
 

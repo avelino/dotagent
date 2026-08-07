@@ -264,7 +264,7 @@ difference from a skill's `scripts/`.
 
 What it does grant is influence over what a model is told to do, so the
 directory deserves the same care as any other input the assistant trusts. See
-the [threat model](../security/threat-model.md#commands).
+the [threat model](../security/threat-model.md#v11--commands).
 
 The menu is registered per allowlisted chat rather than globally. The allowlist
 already gates execution, so a global menu would not be an authorization hole —

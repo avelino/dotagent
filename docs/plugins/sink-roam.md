@@ -103,8 +103,8 @@ Agent's stdout must look like:
     24 PRs merged today
     Sentry: 3 new issues, none P0
   🎯 Por pessoa
-    [[@avelino]]: 4 PRs, 1 release
-    [[@mario]]: 6 PRs, 2 reviews
+    [[@ana]]: 4 PRs, 1 release
+    [[@bruno]]: 6 PRs, 2 reviews
   ---
   Notes after the separator are cut.
 ```
@@ -112,12 +112,12 @@ Agent's stdout must look like:
 The marker regex `#DORA.*dia-anterior` matches the root block; on the
 next run the plugin deletes it and re-writes — no duplicates.
 
-### LinkedIn draft in today's daily, replacing yesterday's
+### Post draft in today's daily, replacing yesterday's
 
 ```toml
 [[on_success]]
 plugin = "sink-roam"
-config = { page = "today", marker_regex = "#LinkedIn.*hot-take" }
+config = { page = "today", marker_regex = "#post-draft.*\\d{4}-\\d{2}-\\d{2}" }
 ```
 
 ### Namespaced page (created on first run)

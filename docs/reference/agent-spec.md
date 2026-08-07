@@ -160,11 +160,16 @@ Supported `driver` values: `desktop`, `slack`, `ntfy`, `pushover`,
 [`docs/concepts/notifications.md`](../concepts/notifications.md) for
 per-driver config schemas.
 
-Notifier config strings that contain `${VAR}` are resolved at send time
+Credential-bearing notifier fields accept `${VAR}`, resolved at send time
 against the daemon-loaded secrets file (see
-[`docs/concepts/secrets.md`](../concepts/secrets.md)), with `std::env`
-as fallback. Currently only `telegram.bot_token` honors interpolation;
-other drivers are being migrated case-by-case.
+[`docs/concepts/secrets.md`](../concepts/secrets.md)), with `std::env` as
+fallback: `slack.webhook_url`, `ntfy.token` / `base_url` / `topic`,
+`pushover.token` / `user`, and `telegram.bot_token`. An unresolved
+reference **fails the send** — there is no fall-through to the literal
+`${…}` string.
+
+`telegram.chat_id` and `imessage.to` are not expanded. They are addresses,
+not credentials; write them literally.
 
 ### `[[on_failure]]` / `[[on_success]]` — legacy plugin hooks
 
@@ -177,19 +182,48 @@ faster, has fewer moving parts, and ships with the daemon.
 |-------------------|---------------------|---------|----------------------------------------------------------------------------------------|
 | `plugin`          | `string`            | —       | Short name; resolved to `dotagent-plugin-<plugin>` via the plugin client.              |
 | `config`          | `object`            | `{}`    | Opaque JSON forwarded to the plugin's `invoke` verb.                                   |
-| `events`          | `string[]`          | `[]`    | Filter (empty = all). For `on_failure`: `attempt_failed`, `given_up`, `recovered`.    |
+| `events`          | `string[]`          | `[]`    | Filter (empty = all). For `on_failure`: `attempt_failed`, `given_up`, `stale`, `recovered`. |
 | `timeout_seconds` | `integer` (>0)      | `300`   | Per-hook deadline. Supervisor kills the process group on overrun. Same field on `[[preflight]]` (default `30`). |
 
 ### Schedule types
 
-| Type         | When the OS scheduler fires                                                   |
+| Type         | When a window is due                                                          |
 |--------------|-------------------------------------------------------------------------------|
-| `cron`       | weekday matches AND `(hour:minute)` matches (launchd `StartCalendarInterval`) |
-| `interval`   | every `interval_minutes` (launchd `StartInterval`)                            |
-| `expression` | free-form cron string (Linux only, via `systemd OnCalendar`)                  |
+| `cron`       | weekday matches AND `(hour:minute)` matches                                   |
+| `interval`   | every `interval_minutes`, anchored on the last success                        |
+| `expression` | free-form cron string (**not yet implemented** — parses, never fires)         |
 
-dotagent generates the launchd plist (macOS) or systemd `.timer` (Linux) from
-the schedule. **dotagent never sleeps to wait for time** — the OS does it.
+A **single** daemon (`run.avelino.dotagent`) owns every schedule. There is no
+per-agent plist and no per-agent systemd timer: launchd / systemd start the
+daemon, and the daemon computes the next event across all schedules and sleeps
+until then. See [`daemon-lifecycle.md`](../guides/daemon-lifecycle.md).
+
+#### How `interval` windows advance
+
+An interval schedule is an arithmetic sequence of ticks anchored on the last
+**success** — `last_success`, `+ interval`, `+ 2 · interval`, … — and the
+window currently due is the greatest tick at or before now.
+
+Anchoring on success is deliberate: a run that succeeds re-phases the sequence,
+so a 90-minute agent that ran at 10:07 is next due at 11:37 rather than on some
+fixed wall-clock grid.
+
+The sequence keeps advancing **while runs fail**, exactly like the calendar
+keeps producing new cron windows. This matters more than it sounds. A frozen
+`last_success + interval` window is what deadlocked a failing interval agent:
+its single window aged past `stale_after_minutes`, so every tick was skipped,
+so `last_success` never advanced, so the window could never move — one observed
+agent sat dead for 55 days. A rolling window means the agent keeps being
+dispatched no matter how long it has been broken.
+
+Health is measured against a **different** window: the *first* one missed after
+the last success, not the rolling one. Judging staleness against a window that
+rolls forward would report a chronically failing agent as a fresh failure
+forever. So dispatch stays alive and `dotagent status` still says `stale`.
+
+`interval_minutes = 0` has no meaningful cadence. It is accepted and the
+schedule simply never comes due — it does not fire every tick, and it does not
+crash the daemon.
 
 ### Heartbeat slug
 
@@ -223,6 +257,27 @@ inherited parent environment, unless `env.inherit = false`):
 
 The agent's positional arguments are `args` from `[run]` followed by `args`
 from the schedule.
+
+### `LANG`
+
+Set to a UTF-8 locale (`en_US.UTF-8` on macOS, `C.UTF-8` elsewhere) **only
+when neither `LANG` nor `LC_ALL` reaches the agent** — an inherited locale is
+never overridden, and `[env.extra]` wins over both.
+
+This is a default, not a policy. launchd and systemd start a daemon with no
+locale at all, and a process in the resulting `C` locale has `MB_CUR_MAX == 1`:
+it reads every **byte** of an environment variable as one character (Latin-1)
+and writes it back out as UTF-8. A `AGENT_TRIGGER_PAYLOAD` carrying `é` reaches
+such an agent as `Ã©`, still valid UTF-8, so nothing errors and the agent simply
+acts on mangled text. Verified with fish 3.7.1, which round-trips `c3 a9` as
+`c3 83 c2 a9` under `C` and unchanged under `en_US.UTF-8`.
+
+Name your own if you need a different one:
+
+```toml
+[env.extra]
+LANG = "pt_BR.UTF-8"
+```
 
 Runs started by a [trigger](../concepts/triggers.md) rather than a schedule get
 four more, applied *before* the block above so a payload can never redefine
@@ -279,9 +334,19 @@ For each `(agent, schedule)` dotagent computes one of:
 | State      | Meaning                                                                          |
 |------------|----------------------------------------------------------------------------------|
 | `ok`       | `last_success_at >= expected_at` and no retries needed in the current window     |
-| `degraded` | recovered after `attempts > 0`, OR interval-style overdue but within `2 * interval` |
+| `degraded` | the window succeeded, but only after at least one **failed** attempt             |
 | `failing`  | window passed without success; retrying or already given up                      |
 | `stale`    | never ran, OR window older than `stale_after_minutes`                            |
+
+`attempts` in the window file counts **dispatches**, not retries — the daemon
+bumps it on every dispatch including the one that succeeded. So a window that
+worked on the first try lands on disk as `attempts: 1` with
+`last_attempt_exit_code: 0`, and that is `ok`, not `degraded`. Only attempts
+that actually failed make a recovered window `degraded`.
+
+For `stale`, an interval schedule is judged against the first window it missed
+after its last success — not the rolling window dispatch uses. See
+[How `interval` windows advance](#how-interval-windows-advance).
 
 ## `[security]` — schema-only in v0
 
@@ -345,14 +410,21 @@ lands). Useful for pure local processors.
 When dotagent fires `on_failure` / `on_success`, the `event` field is one of:
 
 - `attempt_failed` — a retry attempt failed; will retry again
-- `given_up` — retries exhausted
+- `given_up` — retries exhausted; repeated on a rising ladder while it holds
+- `stale` — the schedule stopped running at all (window aged past
+  `stale_after_minutes`, so nothing is even attempted). Delivered on the
+  `given_up` channel when no entry lists `stale` explicitly
 - `recovered` — a previously-failing window succeeded
 - `success` — a normal successful run
 - `timed_out` — agent killed for exceeding `agent.timeout_seconds`
 - `preflight` — a preflight plugin returned `ok = false` and aborted the run
-- `daily_summary` — daemon's internal 22:45 health roll-up (also surfaced via `dotagent daily-summary`)
+- `daily_summary` — the daemon's daily health roll-up, delivered at `[daily_summary].time` (default 22:45 local; also surfaced via `dotagent daily-summary`)
 
-A plugin can filter via its manifest entry's `events` array.
+A plugin can filter via its manifest entry's `events` array — with one
+exception. `daily_summary` belongs to the daemon rather than to any
+agent, so it only ever reaches `[[daily_summary.notifiers]]` in
+[`config.toml`](../guides/config-reference.md#daily_summary); listing it
+in a manifest matches nothing.
 
 ## Manifest hash & drift detection
 
