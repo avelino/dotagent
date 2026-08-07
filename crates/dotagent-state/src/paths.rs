@@ -63,6 +63,13 @@ pub fn state_agents_dir() -> PathBuf {
     state_dir().join("agents")
 }
 
+/// Per-window retry state: `windows/<agent>-<slug>-<YYYY-MM-DD-HHMM>.json`,
+/// each with a `.lock` beside it.
+///
+/// Unlike heartbeats, this directory grows without bound — one file per fired
+/// window, never revisited once the window passes. It is the one state
+/// directory with a retention horizon; see `[state] window_retention_days` and
+/// `dotagent_telemetry::retention`.
 pub fn state_windows_dir() -> PathBuf {
     state_dir().join("windows")
 }

@@ -42,11 +42,19 @@ ls -l ~/.config/dotagent/state/daemon.pid
 
 ### Symptom: launchd / systemd loads the unit but the daemon dies immediately
 
-Check the captured stderr:
+This is exactly what the captured stderr file is for — a daemon that dies
+before or during startup has nowhere else to say why:
 
 ```bash
 tail -50 ~/.config/dotagent/logs/daemon/run.avelino.dotagent-error.log
 ```
+
+> Only crashes land there. Under launchd / systemd the daemon does not mirror
+> its `tracing` stream to stderr (stderr is an unrotated file there, and the
+> stream already goes to `dotagent.log`). So an **empty** `…-error.log` on a
+> daemon that keeps dying means it is not crashing at all — check
+> `logs/daemon/dotagent.log` and `dotagent status` instead. To force the
+> mirror on anyway, set `DOTAGENT_LOG_STDERR=1` in the unit's environment.
 
 Common causes:
 
@@ -230,6 +238,13 @@ sends SIGTERM, waits 5 seconds, then SIGKILL. Either:
 - Fix the agent (most timeouts are an external CLI hanging — wrap
   with `--timeout`).
 
+`timeout_seconds` is the **backstop**, not the first line of defense.
+It kills a wedged run; it does nothing to stop one slow network call
+from eating the whole budget and leaving the agent no time to finish
+the work it already did. Put a ceiling on the call itself — `curl
+--max-time 20`, an HTTP client timeout, `timeout 30 <cmd>` — so a
+single unresponsive endpoint degrades one step instead of the run.
+
 ### Symptom: agent succeeded once but the daemon keeps re-firing it
 
 The previous run failed and you fixed it without updating state. The
@@ -356,6 +371,37 @@ for a `Backend(...)` error:
 tail ~/.config/dotagent/audit.log \
   | jq 'select(.event.event_type == "plugin_invoked" and (.event.plugin | startswith("notifier:")))'
 ```
+
+Three causes account for most of it:
+
+**`<field>: env var ${X} is unset`.** A `${VAR}` in a credential field did not
+resolve. dotagent fails the send rather than posting the literal placeholder,
+so nothing arrives. Check that the key is in `~/.config/dotagent/secrets.env`,
+that the file is mode `0600` (otherwise the daemon refuses the whole file), and
+that you sent `SIGHUP` after editing it — the store is read at startup and on
+reload, not per send.
+
+```bash
+dotagent doctor                 # reports the secrets file's state
+dotagent reload                 # SIGHUP: re-read secrets.env + config.toml
+```
+
+**`<driver> transport error (...)`.** Network or TLS. The message carries a
+kind and, when there was one, an HTTP status — deliberately **not** the URL,
+because for Slack and Telegram the URL is the credential. Reproduce with the
+`curl` above from the daemon's own environment (a proxy set in your shell but
+not in the plist is a classic).
+
+**Nothing arrived, no error.** Check the event filter first —
+`events = ["given_up"]` on an agent that keeps recovering never fires. Then
+check size: an over-limit body is now trimmed with a `[truncated]` marker
+rather than rejected, so if you see a truncated message that is the cap doing
+its job (ntfy counts **bytes**, not characters — see
+[notifications](../concepts/notifications.md#message-size-limits)).
+
+For Telegram specifically, an API refusal now carries the Bot API's own
+`description` (`"Bad Request: message is too long"`, `"chat not found"`), which
+is usually the whole answer.
 
 ### Sink plugin appears not to run
 
@@ -524,8 +570,16 @@ RUST_LOG=warn dotagent daemon
 - The sweep needs write permission on `logs/agents/<name>/`. If your
   agent script chowns its log directory (don't), the sweep fails
   silently.
-- The audit log is **never** swept — it grows linearly. Plan for ~1KB
-  per event, a few hundred events/day max.
+- The audit log is **never** swept. It rotates at 32MB into
+  `audit.log.<YYYYMMDDTHHMMSS>` segments, and those segments stay
+  forever — it is the only forensic artifact dotagent keeps, so pruning
+  it is your call, not a sweeper's. Plan for ~1KB per event, roughly a
+  hundred events/day.
+- `state/windows/` is swept by the same 03:00 pass, on
+  `[state] window_retention_days` (default 30). A 15-minute agent writes
+  ~96 files a day there, so a daemon that never sees 03:00 accumulates
+  thousands. A window whose `.lock` is currently held is skipped — it
+  gets collected on the next pass.
 
 ---
 
@@ -552,9 +606,49 @@ Cause is almost always:
 - Someone (or you) edited the file by hand.
 - A crash mid-write left a half-line.
 - Disk corruption.
+- The head of the file was removed — see the next section, which is the
+  one case that is easy to cause by accident.
 
 dotagent continues operating — the new chain is anchored to the broken
 position. Forensics is on you.
+
+### `position: 0` with `expected_prev_hash: "GENESIS"`
+
+The first line of `audit.log` does not chain to `GENESIS`, and no
+**seam** explains why. Verification calls this *unexplained truncation*:
+somebody removed the head of the log.
+
+The legitimate way for the file to start somewhere other than `GENESIS`
+is rotation, which leaves a seam as line 1:
+
+```bash
+head -1 ~/.config/dotagent/audit.log | jq .
+# {"event":{"event_type":"audit_log_rotated","rotated_to":"audit.log.20260806T101500",
+#           "entries":38513,"tail_hash":"c8d2..."},"prev_hash":"c8d2..."}
+```
+
+If that line is missing, someone `sed`'d or `tail`'d the file. Deleting
+a whole **segment** is fine and stays quiet — the seam lives in the
+current file and keeps explaining the gap. Deleting lines from the
+current file takes the seam with them, and that is what fires here.
+
+### Rotated segments
+
+```bash
+ls -la ~/.config/dotagent/audit.log*
+```
+
+`audit.log` is live; `audit.log.<YYYYMMDDTHHMMSS>` are sealed segments,
+oldest first by name. To read the whole history in order:
+
+```bash
+cat $(ls ~/.config/dotagent/audit.log.* 2>/dev/null) ~/.config/dotagent/audit.log | jq .
+```
+
+Removing old segments is supported and does not break verification —
+it reports "intact since `<ts>`" instead of "intact from GENESIS". The
+reasoning is in
+[`security/threat-model.md`](../security/threat-model.md#what-the-hash-chain-guarantees-and-what-it-does-not).
 
 ---
 

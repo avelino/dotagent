@@ -40,7 +40,7 @@ use dotagent_core::{SkillManifest, SKILL_FILE};
 /// skills exist to avoid.
 const MAX_LISTED_FILES: usize = 100;
 
-/// How deep the file index walks. `references/databricks/companies/x.md` is 3;
+/// How deep the file index walks. `references/api/endpoints/x.md` is 3;
 /// anything deeper is unusual enough to be worth not paying for on every call.
 const MAX_LIST_DEPTH: usize = 4;
 

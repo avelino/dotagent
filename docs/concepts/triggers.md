@@ -33,13 +33,28 @@ Two things are deliberately different.
 
 ## Serialization
 
-Triggers arrive on a channel the daemon reads from the same `select!` that handles its sleep and signals. A triggered run therefore never overlaps the tick loop.
+Triggers arrive on a bounded channel drained by a worker task of its own, separate from the daemon's tick loop. The worker takes requests FIFO and awaits each one to completion before pulling the next, so triggers stay serialized **against each other**: request N+1 is not even started until N has answered, which preserves per-conversation order by construction rather than by luck.
 
-That is a correctness requirement, not a performance choice. Two concurrent runs of the same `(agent, slug)` would race the heartbeat's read-modify-write and the state store's lockfile handling. Serial execution keeps both dormant.
+One worker, not one task per message. A task per message would hand ordering to the scheduler and to whichever task reached the persistent pool's per-key mutex first — non-deterministic, and wrong exactly when a conversation is moving fast. It would also turn a burst of N messages into N concurrent agent processes; queueing them bounds the expensive half.
 
-The practical consequence: a long agent delays the next trigger. A ten-minute run means a message arriving at minute two waits. If that matters for your setup, keep the dispatcher fast and let it hand slow work to something else.
+What is *no longer* serialized is a trigger against the tick. The channel used to be an arm of the daemon's main `select!`, and that arm is only reached **between** ticks — a tick awaits every scheduled run inline. A single scheduled run with a 20-minute deadline therefore held every queued message for its whole duration: the sender saw silence, resent, and got both answers at once when the run finally ended. A triggered run now proceeds beside the tick.
+
+That pair is the only new concurrency, and it is safe on everything the two touch in common:
+
+- **Heartbeat.** A triggered run's slug is namespaced by source (`trigger-telegram`), so it never shares a file with the scheduled history of the same agent. The state store takes a per-file `flock` regardless.
+- **Window state.** Triggered runs never write it, so retry accounting stays single-writer.
+- **Audit log.** Every append takes an exclusive `flock` on the log.
+- **Persistent instances.** The pool keys a mutex per `(agent, key)`, so a scheduled and a triggered request for the same instance queue instead of interleaving.
+
+Scheduled runs remain serialized against each other — the tick still awaits each one inline. Only the trigger-vs-tick pair became concurrent.
+
+The practical consequence: a long *trigger* still delays the next trigger. A ten-minute answer means a message arriving at minute two waits. A long *scheduled run* no longer does. If the remaining queueing matters for your setup, keep the dispatcher fast and let it hand slow work to something else.
+
+The channel holds 64 pending requests. That is deep enough for a burst of chat messages to survive one slow answer, and shallow enough that a wedged daemon applies backpressure to the ingress instead of growing without bound.
 
 `[lifecycle] mode = "persistent"` does not change this. It removes the startup cost of each run, not the queue.
+
+One consequence worth knowing before you `dotagent reload`: retiring persistent instances waits for whatever they are answering. A SIGHUP that arrives while a triggered request is in flight is applied after it finishes, bounded by that agent's `timeout_seconds`. See [Daemon lifecycle](../guides/daemon-lifecycle.md#reload-sighup).
 
 ## What the agent receives
 

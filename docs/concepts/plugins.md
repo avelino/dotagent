@@ -125,8 +125,8 @@ events = ["given_up"]
   plugin's `info` response describes the schema.
 - `events` (optional, only on `on_success` / `on_failure`) — restrict
   firing to specific events. Empty / omitted = all events. Valid values:
-  `attempt_failed`, `given_up`, `recovered`, `timed_out`, `preflight`,
-  `success`, `daily_summary`.
+  `attempt_failed`, `given_up`, `stale`, `recovered`, `timed_out`,
+  `preflight`, `success`, `daily_summary`.
 
 ### 2. Validate at install time
 
@@ -197,19 +197,19 @@ dotagent emits:
 | `success`         | agent exit code 0                                                   |
 | `attempt_failed`  | agent exit ≠ 0 but more retries available                           |
 | `timed_out`       | agent killed for exceeding `timeout_seconds`                        |
-| `given_up`        | retries exhausted (`max_retries` reached)                           |
+| `given_up`        | retries exhausted (`max_retries` reached), and repeated while it holds |
+| `stale`           | the schedule stopped running at all — window aged past `stale_after_minutes` |
 | `recovered`       | success on a window that had ≥1 previous failed attempt             |
 | `preflight`       | preflight plugin returned `ok=false` and the run was aborted        |
-| `daily_summary`   | the daemon's internal 22:45 health summary (or `dotagent daily-summary`) |
+| `daily_summary`   | the daemon's health summary at `[daily_summary].time` (default 22:45), or `dotagent daily-summary` |
 
-**Example — only fire a sink for daily summaries** (not on every run):
-
-```toml
-[[on_success]]
-plugin = "sink-file"
-config = { path = "/tmp/dotagent/daily-summary.md", mode = "overwrite" }
-events = ["daily_summary"]
-```
+`daily_summary` is the one event a manifest cannot subscribe to. It
+belongs to the daemon, not to any agent, so it is delivered only to
+`[[daily_summary.notifiers]]` in
+[`config.toml`](../guides/config-reference.md#daily_summary) — and
+those entries ignore `events` entirely, since a list already scoped to
+one event can only be subtracted from. Writing
+`events = ["daily_summary"]` on a manifest entry matches nothing.
 
 **Example — fire a sink on every successful run** (no filter):
 
@@ -679,7 +679,14 @@ ls ~/.config/dotagent/plugins/            # local install?
 ### "Plugin failed (exit N): …"
 
 Stderr is captured. Either run the plugin manually with the same payload
-or `tail -F ~/.config/dotagent/logs/run.avelino.dotagent-error.log`.
+or watch the daemon's structured log:
+
+```bash
+tail -F ~/.config/dotagent/logs/daemon/dotagent.log | jq -c 'select(.fields.plugin)'
+```
+
+(Not `run.avelino.dotagent-error.log` — under launchd / systemd that file
+only receives daemon crashes, not per-plugin output.)
 
 ### "Plugin returned ok=false"
 
@@ -700,9 +707,10 @@ plugin = "sink-roam"
 events = ["daily_summary"]
 ```
 
-…and your agent never emitted `daily_summary`, the plugin won't fire on
-ordinary `success` events. Remove the filter or add the event you wanted
-to see.
+…that filter can never match: `daily_summary` is the daemon's own event
+and never reaches a manifest entry. The plugin stays silent on ordinary
+`success` too, because the filter excludes it. Remove the filter, or
+list the event you actually wanted.
 
 ### Plugin works manually but not from the daemon
 

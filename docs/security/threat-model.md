@@ -207,7 +207,19 @@ operator did not create for dotagent.
   it callable — the author names entry points by chmod.
 - **Supervised.** Every execution goes through `dotagent-supervisor`: enforced
   deadline (`timeout_seconds`, default 300) and kill-tree on expiry, so a
-  script that spawns children cannot leave orphans.
+  script that spawns children cannot leave orphans — and the guarantee now
+  survives the daemon itself. A daemon killed mid-run used to leave its
+  children with nobody holding their deadline; the next boot re-reads the
+  supervisor snapshot and kill-trees what it can prove was left behind. See
+  [Boot orphan reap](../guides/daemon-lifecycle.md#boot-orphan-reap).
+
+  The reap is **deliberately incomplete**, and that is the security position.
+  Killing the wrong process is a worse outcome than an orphan surviving, so a
+  record is only signalled when group leadership, start time and command line
+  all still match what was recorded. A recycled pid fails at least one of them
+  and is refused. Unreadable snapshot, missing identity fields, another daemon
+  alive: all abort without signalling. Bounding an escaped script is a
+  best-effort mitigation here, never a licence to signal a pid read off disk.
 - **Arguments are a token list**, never a shell string — same rule as V5.
 - **Audited.** Each run appends `skill_invoked` (skill, script, exit code,
   whether it timed out). Without it, "what ran on this machine" would have a
@@ -329,17 +341,62 @@ people use the bot, which is exactly the shape of a leak that ships.
 likes. dotagent isolates the *process*, not the filesystem — `[security]
 filesystem_writable` is still schema-only (V-deferred, below).
 
+### V14 — Notifier credentials written to the daemon's own log
+
+V6 is about a *plugin* leaking secrets outward. This is the inverse, and it
+does not need a misbehaving anything: dotagent leaking its own notifier
+credentials into a file it writes itself.
+
+`reqwest::Error`'s `Display` appends ` for url (…)`. For two built-in drivers
+the URL **is** the credential —
+`hooks.slack.com/services/T…/B…/<secret>` and
+`api.telegram.org/bot<token>/sendMessage`. Any `?` that converted such an error
+into a `NotifyError` reached `warn!(driver, error = %e, "notifier failed")` and
+landed in `~/.config/dotagent/logs/daemon/dotagent.log.*` — live credentials,
+in a file with a 30-day retention window, from a failure as mundane as a DNS
+blip. Nothing was compromised to cause it; the notifier just had a bad day.
+
+**Mitigations:**
+
+- **The leak is unrepresentable, not merely unwritten.** `NotifyError` has no
+  `From<reqwest::Error>` — the variant was **removed from the enum**, so `?` on
+  a `reqwest` call does not compile. A driver has to route transport failures
+  through `redact::sanitize_reqwest_err`, which keeps only the failure kind and
+  the HTTP status (`slack transport error (timeout, status 503)`). Deleting the
+  conversion is what stops the next driver from reintroducing this by accident;
+  fixing the log line would not have.
+- **API error bodies are scrubbed before logging.** Telegram's own error text
+  happily echoes the request URL back, so the token is blanked in the
+  description — both as a whole string and as its trailing high-entropy
+  segment, since a truncated echo can carry the half that matters.
+- **ntfy `base_url` userinfo is redacted**, because a self-hosted URL may
+  legitimately embed HTTP basic credentials.
+- **Credentials do not have to be in the manifest at all.** Every
+  credential-bearing field takes `${VAR}`, resolved at send time from
+  `secrets.env` — see [`concepts/secrets.md`](../concepts/secrets.md). The
+  expansion error names the field and the variable only; it never echoes a
+  resolved value or the literal input, because the input is a credential
+  template and the store holds sibling credentials.
+
+**Not mitigated:** an operator who writes a literal credential into
+`agent.toml` and commits it. dotagent cannot un-publish a git history. The
+`${VAR}` path exists so this never has to happen; `doctor` does not currently
+flag literals that look like credentials.
+
 ## Defenses shipped in v0 (with the daemon engine)
 
 | Defense | Status | Scope |
 |---|---|---|
-| Audit log (hash-chained, append-only) | ✅ v0 | All `agent_run`, `agent_failed`, `agent_recovered`, `manifest_*`, `plugin_*` events |
-| Out-of-band notification on critical events | ✅ v0 | `given_up`, `phantom_agent_detected`, `manifest_drift_detected`, `audit_chain_broken` |
+| Audit log (hash-chained, append-only) | ✅ v0 | All `agent_run`, `agent_failed`, `agent_recovered`, `manifest_*`, `plugin_*` events. Rotates at 32MB across a hash **seam**; segments are never deleted automatically. See [what the chain guarantees](#what-the-hash-chain-guarantees-and-what-it-does-not). |
+| Out-of-band notification on critical events | ✅ v0 | `given_up`, `phantom_agent_detected`, `manifest_drift_detected`, `audit_chain_broken` (which now also covers a log whose head was removed with no seam accounting for it) |
 | `[security]` schema in manifest | ✅ v0 schema-only | Parses + `doctor` warns on inconsistency. **Enforcement is post-v0** — see below. |
 | Manifest drift detection | ✅ v0 | sha256 cache + notify on mismatch |
 | Phantom agent detection | ✅ v0 | first-seen detection + notify |
 | Broken manifest does not hide healthy agents | ✅ | A failed parse is skipped and audited as `manifest_invalid` (Critical). Previously one bad file aborted the whole scan, leaving the daemon with zero agents and nothing but a log line. |
 | Trigger env cannot shadow runner env | ✅ | Per-invocation variables are applied before the `AGENT_*` block, so an untrusted payload cannot redefine `AGENT_NAME` or `AGENT_HEARTBEAT_FILE`. |
+| Notifier credentials cannot reach `tracing` | ✅ | `NotifyError` has no `From<reqwest::Error>`, so a `?` that would log a webhook URL does not compile. Transport errors are reduced to kind + status; API error bodies are token-scrubbed. See [V14](#v14--notifier-credentials-written-to-the-daemons-own-log). |
+| `${VAR}` for every credential-bearing notifier field | ✅ | `slack.webhook_url`, `ntfy.token`/`base_url`/`topic`, `pushover.token`/`user`, `telegram.bot_token`. Resolved at send time from `secrets.env` (0600-enforced), env as fallback. Unresolved = failed send, never the literal placeholder. |
+| Alerts that repeat while a failure holds | ✅ | `stale` and `given_up` re-notify on a rising ladder (entry, 1h, 6h, daily) rather than once. A monitoring channel that goes quiet while the failure persists is indistinguishable from one where nothing is wrong. |
 
 ### The `[security]` gap, stated plainly
 
@@ -362,6 +419,61 @@ need, not as a control that holds.
 Until enforcement lands, the honest mitigations are the ones outside dotagent:
 outbound firewall, disk encryption, and not installing an agent you have not
 read.
+
+## What the hash chain guarantees (and what it does not)
+
+Worth stating plainly, because rotation made the question concrete and the
+answer is easy to overstate.
+
+**The chain detects partial edits. It has never detected a total rewrite.**
+
+Each line carries `prev_hash = sha256(previous line)`. Change one line in the
+middle and every hash downstream stops reproducing, so verification names the
+position. Delete a line and the same thing happens. That is the guarantee, and
+it is a real one: it turns "somebody edited the log" from invisible into loud.
+
+But an attacker with write access to `audit.log` can recompute the whole file —
+strip the entries they dislike, rewrite every `prev_hash` forward, and hand
+back a file that verifies from `GENESIS` to the end. Nothing in dotagent stops
+that, and nothing could without a key the attacker cannot reach (see
+*Defenses deferred*: TPM / Secure Enclave anchoring). Per the premise at the
+top of this document, an attacker with user-equivalent capability is out of
+scope, and this is one of the places that shows.
+
+### Rotation preserves exactly that property — no more, no less
+
+Rotation renames the live file to `audit.log.<stamp>` and starts a new one
+whose first line is a **seam** (`audit_log_rotated`) recording the segment
+name, its entry count, and its tail hash. The seam's own `prev_hash` equals
+that tail hash, so the chain crosses the rename with no gap.
+
+The seam is what makes retention legible:
+
+| On disk | Verification says | Why |
+|---|---|---|
+| all segments present | intact from `GENESIS` | every link checked |
+| old segment deleted, seam present | **intact since `<ts>`**, naming the missing segment and its entry count | the seam survived in the current file, still covered by the chain, and explains the orphan |
+| head of the live file cut off | **unexplained truncation** → `audit_chain_broken`, critical | the seam went with the deleted lines; nothing accounts for the remaining `prev_hash` |
+| a line edited anywhere present | **broken at position N**, naming the segment | hashes stop reproducing |
+| segment truncated at its end | **broken**, seam's `tail_hash` vs. actual | the seam pinned the tail before the segment left |
+
+Could an attacker forge a seam — write an `audit_log_rotated` entry pointing at
+a segment that never existed, to explain away entries they deleted? Yes. But
+that costs them exactly what a total rewrite already costs: write access plus
+recomputing the chain forward. **Rotation does not move the boundary between
+what the chain catches and what it doesn't.** It only adds a way to say
+"history was pruned here, on purpose" that is as trustworthy as everything
+else in the file — no more, and importantly no less.
+
+Two smaller hardening notes, since the seam is a value read off disk and disk
+is attacker-writable:
+
+- `rotated_to` is validated as a bare sibling filename matching
+  `<log>.<YYYYMMDDTHHMMSS>[-N]`. A seam naming `../../etc/passwd` is not
+  followed; it is treated as an orphan, i.e. suspicious.
+- A seam whose `prev_hash` disagrees with its own declared `tail_hash` is not a
+  seam. It is an entry shaped like one, which is what a clumsy forgery looks
+  like, and it reads as unexplained truncation.
 
 ## Defenses deferred (with rationale)
 

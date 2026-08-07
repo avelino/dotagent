@@ -135,7 +135,12 @@ this living in the orchestrator rather than beside it:
   grandchildren.
 - **Visibility.** It shows up in `dotagent status` under `persistent`, and its
   spawn and recycle land in the audit log.
-- **Reaping.** Daemon shutdown terminates it. Nothing is orphaned.
+- **Reaping.** A graceful daemon shutdown retires it through the pool, then
+  the supervisor kill-trees whatever is left. A daemon that dies *without*
+  running that path — `SIGKILL`, a panic, `launchctl kickstart -k` — does
+  orphan its instances: nobody is holding their deadline anymore. Those are
+  collected on the next boot, before the daemon starts anything of its own.
+  See [Boot orphan reap](../guides/daemon-lifecycle.md#boot-orphan-reap).
 - **One instance per key.** The pool lives inside the daemon, so there is no
   second one to race it. This replaces the `flock` an external pool would need.
 
@@ -146,15 +151,28 @@ not. One clock, one kill path, no second implementation to get wrong.
 
 ## Concurrency
 
-Requests to one instance are serialized. Requests to *different* instances are
-not parallel either, and that is deliberate: the daemon reads triggers from the
-same `select!` that drives its tick loop, and instances of one agent share a
-heartbeat file. Two concurrent runs would race its read-modify-write. Serial
-execution keeps that hazard dormant.
+Requests to one instance are serialized by the pool: a mutex per `(agent, key)`
+means a second request for the same instance queues rather than interleaving
+with the first.
 
-The practical consequence is unchanged from
-[triggers](triggers.md#serialization): a slow answer delays the next one. What
-persistence removes is the startup cost, not the queue.
+Requests to *different* instances are not parallel either, and that is still
+deliberate — but the reason is the trigger worker, not the tick loop. Triggers
+are drained by a single task that awaits each request to completion before
+taking the next, so instances of one agent never race the heartbeat file they
+share. Ordering within a conversation falls out of the same property.
+
+What changed is that this queue no longer sits behind the scheduler. A trigger
+used to wait for whatever scheduled run the tick was awaiting inline; it now
+runs beside it. See [triggers](triggers.md#serialization) for why that pair is
+safe on every piece of shared state.
+
+The practical consequence is unchanged: a slow *answer* delays the next one.
+What persistence removes is the startup cost, not the queue.
+
+`dotagent reload` (SIGHUP) retires every instance so the next request re-reads
+the manifest. Retirement waits for the slot's mutex, so an instance answering a
+request when the signal lands is retired once that answer is delivered —
+bounded by the agent's `timeout_seconds`.
 
 ## Outside the daemon
 
@@ -172,7 +190,7 @@ path rather than a fiction.
 ## See also
 
 - [Persistent protocol](../reference/persistent-protocol.md) — the wire format
-- [Agent spec](../reference/agent-spec.md#lifecycle) — every field
+- [Agent spec](../reference/agent-spec.md#lifecycle--how-long-one-process-lives) — every field
 - [Triggers](triggers.md) — what causes a run
 - [Architecture](architecture.md) — where the pool sits
 - [Threat model](../security/threat-model.md) — state shared between senders

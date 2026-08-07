@@ -4,9 +4,9 @@
 //! `agent-orchestrator --status` from the legacy Fish framework.
 
 use anyhow::Result;
-use chrono::{Local, TimeZone};
+use chrono::Local;
 use dotagent_core::{AgentManifest, Heartbeat, Schedule};
-use dotagent_scheduler::{health_state, HealthState, ResolvedPolicy};
+use dotagent_scheduler::{health_state, window_key, HealthState, ResolvedPolicy};
 use dotagent_state::{slug_from_args, StateStore};
 use dotagent_supervisor::ProcessInfo;
 
@@ -117,12 +117,7 @@ fn compute_row(
         .and_then(|h| h.finished_at_iso.clone())
         .unwrap_or_else(|| "never".into());
 
-    let expected = hb
-        .as_ref()
-        .and_then(|h| h.last_success_at)
-        .and_then(|s| Local.timestamp_opt(s, 0).single());
-
-    let window = expected.and_then(|exp| {
+    let window = window_key(sched, hb.as_ref(), now).and_then(|exp| {
         state
             .read_window(&agent.manifest.agent.name, &slug, exp)
             .ok()
@@ -205,4 +200,222 @@ fn print_dashboard(rows: &[Row], now: chrono::DateTime<Local>) {
     println!("Logs:    {}/logs/", home.display());
     println!("State:   {}/state/agents/", home.display());
     println!("Audit:   {}/audit.log", home.display());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use dotagent_core::WindowState;
+    use std::path::Path;
+
+    const CRON_MANIFEST: &str = r#"
+[agent]
+name = "hn-digest"
+timeout_seconds = 600
+
+[run]
+command = "/bin/true"
+
+[[schedules]]
+id = "weekday-morning"
+type = "cron"
+weekdays = [1, 2, 3, 4, 5]
+hours = [10]
+minute = 0
+"#;
+
+    const INTERVAL_MANIFEST: &str = r#"
+[agent]
+name = "inbox-triage"
+timeout_seconds = 600
+
+[run]
+command = "/bin/true"
+
+[[schedules]]
+id = "every-90min"
+type = "interval"
+interval_minutes = 90
+"#;
+
+    fn at(h: u32, m: u32, s: u32) -> chrono::DateTime<Local> {
+        Local.with_ymd_and_hms(2026, 8, 6, h, m, s).unwrap()
+    }
+
+    fn agent_from(dir: &Path, manifest: &str) -> DiscoveredAgent {
+        let path = dir.join("agent.toml");
+        std::fs::write(&path, manifest).unwrap();
+        DiscoveredAgent {
+            manifest: AgentManifest::load(&path).unwrap(),
+            dir: dir.to_path_buf(),
+        }
+    }
+
+    fn heartbeat(agent: &str, last_success: chrono::DateTime<Local>) -> Heartbeat {
+        Heartbeat {
+            name: agent.into(),
+            slug: "default".into(),
+            args: vec![],
+            started_at: last_success.timestamp(),
+            started_at_iso: String::new(),
+            finished_at: Some(last_success.timestamp()),
+            finished_at_iso: Some(last_success.to_rfc3339()),
+            exit_code: Some(0),
+            duration_seconds: Some(1),
+            last_success_at: Some(last_success.timestamp()),
+            last_success_at_iso: None,
+        }
+    }
+
+    fn window(
+        agent: &str,
+        schedule: &str,
+        expected: chrono::DateTime<Local>,
+        attempts: u32,
+        exit_code: i32,
+    ) -> WindowState {
+        WindowState {
+            agent: agent.into(),
+            schedule_id: schedule.into(),
+            expected_at: expected.timestamp(),
+            attempts,
+            last_attempt_at: Some(expected.timestamp()),
+            last_attempt_exit_code: Some(exit_code),
+            last_attempt_stderr: None,
+            given_up: false,
+            given_up_at: None,
+        }
+    }
+
+    /// The bug: the window was looked up by `last_success_at` instead of the
+    /// window's own `expected_at`, so the filename almost never matched and
+    /// `degraded` could not be reached. Here the 10:00 window needed a retry
+    /// and succeeded at 10:12 — two different filenames.
+    #[test]
+    fn degraded_when_the_due_window_needed_a_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateStore::with_root(tmp.path().join("state"));
+        let agent = agent_from(tmp.path(), CRON_MANIFEST);
+        let sched = &agent.manifest.schedules[0];
+
+        state
+            .write_heartbeat(&heartbeat("hn-digest", at(10, 12, 0)))
+            .unwrap();
+        state
+            .write_window(
+                &window("hn-digest", "weekday-morning", at(10, 0, 0), 2, 0),
+                "default",
+                at(10, 0, 0),
+            )
+            .unwrap();
+
+        let row = compute_row(&agent, sched, &state, at(10, 30, 0));
+        assert_eq!(row.state, HealthState::Degraded, "reason: {}", row.reason);
+        assert!(
+            row.reason.contains('1'),
+            "one failed attempt before the success, got: {}",
+            row.reason
+        );
+    }
+
+    /// The other half of the bug, and the one the dashboard actually showed:
+    /// `hn-digest/weekday-morning` finished inside its own window minute, so
+    /// the wrong key matched by coincidence — and reported `degraded` for a
+    /// run that worked on the first try, because `attempts` counts the
+    /// successful dispatch too.
+    #[test]
+    fn ok_when_the_first_attempt_succeeded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateStore::with_root(tmp.path().join("state"));
+        let agent = agent_from(tmp.path(), CRON_MANIFEST);
+        let sched = &agent.manifest.schedules[0];
+
+        state
+            .write_heartbeat(&heartbeat("hn-digest", at(10, 0, 51)))
+            .unwrap();
+        state
+            .write_window(
+                &window("hn-digest", "weekday-morning", at(10, 0, 0), 1, 0),
+                "default",
+                at(10, 0, 0),
+            )
+            .unwrap();
+
+        let row = compute_row(&agent, sched, &state, at(10, 30, 0));
+        assert_eq!(row.state, HealthState::Ok, "reason: {}", row.reason);
+    }
+
+    /// A failing window must report the attempts it burned, not "no attempt".
+    #[test]
+    fn failing_window_reports_its_attempts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateStore::with_root(tmp.path().join("state"));
+        let agent = agent_from(tmp.path(), CRON_MANIFEST);
+        let sched = &agent.manifest.schedules[0];
+
+        // Last success was yesterday's window; today's 10:00 window failed.
+        let yesterday = at(10, 0, 0) - chrono::Duration::days(1);
+        state
+            .write_heartbeat(&heartbeat("hn-digest", yesterday))
+            .unwrap();
+        state
+            .write_window(
+                &window("hn-digest", "weekday-morning", at(10, 0, 0), 1, 1),
+                "default",
+                at(10, 0, 0),
+            )
+            .unwrap();
+
+        let row = compute_row(&agent, sched, &state, at(10, 30, 0));
+        assert_eq!(row.state, HealthState::Failing, "reason: {}", row.reason);
+        assert!(
+            row.reason.contains("1 attempt"),
+            "window state was not read: {}",
+            row.reason
+        );
+    }
+
+    /// Interval windows roll forward, so the key is the tick currently due —
+    /// the same one the daemon dispatches against. Ticks here are 09:00,
+    /// 10:30, 12:00; at 11:00 the due window is 10:30.
+    #[test]
+    fn interval_reads_the_rolled_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = StateStore::with_root(tmp.path().join("state"));
+        let agent = agent_from(tmp.path(), INTERVAL_MANIFEST);
+        let sched = &agent.manifest.schedules[0];
+
+        state
+            .write_heartbeat(&heartbeat("inbox-triage", at(9, 0, 0)))
+            .unwrap();
+        state
+            .write_window(
+                &window("inbox-triage", "every-90min", at(10, 30, 0), 1, 1),
+                "default",
+                at(10, 30, 0),
+            )
+            .unwrap();
+
+        let row = compute_row(&agent, sched, &state, at(11, 0, 0));
+        assert_eq!(row.state, HealthState::Failing, "reason: {}", row.reason);
+        assert!(
+            row.reason.contains("1 attempt"),
+            "rolled window was not read: {}",
+            row.reason
+        );
+    }
+
+    #[test]
+    fn window_key_is_the_due_window_not_the_last_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = agent_from(tmp.path(), CRON_MANIFEST);
+        let sched = &agent.manifest.schedules[0];
+        let hb = heartbeat("hn-digest", at(10, 12, 0));
+
+        assert_eq!(
+            window_key(sched, Some(&hb), at(10, 30, 0)),
+            Some(at(10, 0, 0))
+        );
+    }
 }

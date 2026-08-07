@@ -68,6 +68,13 @@ Both unit files set:
 | stdout capture     | `StandardOutPath=…run.avelino.dotagent.log` | `StandardOutput=append:…` |
 | stderr capture     | `StandardErrorPath=…-error.log`  | `StandardError=append:…`  |
 
+> The stderr file catches **crashes**, not activity. The daemon only mirrors
+> its `tracing` stream to stderr when stderr is a terminal — otherwise it
+> would grow forever in a file no rotation policy covers. Read
+> `logs/daemon/dotagent.log` to see what the daemon is doing;
+> read `…-error.log` to find out why it died. `DOTAGENT_LOG_STDERR=1`/`0`
+> forces the mirror on or off.
+
 Templates live in
 [`crates/dotagent-unit-gen/templates/`](../../crates/dotagent-unit-gen/templates/).
 
@@ -188,6 +195,85 @@ systemctl --user restart run.avelino.dotagent
 
 ---
 
+## Boot orphan reap
+
+A daemon that exits through its shutdown path reaps its children and
+deletes `state/supervisor.json`. A daemon that is `SIGKILL`ed, panics,
+or is replaced by `launchctl kickstart -k` does neither. Its children
+survive with **nobody holding their deadline** — the supervisor that
+would have enforced it died with the daemon. Observed in production as
+an agent process alive for 26 minutes against a 600-second timeout.
+
+So a starting daemon opens its state store and audit log, and then —
+before it starts a supervisor of its own — looks at what the last one
+left behind:
+
+```mermaid
+flowchart TD
+    S([daemon starts]) --> E{"state/supervisor.json<br/>exists?"}
+    E -->|no| G["clean previous exit — nothing to do"]
+    E -->|yes| P{"another daemon<br/>alive (pidfile)?"}
+    P -->|yes| A["abort the sweep<br/>(two daemons is a misconfiguration,<br/>not a licence to kill)"]
+    P -->|no| R{"readable?"}
+    R -->|no| V["signal nothing;<br/>leave the file as evidence"]
+    R -->|yes| C["classify every record"]
+    C -->|identity confirmed| K["SIGTERM the process group,<br/>grace, then SIGKILL"]
+    C -->|any doubt| L["leave it alone"]
+    K --> D[delete the snapshot]
+    L --> D
+    G --> N(["start supervisor, snapshot writer, tick loop"])
+    D --> N
+```
+
+The order matters: the reap runs **before** the snapshot writer starts,
+because the writer's first tick would overwrite the only record of
+those processes.
+
+### It refuses to kill on doubt
+
+The OS recycles pids. A pid read off disk with no further proof
+eventually names somebody else's process, so every record is
+corroborated against what the OS reports for that pid *right now*. A
+record is reaped only when **all** of these hold:
+
+| Check | What it rules out |
+|---|---|
+| pid > 1, and not our own | signalling init or ourselves |
+| the record carries `pgid` and `command` | a snapshot from a build that predates identity checking |
+| recorded `pgid == pid` | a record this supervisor did not produce — every supervised spawn does `setpgid(0, 0)` |
+| the OS still reports the pid | a process that already exited (the common case) |
+| observed `pgid == pid` | a recycled pid that is not its own group leader |
+| observed start time within 5s of the recorded one | a process that inherited the number after the old daemon died |
+| observed command consistent with the recorded one | a recycled pid running something else entirely |
+
+Anything missing, ambiguous, or unparseable is a **skip**, never a
+kill. Leaving one orphan alive costs memory; killing the wrong process
+costs somebody's work. A snapshot that cannot be read or parsed
+signals nothing at all and is left on disk, since a corrupt registry is
+exactly when guessing is most expensive.
+
+Confirmed orphans get the same treatment a live deadline expiry gets:
+`SIGTERM` to the whole process group, one grace window, then `SIGKILL`.
+Each one is logged at `warn` with the agent, label, pid, pgid, and how
+far past its deadline it ran, and audited as
+[`orphan_reaped`](../reference/paths.md#auditlog) at `critical` — a
+process that outlived its deadline unsupervised is worth an out-of-band
+notification, not just a log line. Skips are logged at `debug` with the
+reason (`already_gone`, `start_time_mismatch`, `command_mismatch`,
+`not_group_leader`, `ambiguous_record`, `unusable_record`) and are never
+audited: refusing to signal is the expected outcome, not an event.
+
+### Rollout
+
+`pgid` and `command` are new fields in the snapshot. A
+`state/supervisor.json` written by an older binary has neither, so
+every record in it classifies as `ambiguous_record` and nothing is
+killed. The reap becomes effective from the **second** restart after
+the upgrade — the first one is what writes a snapshot the next boot can
+actually check.
+
+---
+
 ## Reload (SIGHUP)
 
 ```bash
@@ -208,6 +294,12 @@ What `reload` does NOT do:
   in-memory code. For binary swaps, use `restart` (above).
 - **Doesn't drain in-flight runs.** Currently-spawned agents keep
   running until they exit.
+- **Doesn't cut short an in-flight answer.** Retiring
+  [persistent](../concepts/lifecycle.md) instances waits for the slot each one
+  holds, so an instance answering a trigger when the signal lands is retired
+  after that answer is delivered. The wait is bounded by the agent's
+  `timeout_seconds`. `dotagent reload` itself returns as soon as the signal is
+  sent — it is the daemon-side effect that waits.
 - **Doesn't reset the audit chain.** The new tick continues from the
   current `prev_hash`.
 
@@ -217,6 +309,65 @@ Errors:
 |----------------------------------------|--------------------------------------------------------------------------|
 | `reading ... (daemon not running?)`    | `state/daemon.pid` is missing. Daemon isn't running.                     |
 | `sending SIGHUP: No such process`      | PID file is stale (daemon crashed without `Drop` cleanup). Start it again. |
+
+A reload replaces the **whole** in-memory config, not just the parts
+the ingress reads. Retention thresholds and the daily summary's time
+and destinations were pinned at boot until recently; editing
+`config.toml` and reloading now takes effect on the next tick, as the
+table above says it should.
+
+---
+
+## What wakes the daemon
+
+The daemon sleeps until the earliest thing it has to be awake for. Two
+independent reasons produce a wake-up, plus a safety cap:
+
+```mermaid
+flowchart LR
+    A["next agent window<br/>(across every schedule)"] --> M{"earliest"}
+    B["daily summary<br/>at [daily_summary].time"] --> M
+    C["safety cap<br/>MAX_SLEEP = 30min"] --> M
+    M --> S["sleep until it"]
+    S -.->|SIGHUP / SIGTERM / SIGINT| S
+```
+
+The safety cap is what picks up a manifest dropped into `agents/`
+without a reload — within 30 minutes even if nothing is scheduled.
+
+An **inbound trigger is not on this list**, and that is the point. A
+chat message or an MCP tool call is drained by a worker task running
+beside the loop, so it is answered on its own clock instead of waiting
+for the loop to come back around:
+
+```mermaid
+flowchart LR
+    subgraph daemon
+      L["tick loop<br/>(awaits each scheduled run inline)"]
+      W["trigger worker<br/>(one task, FIFO, awaits each request)"]
+    end
+    ING(["telegram poller / MCP"]) -->|bounded channel, 64| W
+    CLK([clock]) --> L
+```
+
+Triggers were an arm of the loop's `select!` until recently, which
+meant a scheduled run with a 20-minute deadline held every queued
+message for its whole duration. Now only triggers queue behind each
+other. See [Triggers → Serialization](../concepts/triggers.md#serialization).
+
+The daily summary is a wake-up reason **in its own right**: it is the
+one scheduled thing the daemon does that no agent schedule accounts
+for. Before that was made explicit it only landed inside its window by
+coincidence — the 30-minute sleep cap happened to match the 30-minute
+grace window, two unrelated constants with nothing connecting them.
+That coincidence broke the moment a tick overran its own sleep budget,
+and it never held at all for a `time` / `grace_minutes` someone picked
+themselves.
+
+`dotagent tick --dry-run` reports the **agent** next event only, so the
+real next wake-up can be earlier than what it prints when the summary
+is closer. See
+[`[daily_summary]`](config-reference.md#daily_summary).
 
 ---
 
@@ -293,12 +444,28 @@ tail -F ~/.config/dotagent/logs/daemon/dotagent.log | jq -c .
 # {"timestamp":"...","level":"INFO","fields":{"message":"dispatching run","agent":"hello","schedule":"every-2min"}}
 ```
 
-Or the launchd / systemd captured stdout:
+That is the file to watch. `dotagent.log` is where the daemon's whole
+`tracing` stream goes, and under launchd / systemd it is the **only** place
+it goes.
+
+The captured stdout/stderr files are a different thing:
 
 ```bash
-tail -F ~/.config/dotagent/logs/daemon/run.avelino.dotagent.log
-tail -F ~/.config/dotagent/logs/daemon/run.avelino.dotagent-error.log
+tail -F ~/.config/dotagent/logs/daemon/run.avelino.dotagent.log        # stdout
+tail -50 ~/.config/dotagent/logs/daemon/run.avelino.dotagent-error.log # crashes only
 ```
+
+`…-error.log` is **not** an activity log. The daemon installs its stderr
+`tracing` layer only when stderr is a terminal, because under a service
+manager stderr is a plain file that nothing rotates — an unbounded log
+growing next to the rotated one it duplicates. So the error file receives
+panics, and startup failures that happen before logging is up, and nothing
+else. A daemon that is running normally leaves it empty, which is the
+correct outcome and not a symptom.
+
+Override with `DOTAGENT_LOG_STDERR=1` (force the mirror on — useful when the
+unit is rewired to journald, which does rotate) or `DOTAGENT_LOG_STDERR=0`
+(force it off even in a terminal).
 
 Health dashboard:
 
@@ -313,12 +480,16 @@ dotagent tick --dry-run
 # (dry-run) scanned 4 agent(s); would dispatch 1; next event: 2026-05-19T08:30:00-0300
 ```
 
-That `next event` timestamp is when the daemon will next wake.
+That `next event` timestamp is the next **agent** window. The daemon
+wakes at whichever comes first between it, the daily summary, and the
+30-minute safety cap — see
+[What wakes the daemon](#what-wakes-the-daemon).
 
 ### "Did the audit log break?"
 
 The daemon verifies the chain on startup and emits
-`AuditChainBroken` (with notify) if it fails. Manual check:
+`AuditChainBroken` (with notify) if it fails. It checks the **live
+segment** — the only file that changes. Manual check:
 
 ```bash
 # Walk the file; each line's prev_hash must be sha256 of the previous line.
@@ -326,6 +497,25 @@ The daemon verifies the chain on startup and emits
 grep audit_chain_broken ~/.config/dotagent/audit.log
 # (no output = chain intact)
 ```
+
+Past 32MB the log rotates: the live file becomes
+`audit.log.<YYYYMMDDTHHMMSS>` and a fresh one opens with a **seam**
+(`audit_log_rotated`) whose `prev_hash` is the old file's tail hash, so
+the chain has no gap at the rename. Rotation is normal and verifies
+clean:
+
+```bash
+ls ~/.config/dotagent/audit.log*        # live file plus any segments
+grep audit_log_rotated ~/.config/dotagent/audit.log | jq .
+```
+
+Segments are **never deleted by dotagent** — the log sweeper in `[logs]`
+does not touch them. If you prune them yourself, verification still
+reads as intact and reports how far back it reaches. What it will *not*
+forgive is cutting lines off the head of the live file: that removes the
+seam too, and the orphaned hash left behind is what fires
+`audit_chain_broken`. Details in
+[`security/threat-model.md`](../security/threat-model.md#what-the-hash-chain-guarantees-and-what-it-does-not).
 
 ---
 

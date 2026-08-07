@@ -161,7 +161,7 @@ MCP restricts tool names to `[a-zA-Z0-9_-]`, which agent names are not bound by.
 |---|---|
 | `disk-alert` | `run-disk-alert` |
 | `hn.digest` | `run-hn-digest` |
-| `buser/finops` | `run-buser-finops` |
+| `ops/cost-report` | `run-ops-cost-report` |
 
 Skills use the same sanitizer under a different prefix, `skill-<name>`, which is
 what keeps a skill from ever colliding with an agent. Two *skills* can still
@@ -249,4 +249,4 @@ A malformed manifest anywhere in the search path fails discovery, and `tools/lis
 
 - [Triggers](../concepts/triggers.md) — the general concept
 - [Telegram](../concepts/telegram.md) — a chat front end built on this
-- [CLI](cli.md#dotagent-mcp)
+- [CLI](cli.md#mcp)

@@ -168,6 +168,6 @@ DOTAGENT_ROOT=$PWD/examples dotagent run hello-persistent --schedule manual
 ## See also
 
 - [Lifecycle](../concepts/lifecycle.md) — when to use this at all
-- [Agent spec](agent-spec.md#lifecycle) — the `[lifecycle]` fields
+- [Agent spec](agent-spec.md#lifecycle--how-long-one-process-lives) — the `[lifecycle]` fields
 - [Plugin protocol](plugin-protocol.md) — the one-shot JSON-stdio contract
 - [Env vars](env-vars.md) — everything dotagent injects

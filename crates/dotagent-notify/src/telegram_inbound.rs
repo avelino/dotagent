@@ -22,11 +22,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::telegram::{client, expand_env, sanitize_reqwest_err, send_message};
+use crate::secrets::expand_env;
+use crate::telegram::{
+    client, describe_api_error, sanitize_reqwest_err, send_message, BOT_TOKEN_FIELD,
+};
 use crate::{NotifyError, Result};
-
-/// Telegram's hard cap on a single message body.
-const MAX_MESSAGE_CHARS: usize = 4096;
 
 /// One accepted inbound message, flattened to what a trigger needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,7 +207,7 @@ impl Poller {
     /// runs agents, at-most-once beats at-least-once: a redelivered message
     /// would re-run whatever it asked for.
     pub async fn poll(&mut self) -> Result<Vec<InboundMessage>> {
-        let token = expand_env(&self.bot_token).map_err(NotifyError::Config)?;
+        let token = expand_env(BOT_TOKEN_FIELD, &self.bot_token).map_err(NotifyError::Config)?;
         let url = format!("https://api.telegram.org/bot{token}/getUpdates");
         let body = serde_json::json!({
             "offset": self.offset,
@@ -220,10 +220,9 @@ impl Poller {
             Err(e) => return Err(NotifyError::Backend(sanitize_reqwest_err(&e))),
         };
         if !res.status().is_success() {
-            return Err(NotifyError::Backend(format!(
-                "telegram getUpdates returned {}",
-                res.status()
-            )));
+            return Err(NotifyError::Backend(
+                api_error("getUpdates", res, &token).await,
+            ));
         }
         let parsed: GetUpdatesResponse = match res.json().await {
             Ok(p) => p,
@@ -257,20 +256,18 @@ impl Poller {
 /// `reply_to` quotes the original message. Runs are asynchronous and a chat can
 /// have several questions in flight, so without the quote there is no telling
 /// which answer belongs to which.
+///
+/// Truncation to Telegram's 4096-char cap happens inside `send_message`, which
+/// is the single choke point every outbound message goes through — trimming
+/// here as well would leave the notification path uncovered, which is exactly
+/// how it stayed broken.
 pub async fn reply(bot_token: &str, chat_id: i64, reply_to: Option<i64>, text: &str) -> Result<()> {
     // The id of the reply is not recorded: correlation exists so a *failure
     // notification* can be answered, and an answer to an answer resolves to
     // the same run through the message it quotes.
-    send_message(
-        bot_token,
-        &chat_id.to_string(),
-        &truncate(text),
-        None,
-        false,
-        reply_to,
-    )
-    .await
-    .map(|_| ())
+    send_message(bot_token, &chat_id.to_string(), text, None, false, reply_to)
+        .await
+        .map(|_| ())
 }
 
 // ---------------------------------------------------------------------
@@ -323,7 +320,7 @@ impl BotCommand {
 /// stop being offered, or the menu keeps promising something that no longer
 /// resolves.
 pub async fn set_my_commands(bot_token: &str, chat_id: i64, commands: &[BotCommand]) -> Result<()> {
-    let token = expand_env(bot_token).map_err(NotifyError::Config)?;
+    let token = expand_env(BOT_TOKEN_FIELD, bot_token).map_err(NotifyError::Config)?;
     let url = format!("https://api.telegram.org/bot{token}/setMyCommands");
     let body = serde_json::json!({
         "commands": commands,
@@ -331,11 +328,27 @@ pub async fn set_my_commands(bot_token: &str, chat_id: i64, commands: &[BotComma
     });
     match client().post(&url).json(&body).send().await {
         Ok(r) if r.status().is_success() => Ok(()),
-        Ok(r) => Err(NotifyError::Backend(format!(
-            "telegram setMyCommands returned {}",
-            r.status()
-        ))),
+        Ok(r) => Err(NotifyError::Backend(
+            api_error("setMyCommands", r, &token).await,
+        )),
         Err(e) => Err(NotifyError::Backend(sanitize_reqwest_err(&e))),
+    }
+}
+
+/// Format a failed Bot API call as `<method> returned <status>: <reason>`.
+///
+/// The reason lives in the response body; a status on its own says a call
+/// failed without saying what to change.
+async fn api_error(method: &str, res: reqwest::Response, token: &str) -> String {
+    let status = res.status();
+    match res
+        .text()
+        .await
+        .ok()
+        .and_then(|b| describe_api_error(&b, token))
+    {
+        Some(d) => format!("telegram {method} returned {status}: {d}"),
+        None => format!("telegram {method} returned {status}"),
     }
 }
 
@@ -351,28 +364,16 @@ pub const TYPING_REFRESH: std::time::Duration = std::time::Duration::from_secs(4
 /// Best-effort by design: a failed indicator is cosmetic, and letting it
 /// interrupt the run would trade a working answer for a spinner.
 pub async fn typing(bot_token: &str, chat_id: i64) -> Result<()> {
-    let token = expand_env(bot_token).map_err(NotifyError::Config)?;
+    let token = expand_env(BOT_TOKEN_FIELD, bot_token).map_err(NotifyError::Config)?;
     let url = format!("https://api.telegram.org/bot{token}/sendChatAction");
     let body = serde_json::json!({ "chat_id": chat_id, "action": "typing" });
     match client().post(&url).json(&body).send().await {
         Ok(r) if r.status().is_success() => Ok(()),
-        Ok(r) => Err(NotifyError::Backend(format!(
-            "telegram sendChatAction returned {}",
-            r.status()
-        ))),
+        Ok(r) => Err(NotifyError::Backend(
+            api_error("sendChatAction", r, &token).await,
+        )),
         Err(e) => Err(NotifyError::Backend(sanitize_reqwest_err(&e))),
     }
-}
-
-/// Trim to Telegram's limit, saying so rather than silently losing the tail.
-fn truncate(text: &str) -> String {
-    if text.chars().count() <= MAX_MESSAGE_CHARS {
-        return text.to_string();
-    }
-    const NOTICE: &str = "\n[truncated]";
-    let keep = MAX_MESSAGE_CHARS - NOTICE.chars().count();
-    let head: String = text.chars().take(keep).collect();
-    format!("{head}{NOTICE}")
 }
 
 // ---------------------------------------------------------------------
@@ -466,6 +467,62 @@ mod tests {
     }
 
     #[test]
+    fn non_ascii_survives_extraction_byte_for_byte() {
+        // pt-BR is the common case for this bot and every accent is a
+        // multi-byte sequence. A path that re-encodes them turns "é"
+        // (`c3 a9`) into "Ã©" (`c3 83 c2 a9`) — still valid UTF-8, so nothing
+        // downstream errors and the agent simply reasons about mangled text.
+        // Pinning the bytes is what makes that visible in CI instead of in a
+        // chat two months later.
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},
+             "text":"quem é thiago avelino?",
+             "reply_to_message":{"message_id":8,"chat":{"id":2},
+              "text":"sincroniza calendários pro Buser — última rodada às 19:01"}}}
+        ]}"#;
+        let m = &extract(updates_json(raw))[0];
+        assert_eq!(m.text, "quem é thiago avelino?");
+        assert_eq!(m.text.as_bytes(), "quem é thiago avelino?".as_bytes());
+        assert_eq!(
+            m.reply_to_text.as_deref(),
+            Some("sincroniza calendários pro Buser — última rodada às 19:01")
+        );
+        assert!(
+            !m.text.contains('Ã') && !m.reply_to_text.as_deref().unwrap().contains('Ã'),
+            "double-encoded UTF-8 reached the trigger payload"
+        );
+    }
+
+    #[test]
+    fn escaped_unicode_decodes_to_the_same_bytes_as_raw_utf8() {
+        // Telegram may send either form on the wire. Both must land on the
+        // same String, or the agent's behaviour would depend on which one the
+        // API happened to pick.
+        let escaped = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},
+             "text":"quem é thiago avelino?"}}
+        ]}"#;
+        assert_eq!(
+            extract(updates_json(escaped))[0].text,
+            "quem é thiago avelino?"
+        );
+    }
+
+    #[test]
+    fn an_emoji_in_a_quoted_notification_keeps_its_codepoint() {
+        // dotagent's own alerts lead with 🚨 (4 bytes). Latin-1 round-tripping
+        // renders it as "ð\u{9f}\u{9a}¨", which is what the log showed.
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},
+             "text":"pq?",
+             "reply_to_message":{"message_id":8,"chat":{"id":2},
+              "text":"🚨 calendar-prep-1h/hourly-30 gave up after 2 attempts"}}}
+        ]}"#;
+        let m = &extract(updates_json(raw))[0];
+        assert!(m.reply_to_text.as_deref().unwrap().starts_with('🚨'));
+    }
+
+    #[test]
     fn a_message_without_a_reply_has_no_quoted_text() {
         let raw = r#"{"ok":true,"result":[
             {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},"text":"oi"}}
@@ -478,7 +535,7 @@ mod tests {
     #[test]
     fn a_reply_carries_the_id_it_answers() {
         // The id is what resolves a notification back to the run that sent it.
-        // The text cannot: one event says "calendar-prep-1h/hourly-00 gave up"
+        // The text cannot: one event says "disk-alert/every-15min gave up"
         // and another says only "preflight aborted by plugin preflight-warp",
         // so parsing the wording would work for one and fail for the other.
         let raw = r#"{"ok":true,"result":[
@@ -620,26 +677,8 @@ mod tests {
         assert_eq!(p.offset, 500);
     }
 
-    #[test]
-    fn truncate_leaves_short_text_alone() {
-        assert_eq!(truncate("hi"), "hi");
-    }
-
-    #[test]
-    fn truncate_marks_long_text_and_respects_the_cap() {
-        let long = "x".repeat(MAX_MESSAGE_CHARS + 500);
-        let out = truncate(&long);
-        assert!(out.ends_with("[truncated]"));
-        assert!(out.chars().count() <= MAX_MESSAGE_CHARS);
-    }
-
-    #[test]
-    fn truncate_counts_characters_not_bytes() {
-        // Multi-byte input must not be cut mid-character nor over-trimmed.
-        let long = "é".repeat(MAX_MESSAGE_CHARS + 10);
-        let out = truncate(&long);
-        assert!(out.chars().count() <= MAX_MESSAGE_CHARS);
-    }
+    // Truncation moved to `crate::telegram` so the outbound notification path
+    // gets it too; its tests live there.
 
     // --- rate limiter: deny-side coverage outweighs allow-side ---
 

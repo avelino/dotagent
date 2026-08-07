@@ -4,8 +4,17 @@
 //!
 //! 1. **JSON file appender** with daily rotation under
 //!    `$DOTAGENT_HOME/logs/daemon/dotagent.log.YYYY-MM-DD`. Always on.
-//! 2. **Stderr** in the configured format (`json` / `pretty` / `compact`)
-//!    so launchd / systemd capture something legible too.
+//!    This is the source of truth: it rotates daily and the retention
+//!    sweeper compresses + expires it.
+//! 2. **Stderr mirror**, compact format — **only when stderr is a
+//!    terminal**. Under launchd / systemd stderr is a plain file that the
+//!    init system holds open, so nothing can rotate it; mirroring there
+//!    grew an unbounded duplicate of (1). Left quiet, that channel stays
+//!    free for what only it can carry: panics, aborts, and anything that
+//!    fails before this subscriber exists. Override with
+//!    `DOTAGENT_LOG_STDERR=1` (force on, e.g. when the unit is rewired to
+//!    journald) or `DOTAGENT_LOG_STDERR=0` (force off).
+//!    ANSI colour follows the same TTY check and honours `NO_COLOR`.
 //! 3. **OpenTelemetry OTLP layer** (opt-in). Enabled when
 //!    `[telemetry] otlp_endpoint` in `~/.config/dotagent/config.toml` is
 //!    set. Exports spans via gRPC. Auth headers come from the standard
@@ -17,6 +26,7 @@
 
 pub mod retention;
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use dotagent_core::config::{Config, TelemetryConfig};
@@ -38,6 +48,37 @@ pub enum TelemetryError {
     Io(#[from] std::io::Error),
     #[error("otel pipeline: {0}")]
     Otel(String),
+}
+
+/// Forces the stderr mirror layer on (`1`/`true`/`yes`/`on`) or off
+/// (`0`/`false`/`no`/`off`), overriding TTY detection.
+pub const STDERR_MIRROR_ENV: &str = "DOTAGENT_LOG_STDERR";
+
+/// Whether to install the stderr mirror layer.
+///
+/// Default is "only on a terminal". A non-TTY stderr under launchd /
+/// systemd is a file held open by the init system: no rotation, no
+/// retention, and every event it receives is already in the rotating JSON
+/// log. Keeping it quiet is what stops that file from growing forever.
+fn stderr_mirror_enabled(is_tty: bool, forced: Option<&str>) -> bool {
+    match forced.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => is_tty,
+    }
+}
+
+/// Whether a stderr log writer may emit ANSI escapes. `NO_COLOR` set to any
+/// non-empty value wins over TTY detection (https://no-color.org).
+///
+/// Public because the daemon is not the only writer: the CLI's lightweight
+/// per-subcommand subscriber has to answer the same question, and two copies
+/// of this rule would drift the first time one of them is fixed.
+pub fn ansi_enabled(is_tty: bool, no_color: Option<&str>) -> bool {
+    if no_color.is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    is_tty
 }
 
 /// Drop this when the daemon exits to flush buffered logs + spans.
@@ -73,9 +114,20 @@ pub fn init(config: &Config, log_dir_override: Option<PathBuf>) -> Result<Guard,
         .with_span_list(true)
         .with_writer(file_writer);
 
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .compact()
-        .with_writer(std::io::stderr);
+    // Built inline (same reason as the OTel layer below) so `Option<L>`
+    // still infers its `S` from the `registry()` chain.
+    let stderr_is_tty = std::io::stderr().is_terminal();
+    let ansi = ansi_enabled(stderr_is_tty, std::env::var("NO_COLOR").ok().as_deref());
+    let stderr_layer = stderr_mirror_enabled(
+        stderr_is_tty,
+        std::env::var(STDERR_MIRROR_ENV).ok().as_deref(),
+    )
+    .then(|| {
+        tracing_subscriber::fmt::layer()
+            .compact()
+            .with_ansi(ansi)
+            .with_writer(std::io::stderr)
+    });
 
     // 2) Optional OTel layer — built inline so the layer's `S` type
     //    parameter can be inferred from the `registry()` chain.
@@ -153,4 +205,47 @@ pub fn agent_log_path(agent: &str) -> PathBuf {
 /// Plain path to today's daemon log file.
 pub fn daemon_log_path() -> PathBuf {
     dotagent_state::paths::daemon_logs_dir().join("dotagent.log")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ansi_enabled, stderr_mirror_enabled};
+
+    #[test]
+    fn stderr_mirror_follows_tty_by_default() {
+        assert!(stderr_mirror_enabled(true, None));
+        // The launchd / systemd case: stderr is a file nobody rotates.
+        assert!(!stderr_mirror_enabled(false, None));
+    }
+
+    #[test]
+    fn stderr_mirror_env_overrides_tty() {
+        for on in ["1", "true", "yes", "on", " TRUE ", "On"] {
+            assert!(stderr_mirror_enabled(false, Some(on)), "{on}");
+        }
+        for off in ["0", "false", "no", "off", "OFF"] {
+            assert!(!stderr_mirror_enabled(true, Some(off)), "{off}");
+        }
+    }
+
+    #[test]
+    fn stderr_mirror_ignores_garbage_env() {
+        assert!(stderr_mirror_enabled(true, Some("maybe")));
+        assert!(!stderr_mirror_enabled(false, Some("maybe")));
+        assert!(!stderr_mirror_enabled(false, Some("")));
+    }
+
+    #[test]
+    fn ansi_off_when_not_a_terminal() {
+        assert!(ansi_enabled(true, None));
+        assert!(!ansi_enabled(false, None));
+    }
+
+    #[test]
+    fn no_color_beats_tty() {
+        assert!(!ansi_enabled(true, Some("1")));
+        assert!(!ansi_enabled(true, Some("anything")));
+        // Empty value is "unset" per the NO_COLOR spec.
+        assert!(ansi_enabled(true, Some("")));
+    }
 }

@@ -144,16 +144,47 @@ sending a request authenticated as the literal string `${…}`.
 
 ```mermaid
 flowchart LR
-    A["telegram bot_token = \"${TELEGRAM_BOT_TOKEN}\""] --> B{secrets store has key?}
+    A["slack webhook_url = \"${SLACK_WEBHOOK_URL}\""] --> B{secrets store has key?}
     B -- yes --> C[use value from secrets.env]
     B -- no --> D{std::env::var has key?}
     D -- yes --> E[use value from process env]
     D -- no --> F[fail: env var unset]
 ```
 
-Today only `telegram.bot_token` honors `${VAR}` interpolation.
-`slack.webhook_url`, `pushover.token`/`user`, and `ntfy.token` will
-follow in a future change — open an issue if you need one urgently.
+### Which fields honor `${VAR}`
+
+Every credential-bearing field on every built-in HTTP driver:
+
+| Field                  | Why it is a credential                                          |
+|------------------------|-----------------------------------------------------------------|
+| `slack.webhook_url`    | The URL **is** the credential — anyone holding it can post.     |
+| `ntfy.token`           | Bearer token for authenticated topics.                          |
+| `ntfy.base_url`        | A self-hosted URL can legitimately embed HTTP basic credentials.|
+| `ntfy.topic`           | On public `ntfy.sh` the topic name is the only thing standing between your alert stream and anyone who guesses it. |
+| `pushover.token`       | Application token.                                              |
+| `pushover.user`        | User/group key.                                                 |
+| `telegram.bot_token`   | Full control of the bot.                                        |
+
+Two fields are deliberately **not** expanded: `telegram.chat_id` and
+`imessage.to`. They are addresses, not secrets — a phone number or a
+channel id identifies *where* the alert goes, and putting them through a
+resolver would turn a typo into a confusing "env var unset" instead of a
+message that lands in the wrong place. Keep them literal.
+
+Expansion happens at **send time**, not at load time, so rotating
+`secrets.env` and sending `SIGHUP` is enough — no manifest edit.
+
+### What an unresolved reference does
+
+It fails the send. There is no fallback to the literal `"${SLACK_WEBHOOK_URL}"`:
+that string is not a degraded credential, it is a request authenticated as a
+placeholder, which answers `404` and reads like an outage rather than a typo.
+
+The error names the **field** and the **variable** and nothing else —
+`slack.webhook_url: env var ${SLACK_WEBHOOK_URL} is unset`. It never carries a
+resolved value, because the input is a credential template and the store holds
+sibling credentials; echoing either would turn a config typo into a disclosure
+in `~/.config/dotagent/logs/`.
 
 ## Reload
 

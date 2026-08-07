@@ -39,8 +39,6 @@ What's stable:
 What might still move:
 
 - `config.toml` may grow new sections.
-- `dotagent daily-summary` currently has a hardcoded default target —
-  that becomes `config.toml`-driven before 1.0.
 - A couple of CLI subcommands are stubs (`bootstrap`, `plugin invoke`).
 
 ### Will it run on a server (headless)?
@@ -77,7 +75,9 @@ without writing your own bookkeeping. Specifically, cron can't:
 
 - Retry on failure with backoff.
 - Tell you a window passed without being satisfied.
-- Notify on `attempt_failed` / `given_up` / `recovered` semantics.
+- Notify on `attempt_failed` / `given_up` / `stale` / `recovered` semantics —
+  including telling you an entry **stopped running at all**, and saying so
+  again tomorrow if you haven't fixed it.
 - Detect manifest tampering or phantom agents.
 - Run preflight checks before the body.
 - Spawn one process per agent without forking the scheduler.
@@ -227,7 +227,10 @@ dotagent tick --dry-run
 # → (dry-run) scanned 4 agent(s); would dispatch 1; next event: 2026-05-19T08:30:00-0300
 ```
 
-That `next event` timestamp is when the daemon will next wake.
+That `next event` timestamp is the next **agent** window. The daemon
+also wakes for the daily summary and for a 30-minute safety cap,
+whichever comes first — see
+[What wakes the daemon](guides/daemon-lifecycle.md#what-wakes-the-daemon).
 
 ### How do I tail logs?
 

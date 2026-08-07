@@ -17,9 +17,16 @@
 //!
 //! [[notifiers]]
 //! driver = "slack"
-//! webhook_url = "https://hooks.slack.com/..."
+//! webhook_url = "${SLACK_WEBHOOK_URL}"
 //! events = ["given_up", "recovered"]
 //! ```
+//!
+//! Every credential-bearing field accepts `${VAR}`, resolved at send time from
+//! `~/.config/dotagent/secrets.env` (falling back to the process environment) —
+//! `slack.webhook_url`, `ntfy.base_url` / `topic` / `token`, `pushover.token` /
+//! `user`, `telegram.bot_token`. A manifest is a versioned file; a credential
+//! written literally into one is a credential in git history. See
+//! [`crate::secrets`].
 //!
 //! ## Drivers
 //!
@@ -38,8 +45,11 @@
 
 pub mod desktop;
 pub mod imessage;
+pub(crate) mod limits;
 pub mod ntfy;
 pub mod pushover;
+pub(crate) mod redact;
+pub(crate) mod secrets;
 pub mod slack;
 pub mod telegram;
 pub mod telegram_inbound;
@@ -50,12 +60,19 @@ use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, NotifyError>;
 
+/// Failure modes a notifier can report.
+///
+/// There is deliberately **no** `Http(#[from] reqwest::Error)` variant.
+/// `reqwest::Error`'s `Display` appends ` for url (…)`, and for Slack and
+/// Telegram the URL is the credential itself — a `?` on a `reqwest` call used
+/// to write live webhook secrets into the daemon log. Without the `From` impl
+/// that `?` no longer compiles, so a driver has to route transport failures
+/// through [`redact::sanitize_reqwest_err`] and the leak stays unrepresentable
+/// rather than merely unwritten.
 #[derive(Debug, Error)]
 pub enum NotifyError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("http: {0}")]
-    Http(#[from] reqwest::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("desktop: {0}")]
@@ -79,7 +96,11 @@ pub struct NotifyContext<'a> {
     pub schedule: &'a str,
     /// Lifecycle event — matches the same set the plugin protocol used:
     /// `attempt_failed`, `given_up`, `recovered`, `success`, `preflight`,
-    /// `timed_out`.
+    /// `timed_out`, `stale`.
+    ///
+    /// `stale` is the odd one: it fires from the daemon's health sweep rather
+    /// than from a run, because a schedule that stopped being dispatched
+    /// produces no run to hang an event off of.
     pub event: &'a str,
     pub message: &'a str,
 }

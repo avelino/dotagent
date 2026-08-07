@@ -17,6 +17,7 @@ If this file is **missing**, dotagent uses the baked-in defaults
 | Keep secrets somewhere other than the default path | [`[secrets]`](#secrets) |
 | **Talk to your agents from Telegram** | [`[telegram]`](#telegram) |
 | **Move or disable long-term memory** | [`[memory]`](#memory) |
+| Retime the daily health summary, or send it somewhere other than the desktop | [`[daily_summary]`](#daily_summary) |
 
 Two of those differ in kind. `[logging]`, `[telemetry]` and `[memory]` tune
 something that already works; `[telegram]` **turns on** a path that does not
@@ -44,6 +45,9 @@ retention_days = 30                # daemon logs older than this are deleted
 per_agent_retention_days = 14      # agent logs (noisier; shorter horizon)
 compress_after_days = 1            # rotated files older than N days → gzip
 
+[state]
+window_retention_days = 30         # state/windows/ files older than this are deleted
+
 [telemetry]
 otlp_endpoint = ""                 # empty = OTel disabled (default)
 protocol = "grpc"                  # grpc | http
@@ -57,7 +61,7 @@ service_name = "dotagent"
 [telemetry.resource]
 # Resource attributes attached to every span/log.
 "deployment.environment" = "production"
-"host.name" = "avelino-igloo"
+"host.name" = "workstation-01"
 
 [secrets]
 file = ""                          # empty = default path or DOTAGENT_SECRETS_FILE
@@ -82,6 +86,17 @@ paths = []                           # extra roots, searched before the defaults
 enabled = true                       # default; false removes the menu and tools
 claude_commands = false              # default; opt in to ~/.claude/commands
 paths = []                           # extra roots, searched before the defaults
+
+[daily_summary]
+enabled = true                       # default; governs the daemon's fire only
+time = "22:45"                       # default; local HH:MM or HH:MM:SS
+grace_minutes = 30                   # default; how late a wake-up still delivers
+
+[[daily_summary.notifiers]]
+# Same shape as a manifest's [[notifiers]]. None declared = desktop.
+driver = "telegram"
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+chat_id = "123456789"
 ```
 
 ---
@@ -172,6 +187,79 @@ Full behavior in [Skills](../concepts/skills.md).
 
 ---
 
+## `[daily_summary]`
+
+The end-of-day health roll-up: one line per unhealthy
+`(agent, schedule)`, healthy ones collapsed into a count. **On by
+default** — nothing here is required to receive it.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Deliver on the daemon's schedule. `false` stops the nightly fire and the wake-up it schedules. |
+| `time` | `"22:45"` | Local time of day, `HH:MM` or `HH:MM:SS`. |
+| `grace_minutes` | `30` | How long after `time` a delivery still counts. Clamped to `[1, 1440]`. |
+| `notifiers` | `[]` | Array of tables, same shape as a manifest's `[[notifiers]]`. Empty = the `desktop` driver. |
+
+```toml
+[daily_summary]
+time = "07:30"          # a morning report reads better than a bedtime one
+grace_minutes = 60      # laptop opens late; still deliver
+
+[[daily_summary.notifiers]]
+driver = "telegram"
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+chat_id = "123456789"
+```
+
+Declaring more than one entry delivers to all of them, `driver = "plugin"`
+included. See [Notifications](../concepts/notifications.md) for every
+driver and its fields.
+
+### Why the defaults are what they are
+
+**No notifier means `desktop`, not silence.** Every other driver needs
+a chat id, a phone number or a webhook, and there is no universal
+default for those. `desktop` is the only one with nothing to fill in
+and nothing to leak — no credential, no network, nothing leaving the
+machine. Delivering only when configured is how this feature spent its
+early life: it fired nightly at a constant nobody owned and left no
+trace when the message went nowhere.
+
+**`[telegram]` is not used as a destination.** That section is
+*ingress* — the bot that accepts your messages. Wiring it to *egress*
+would send a nightly report to anyone who set up a bot to talk to their
+agents and never asked for one.
+
+**A `time` that does not parse falls back to `22:45`** rather than
+disabling delivery. A typo should cost you the wrong hour, not a silent
+month. `grace_minutes = 0` becomes `1` for the same reason: a
+zero-width window is an empty one.
+
+**An `events` filter inside `[[daily_summary.notifiers]]` is ignored.**
+The list is already scoped to a single event, so a filter there could
+only subtract. Entries get copied out of manifests, and
+`events = ["given_up"]` riding along would match nothing and drop the
+summary without a word.
+
+### When it actually fires
+
+The daemon schedules a **wake-up for `time`**, so delivery does not
+depend on some other schedule happening to be due nearby.
+`grace_minutes` covers the case where the wake-up could not happen at
+all — machine asleep, machine off, a tick that overran its own sleep
+budget. It fires once per window; re-entering it (a `dotagent reload`,
+say) does not double-send.
+
+`enabled = false` does **not** block `dotagent daily-summary` typed by
+hand — that flag governs the daemon, and someone who ran the command
+asked for that one. Each delivery is audited as `plugin_invoked` with
+`plugin: "notifier:<driver>"`, failures included.
+
+Full command reference in
+[`cli.md`](../reference/cli.md#daily-summary).
+
+---
+
 ## `[secrets]`
 
 Override the path to the daemon-loaded secrets file. The default
@@ -230,13 +318,62 @@ RUST_LOG=info,dotagent_runner=trace,dotagent_state=debug dotagent daemon
 A daily sweep at **03:00 local time** (single-shot per day):
 
 1. Walks `logs/daemon/` and every `logs/agents/<name>/`.
-2. Files older than `compress_after_days` → gzipped in-place.
-3. Files older than `retention_days` (daemon) or
+2. Rotated files older than `compress_after_days` → gzipped in-place.
+3. Rotated files older than `retention_days` (daemon) or
    `per_agent_retention_days` (agents) → deleted.
+
+Both horizons apply to **rotated** files only. The active log is never
+compressed and never deleted, whatever its age: launchd and systemd hold an
+open fd on it, so unlinking it would strand every subsequent write.
+
+The same 03:00 pass also sweeps `state/windows/` — see
+[`[state]`](#state).
 
 The audit log (`audit.log`) is **never** swept regardless of these
 settings — by design. See
 [`observability.md`](observability.md#audit-log-vs-operational-log).
+
+---
+
+## `[state]`
+
+Retention for what dotagent writes under `state/`. **Nothing to
+configure** — the default already bounds the only directory that grows
+without limit.
+
+| Field                   | Type | Default | Valid values                                                        |
+|-------------------------|------|---------|---------------------------------------------------------------------|
+| `window_retention_days` | uint | `30`    | Days to keep `state/windows/`. `0` disables the sweep entirely.      |
+
+A schedule writes one window file per fired window and never revisits
+it, so an agent on a 15-minute interval leaves ~96 files a day behind —
+a `.json` plus the `.lock` next to it. Left alone, that directory grows
+forever.
+
+The nightly sweep deletes each aged-out window together with its
+`.lock`, and skips any window a writer currently holds the lock on.
+Windows are deleted, never gzipped: the daemon reads them as JSON.
+
+### Why 30 days
+
+The horizon has to clear the oldest window the daemon might still
+consult. A window stops being actionable once it is older than the
+schedule's [`stale_after_minutes`](../reference/agent-spec.md) (default
+120), which 30 days exceeds by ~360×. Even a wildly permissive
+`stale_after_minutes` of a full week still leaves four days of headroom.
+
+Erring high costs a few MB. Erring low deletes retry state under a
+running daemon, which resets `attempts` and re-fires an alert someone
+already gave up on — so widen it freely, narrow it carefully:
+
+```toml
+[state]
+window_retention_days = 90   # keep a quarter of retry history
+```
+
+Heartbeats are deliberately not covered: there is exactly one per
+`(agent, schedule)` and it is rewritten in place, so
+`state/agents/` is bounded by how many schedules exist.
 
 ---
 
@@ -273,7 +410,7 @@ every span and log record. Vendor-agnostic.
 ```toml
 [telemetry.resource]
 "deployment.environment" = "production"
-"host.name" = "avelino-igloo"
+"host.name" = "workstation-01"
 "service.version" = "0.0.1"
 ```
 
@@ -306,7 +443,6 @@ per-vendor recipes (Honeycomb, Tempo, Jaeger, Datadog).
 | Per-agent notifications                | `[[notifiers]]` in the agent's own `agent.toml`                                |
 | Per-agent security policy              | `[security]` in the agent's own `agent.toml`                                   |
 | Notifier defaults across agents        | (Not yet supported — declare per-agent for now.)                               |
-| Daily summary target / time            | (Hardcoded today; `config.toml` integration is on the roadmap.)                |
 | Daemon binary path / unit file content | Generated by `dotagent install` from the running binary. No override knob.     |
 
 ---

@@ -18,8 +18,8 @@
 //! {
 //!   "entries": {
 //!     "4821": {                       // telegram message_id
-//!       "agent": "gmail-triage",
-//!       "schedule": "triage-90min",
+//!       "agent": "inbox-triage",
+//!       "schedule": "every-90min",
 //!       "event": "preflight",
 //!       "at": 1785925367
 //!     }
@@ -148,10 +148,10 @@ mod tests {
     fn records_and_resolves() {
         let dir = tempfile::tempdir().unwrap();
         let store = SentMessageStore::new(dir.path().join("sent.json"));
-        store.record(4821, entry("gmail-triage", 100)).unwrap();
+        store.record(4821, entry("inbox-triage", 100)).unwrap();
 
         let found = store.resolve(4821).expect("recorded id must resolve");
-        assert_eq!(found.agent, "gmail-triage");
+        assert_eq!(found.agent, "inbox-triage");
         assert_eq!(found.event, "given_up");
     }
 

@@ -48,6 +48,15 @@ fn default_backoff() -> Vec<u32> {
 /// hour <= now) or if interval-style and there's no `last_success` to anchor
 /// from (the OS scheduler bootstraps the first run; orchestrator never forces
 /// it).
+///
+/// Interval schedules define an arithmetic sequence of ticks anchored on
+/// `last_success` (`ls`, `ls + iv`, `ls + 2·iv`, …); this returns the greatest
+/// tick `<= now`. Anchoring on success is deliberate — a run that succeeds
+/// re-phases the sequence — but the sequence itself must keep advancing while
+/// runs fail, exactly like the calendar keeps producing new cron windows.
+/// Returning a frozen `ls + iv` forever is what deadlocked a failing interval
+/// agent: its single window aged past `stale_after_minutes`, every tick was
+/// skipped, `last_success` never advanced, and the window could never move.
 pub fn expected_at(
     schedule: &Schedule,
     now: DateTime<Local>,
@@ -62,9 +71,80 @@ pub fn expected_at(
         } => cron_expected_at(weekdays, hours, *minute, now),
         Schedule::Interval {
             interval_minutes, ..
-        } => last_success.map(|ls| ls + chrono::Duration::minutes(*interval_minutes as i64)),
+        } => {
+            let ls = last_success?;
+            let Some(iv) = positive_interval(*interval_minutes) else {
+                return Some(ls); // degenerate manifest — never comes due
+            };
+            // Ticks elapsed since the anchor, clamped at 0 so a clock that
+            // jumped backwards cannot produce a window before the anchor.
+            let ticks = (now - ls).num_minutes().div_euclid(iv).max(0);
+            Some(ls + chrono::Duration::minutes(ticks * iv))
+        }
         Schedule::Expression { .. } => None, // TODO: parse cron expression
     }
+}
+
+/// `interval_minutes` as a positive number of minutes, or `None` if the
+/// manifest declared a zero interval (which has no meaningful cadence).
+fn positive_interval(interval_minutes: u32) -> Option<i64> {
+    match interval_minutes {
+        0 => None,
+        n => Some(n as i64),
+    }
+}
+
+/// The first window an interval schedule missed after its last success.
+///
+/// Dispatch asks "is a run due right now?" and wants the rolling window;
+/// health asks "how long has this been broken?" and wants this one. Judging
+/// staleness against the rolling window would report a chronically failing
+/// agent as a fresh failure forever.
+fn first_missed_window(
+    schedule: &Schedule,
+    last_success: Option<DateTime<Local>>,
+) -> Option<DateTime<Local>> {
+    let Schedule::Interval {
+        interval_minutes, ..
+    } = schedule
+    else {
+        return None;
+    };
+    let iv = positive_interval(*interval_minutes)?;
+    last_success.map(|ls| ls + chrono::Duration::minutes(iv))
+}
+
+/// Timestamp of the last successful run recorded in a heartbeat.
+fn last_success_of(heartbeat: Option<&Heartbeat>) -> Option<DateTime<Local>> {
+    heartbeat
+        .and_then(|hb| hb.last_success_at)
+        .and_then(|s| Local.timestamp_opt(s, 0).single())
+}
+
+/// Which window file describes the health being reported.
+///
+/// Window files are named after the window's `expected_at`
+/// (`windows/<agent>-<slug>-<YYYY-MM-DD-HHMM>.json`), so the lookup key has to
+/// be that timestamp — not `last_success_at`, which only lands on the same
+/// filename when a run happens to finish inside the same minute its window
+/// opened. That coincidence was why exactly one schedule ever reported a
+/// window state and every other one silently read `None`.
+///
+/// The key is the window currently *due* — `expected_at`, the same value the
+/// daemon dispatches and writes against, and the same one [`health_state`]
+/// derives internally. Not the first missed window: that one answers "how long
+/// has this been broken", which [`health_state`] already computes on its own.
+///
+/// Lives here rather than in a CLI module because every reader of a window
+/// file has to agree with the writer on the key, and the writer's key comes
+/// from [`expected_at`]. Two independent re-derivations of it is exactly how
+/// the same bug landed in two commands.
+pub fn window_key(
+    schedule: &Schedule,
+    heartbeat: Option<&Heartbeat>,
+    now: DateTime<Local>,
+) -> Option<DateTime<Local>> {
+    expected_at(schedule, now, last_success_of(heartbeat))
 }
 
 fn cron_expected_at(
@@ -130,17 +210,17 @@ pub fn next_occurrence(
         Schedule::Interval {
             interval_minutes, ..
         } => {
+            let iv = positive_interval(*interval_minutes)?;
             let anchor = last_success.unwrap_or(now);
-            let next = anchor + chrono::Duration::minutes(*interval_minutes as i64);
+            let next = anchor + chrono::Duration::minutes(iv);
             // If interval anchor + interval is in the past (we missed many windows),
             // catch up to the next forward-looking firing.
             if next > now {
                 Some(next)
             } else {
                 // (now - anchor) // interval + 1, then anchor + N*interval
-                let elapsed_min = (now - anchor).num_minutes();
-                let n = elapsed_min.div_euclid(*interval_minutes as i64) + 1;
-                Some(anchor + chrono::Duration::minutes(n * *interval_minutes as i64))
+                let n = (now - anchor).num_minutes().div_euclid(iv) + 1;
+                Some(anchor + chrono::Duration::minutes(n * iv))
             }
         }
         Schedule::Expression { .. } => None, // TODO: cron-string parser
@@ -210,8 +290,7 @@ pub struct AgentSchedulePair<'a> {
 pub enum HealthState {
     /// Ran successfully within the current window, no retries needed.
     Ok,
-    /// Recovered after attempts > 0, or interval-style is running past its
-    /// next-tick but within `2 * interval` grace.
+    /// Recovered after at least one failed attempt.
     Degraded,
     /// Window passed without success, retrying or given up.
     Failing,
@@ -228,57 +307,86 @@ pub fn health_state(
     window_state: Option<&WindowState>,
     now: DateTime<Local>,
 ) -> (HealthState, String) {
-    // Resolve last_success time
-    let last_success = heartbeat
-        .and_then(|hb| hb.last_success_at)
-        .and_then(|s| Local.timestamp_opt(s, 0).single());
-
+    let last_success = last_success_of(heartbeat);
     let expected = expected_at(schedule, now, last_success);
 
     match (expected, last_success) {
-        (None, None) => (HealthState::Stale, "nunca rodou".into()),
-        (None, Some(_)) => (
-            HealthState::Ok,
-            "sem janela hoje · último sucesso ok".into(),
-        ),
+        (None, None) => (HealthState::Stale, "never ran".into()),
+        (None, Some(_)) => (HealthState::Ok, "no window today · last success ok".into()),
         (Some(exp), ls) if ls.is_some_and(|ls| ls >= exp) => {
-            let attempts = window_state.map(|w| w.attempts).unwrap_or(0);
-            if attempts > 0 {
+            let failed = window_state.map(failed_attempts).unwrap_or(0);
+            if failed > 0 {
                 (
                     HealthState::Degraded,
-                    format!("recuperou após {attempts} tentativas"),
+                    format!("recovered after {}", attempts_label(failed)),
                 )
             } else {
                 (HealthState::Ok, "ok".into())
             }
         }
         (Some(exp), _) => {
-            if is_stale(exp, policy.stale_after_minutes, now) {
-                let age_min = (now - exp).num_minutes();
+            // Interval windows roll forward so dispatch stays alive; staleness
+            // is judged from the first window we missed, so a schedule that has
+            // been failing for weeks still reads as stale, not as fresh.
+            let stale_ref = first_missed_window(schedule, last_success).unwrap_or(exp);
+            if is_stale(stale_ref, policy.stale_after_minutes, now) {
+                let age_min = (now - stale_ref).num_minutes();
                 (
                     HealthState::Stale,
-                    format!("janela perdida há {age_min}min (stale)"),
+                    format!("window missed {age_min}min ago (stale)"),
                 )
             } else if let Some(ws) = window_state {
                 if ws.given_up {
                     (
                         HealthState::Failing,
-                        format!("desisti após {} tentativas", ws.attempts),
+                        format!("gave up after {}", attempts_label(ws.attempts)),
                     )
                 } else {
                     (
                         HealthState::Failing,
-                        format!("{} tentativas, vai retentar", ws.attempts),
+                        format!("{}, will retry", attempts_label(ws.attempts)),
                     )
                 }
             } else {
                 let age_min = (now - exp).num_minutes();
                 (
                     HealthState::Failing,
-                    format!("janela esperada há {age_min}min, sem ação"),
+                    format!("window due {age_min}min ago, no attempt"),
                 )
             }
         }
+    }
+}
+
+/// Render an attempt count with the right plural: "1 attempt", "2 attempts".
+///
+/// The counter reaches the user verbatim in `dotagent status` and in the daily
+/// summary, so "1 attempts" is a visible defect, not a nitpick.
+fn attempts_label(n: u32) -> String {
+    if n == 1 {
+        "1 attempt".into()
+    } else {
+        format!("{n} attempts")
+    }
+}
+
+/// How many attempts in this window *failed*.
+///
+/// `attempts` is a dispatch counter: the daemon bumps it after every dispatch,
+/// the successful one included, so a window that worked on the first try lands
+/// on disk as `attempts = 1`. Reading that raw counter as a retry count is off
+/// by one and calls every healthy agent `degraded`.
+///
+/// The successful dispatch is only discounted when the last attempt is the one
+/// that exited 0. A window whose last recorded attempt failed but whose
+/// heartbeat shows a later success was rescued from outside the window — a
+/// manual `dotagent run` writes no window file — and really did burn every one
+/// of those attempts.
+fn failed_attempts(ws: &WindowState) -> u32 {
+    if ws.last_attempt_exit_code == Some(0) {
+        ws.attempts.saturating_sub(1)
+    } else {
+        ws.attempts
     }
 }
 
@@ -367,6 +475,266 @@ mod tests {
             overrides: ScheduleOverrides::default(),
         };
         assert!(expected_at(&s, now_at(12, 0), None).is_none());
+    }
+
+    fn interval(id: &str, minutes: u32) -> Schedule {
+        Schedule::Interval {
+            id: id.to_string(),
+            interval_minutes: minutes,
+            args: vec![],
+            overrides: ScheduleOverrides::default(),
+        }
+    }
+
+    /// The bug this pins: an interval schedule that failed once stayed dead
+    /// forever. `last_success` froze, so `expected_at` kept returning the very
+    /// same (ancient) window. The daemon's stale gate then skipped it on every
+    /// tick, so `last_success` could never advance. Found in the wild on an
+    /// every-90-minute agent that had been silently dead for 55 days.
+    #[test]
+    fn interval_window_rolls_forward_across_missed_windows() {
+        let s = interval("every-90min", 90);
+        let now = now_at(12, 0);
+        let last_success = now - chrono::Duration::days(55);
+
+        let exp = expected_at(&s, now, Some(last_success)).unwrap();
+
+        // Fresh window: at most one interval old, never in the future.
+        assert!(exp <= now, "expected window must not be in the future");
+        assert!(
+            (now - exp).num_minutes() < 90,
+            "expected window is {} min old — it did not roll forward",
+            (now - exp).num_minutes()
+        );
+        // And it is a real tick of the sequence anchored on last_success.
+        assert_eq!((exp - last_success).num_minutes() % 90, 0);
+    }
+
+    /// The window that got `given_up` is keyed by its own `expected_at`. Once
+    /// the window rolls, the next dispatch reads a *different* window file, so
+    /// `given_up` stops being terminal without any change to its semantics.
+    #[test]
+    fn interval_rolled_window_escapes_the_given_up_window() {
+        let s = interval("every-90min", 90);
+        let now = now_at(12, 0);
+        let last_success = now - chrono::Duration::days(55);
+
+        let dead_window = last_success + chrono::Duration::minutes(90);
+        let exp = expected_at(&s, now, Some(last_success)).unwrap();
+
+        assert_ne!(exp, dead_window, "still pinned to the given_up window");
+        // And the daemon's stale gate must let the fresh window through.
+        assert!(is_stale(dead_window, 120, now));
+        assert!(!is_stale(exp, 120, now));
+    }
+
+    /// Successful cadence: the next tick has not arrived yet, so the most
+    /// recent expected window *is* the last success — not a future timestamp.
+    #[test]
+    fn interval_expected_is_last_success_when_next_tick_is_future() {
+        let s = interval("every-90", 90);
+        let last = now_at(10, 0);
+        let exp = expected_at(&s, now_at(10, 30), Some(last)).unwrap();
+        assert_eq!(exp, last);
+    }
+
+    #[test]
+    fn interval_expected_walks_the_tick_sequence() {
+        let s = interval("every-90", 90);
+        let last = now_at(9, 0);
+        // 9:00, 10:30, 12:00, 13:30 …
+        assert_eq!(expected_at(&s, now_at(10, 29), Some(last)).unwrap(), last);
+        assert_eq!(
+            expected_at(&s, now_at(10, 30), Some(last)).unwrap(),
+            now_at(10, 30)
+        );
+        assert_eq!(
+            expected_at(&s, now_at(13, 29), Some(last)).unwrap(),
+            now_at(12, 0)
+        );
+    }
+
+    #[test]
+    fn interval_zero_minutes_does_not_panic() {
+        let s = interval("degenerate", 0);
+        let last = now_at(9, 0);
+        assert_eq!(expected_at(&s, now_at(12, 0), Some(last)).unwrap(), last);
+        assert!(next_occurrence(&s, now_at(12, 0), Some(last)).is_none());
+    }
+
+    /// Regression guard: cron never suffered from this, and must not start
+    /// rolling. A missed cron window stays exactly where the calendar put it.
+    #[test]
+    fn cron_expected_does_not_roll_forward() {
+        let s = cron("daily", vec![1, 2, 3, 4, 5], vec![9], 0);
+        let last_success = now_at(9, 0) - chrono::Duration::days(55);
+        let exp = expected_at(&s, now_at(23, 0), Some(last_success)).unwrap();
+        assert_eq!(exp, now_at(9, 0));
+        assert!(is_stale(exp, 120, now_at(23, 0)));
+    }
+
+    fn heartbeat_with_success(at: Option<DateTime<Local>>) -> Heartbeat {
+        Heartbeat {
+            name: "inbox-triage".into(),
+            slug: "default".into(),
+            args: vec![],
+            started_at: 0,
+            started_at_iso: String::new(),
+            finished_at: Some(0),
+            finished_at_iso: None,
+            exit_code: Some(1),
+            duration_seconds: None,
+            last_success_at: at.map(|t| t.timestamp()),
+            last_success_at_iso: None,
+        }
+    }
+
+    fn policy(stale_after_minutes: u32) -> ResolvedPolicy {
+        ResolvedPolicy {
+            max_retries: 3,
+            retry_backoff_minutes: default_backoff(),
+            stale_after_minutes,
+        }
+    }
+
+    /// Rolling the dispatch window must NOT hide chronic failure: the health
+    /// report still measures staleness from the first window we missed.
+    #[test]
+    fn health_interval_chronic_failure_is_still_stale() {
+        let s = interval("every-90min", 90);
+        let now = now_at(12, 0);
+        let last_success = now - chrono::Duration::days(55);
+        let hb = heartbeat_with_success(Some(last_success));
+        let ws = WindowState {
+            agent: "inbox-triage".into(),
+            schedule_id: "every-90min".into(),
+            expected_at: (last_success + chrono::Duration::minutes(90)).timestamp(),
+            attempts: 2,
+            given_up: true,
+            ..Default::default()
+        };
+
+        let (state, reason) = health_state(&s, &policy(120), Some(&hb), Some(&ws), now);
+        assert_eq!(state, HealthState::Stale, "reason was: {reason}");
+    }
+
+    /// Healthy interval cadence reports ok, not a bogus "window expected
+    /// -60min ago" failure.
+    #[test]
+    fn health_interval_ok_between_ticks() {
+        let s = interval("every-90", 90);
+        let hb = heartbeat_with_success(Some(now_at(10, 0)));
+        let (state, reason) = health_state(&s, &policy(120), Some(&hb), None, now_at(10, 30));
+        assert_eq!(state, HealthState::Ok, "reason was: {reason}");
+    }
+
+    /// `attempts` counts dispatches, not retries: the daemon bumps it after
+    /// the successful one too. These four cases pin what the counter means
+    /// once a window has succeeded.
+    fn succeeded_window(attempts: u32, last_exit: Option<i32>) -> WindowState {
+        WindowState {
+            agent: "inbox-triage".into(),
+            schedule_id: "morning".into(),
+            expected_at: now_at(10, 0).timestamp(),
+            attempts,
+            last_attempt_at: Some(now_at(10, 0).timestamp()),
+            last_attempt_exit_code: last_exit,
+            ..Default::default()
+        }
+    }
+
+    /// One dispatch, exit 0 — nothing failed. The raw counter says 1 and used
+    /// to read as "recovered after 1 attempt".
+    #[test]
+    fn health_first_attempt_succeeded_is_ok() {
+        let s = cron("morning", vec![0, 1, 2, 3, 4, 5, 6], vec![10], 0);
+        let hb = heartbeat_with_success(Some(now_at(10, 0)));
+        let ws = succeeded_window(1, Some(0));
+        let (state, reason) = health_state(&s, &policy(120), Some(&hb), Some(&ws), now_at(10, 30));
+        assert_eq!(state, HealthState::Ok, "reason was: {reason}");
+    }
+
+    /// Three dispatches, the last one exit 0 — two burned before it worked.
+    #[test]
+    fn health_success_after_failures_reports_only_the_failures() {
+        let s = cron("morning", vec![0, 1, 2, 3, 4, 5, 6], vec![10], 0);
+        let hb = heartbeat_with_success(Some(now_at(10, 20)));
+        let ws = succeeded_window(3, Some(0));
+        let (state, reason) = health_state(&s, &policy(120), Some(&hb), Some(&ws), now_at(10, 30));
+        assert_eq!(state, HealthState::Degraded, "reason was: {reason}");
+        assert!(reason.contains('2'), "expected 2 failed attempts: {reason}");
+    }
+
+    /// Every scheduled attempt failed and a manual `dotagent run` rescued it.
+    /// The manual run writes no window file, so the window still shows the
+    /// failed last attempt — all three attempts really were burned.
+    #[test]
+    fn health_manual_rescue_counts_every_failed_attempt() {
+        let s = cron("morning", vec![0, 1, 2, 3, 4, 5, 6], vec![10], 0);
+        let hb = heartbeat_with_success(Some(now_at(10, 45)));
+        let ws = succeeded_window(3, Some(1));
+        let (state, reason) = health_state(&s, &policy(120), Some(&hb), Some(&ws), now_at(11, 0));
+        assert_eq!(state, HealthState::Degraded, "reason was: {reason}");
+        assert!(reason.contains('3'), "expected 3 failed attempts: {reason}");
+    }
+
+    /// No window file at all — nothing to discount, nothing to report.
+    #[test]
+    fn health_success_without_window_state_is_ok() {
+        let s = cron("morning", vec![0, 1, 2, 3, 4, 5, 6], vec![10], 0);
+        let hb = heartbeat_with_success(Some(now_at(10, 0)));
+        let (state, reason) = health_state(&s, &policy(120), Some(&hb), None, now_at(10, 30));
+        assert_eq!(state, HealthState::Ok, "reason was: {reason}");
+    }
+
+    #[test]
+    fn health_interval_failing_within_stale_horizon() {
+        let s = interval("every-90", 90);
+        let hb = heartbeat_with_success(Some(now_at(9, 0)));
+        let ws = WindowState {
+            agent: "a".into(),
+            schedule_id: "every-90".into(),
+            expected_at: now_at(10, 30).timestamp(),
+            attempts: 1,
+            ..Default::default()
+        };
+        // Window at 10:30 missed, now 11:00 — 30min old, well inside 120min.
+        let (state, _) = health_state(&s, &policy(120), Some(&hb), Some(&ws), now_at(11, 0));
+        assert_eq!(state, HealthState::Failing);
+    }
+
+    /// The shared bug this function exists to prevent: a run that finished at
+    /// 10:12 belongs to the 10:00 window, and the window file is named after
+    /// 10:00. Keying by `last_success_at` reads a filename that does not exist.
+    #[test]
+    fn window_key_is_the_due_window_not_the_last_success() {
+        let s = cron("morning", vec![0, 1, 2, 3, 4, 5, 6], vec![10], 0);
+        let hb = heartbeat_with_success(Some(now_at(10, 12)));
+        assert_eq!(
+            window_key(&s, Some(&hb), now_at(10, 30)),
+            Some(now_at(10, 0))
+        );
+    }
+
+    /// Interval windows roll, so the key rolls with them — it must be the tick
+    /// the daemon is dispatching against, not the frozen first missed window.
+    #[test]
+    fn window_key_follows_the_rolling_interval_tick() {
+        let s = interval("every-90min", 90);
+        let hb = heartbeat_with_success(Some(now_at(9, 0)));
+        // Ticks: 09:00, 10:30, 12:00 — at 11:00 the due one is 10:30.
+        assert_eq!(
+            window_key(&s, Some(&hb), now_at(11, 0)),
+            Some(now_at(10, 30))
+        );
+    }
+
+    #[test]
+    fn window_key_without_heartbeat_matches_expected_at() {
+        let s = cron("morning", vec![0, 1, 2, 3, 4, 5, 6], vec![10], 0);
+        assert_eq!(window_key(&s, None, now_at(10, 30)), Some(now_at(10, 0)));
+        // Interval has no anchor without a success, so there is no window.
+        assert_eq!(window_key(&interval("iv", 90), None, now_at(10, 30)), None);
     }
 
     #[test]

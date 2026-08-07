@@ -26,11 +26,13 @@ use dotagent_plugin::PluginClient;
 use dotagent_runner::persistent::PersistentPool;
 use dotagent_runner::{run_with_hooks, OrchestratedOutcome, RunContext, RunSpec};
 use dotagent_scheduler::{
-    compute_next_event, expected_at, is_stale, should_retry, AgentSchedulePair, ResolvedPolicy,
+    compute_next_event, expected_at, health_state, is_stale, should_retry, AgentSchedulePair,
+    HealthState, ResolvedPolicy,
 };
 use dotagent_state::{
     audit::AuditLog,
     manifest_cache::{hash_manifest_file, KnownManifest, ManifestCache},
+    notify_dedup::{alert_key, AlertEpisode, NotifyDedupStore},
     slug_from_args, StateStore,
 };
 use dotagent_supervisor::{Supervisor, DEFAULT_REAPER_TICK};
@@ -109,6 +111,58 @@ struct DaemonCtx<'a> {
 /// that a burst of chat messages survives one slow run, shallow enough that a
 /// wedged daemon applies backpressure instead of growing without bound.
 const TRIGGER_CHANNEL_DEPTH: usize = 64;
+
+/// Drain the trigger channel from a task of its own, so an inbound message is
+/// answered on its own clock rather than the scheduler's.
+///
+/// The bug this exists for: [`run`]'s `select!` is only reached *after* a tick
+/// returns, and a tick awaits every scheduled run inline. One 20-minute agent
+/// therefore held every queued chat message for 20 minutes — the sender saw
+/// silence, resent, and then got both answers at once when the run ended.
+///
+/// Deliberately **one** worker, not one task per message:
+///
+/// - **Ordering.** Messages from one conversation must be answered in the
+///   order they were sent. A task per message would hand that ordering to the
+///   scheduler and to whichever task happened to reach the persistent pool's
+///   per-key mutex first — non-deterministic, and wrong exactly when a
+///   conversation is going fast.
+/// - **Concurrency ceiling.** A burst of N messages stays N *queued* requests
+///   rather than N concurrent agent processes. The ingress rate limit bounds
+///   arrivals; this bounds execution, which is the expensive half.
+///
+/// What it does introduce is exactly one new concurrent pair — a triggered run
+/// beside a scheduled one — and that pair is safe on every shared resource
+/// they touch:
+///
+/// - **Heartbeat.** A triggered run's slug is namespaced by source
+///   (`trigger-telegram`), so it never shares a file with the scheduled
+///   history of the same agent. `dotagent-state` takes a per-file `flock`
+///   regardless.
+/// - **Window state.** Triggered runs never write it (see [`run_triggered`]),
+///   so retry accounting stays single-writer.
+/// - **Audit log.** Every append takes an exclusive `flock` on the log.
+/// - **Persistent pool.** Slots are `(agent, key)`-keyed mutexes, so a
+///   scheduled and a triggered request for the same instance queue instead of
+///   interleaving.
+///
+/// The handler is a parameter so tests can drive this loop's real shape
+/// without a filesystem, a manifest, or a subprocess.
+fn spawn_trigger_worker<H, F>(
+    mut rx: tokio::sync::mpsc::Receiver<TriggerRequest>,
+    handler: H,
+) -> tokio::task::JoinHandle<()>
+where
+    H: Fn(TriggerRequest) -> F + Send + 'static,
+    F: std::future::Future<Output = ()> + Send,
+{
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            handler(req).await;
+        }
+        debug!("trigger worker stopped — channel closed");
+    })
+}
 
 /// Run an agent because something asked, not because a window came due.
 ///
@@ -653,6 +707,10 @@ fn trigger_env(req: &TriggerRequest) -> Vec<(String, String)> {
 pub async fn run() -> Result<()> {
     let state = StateStore::from_home().context("opening state store")?;
     let audit = AuditLog::from_home().context("opening audit log")?;
+    // Before anything of ours exists: collect what a previous daemon left
+    // behind. Must run before `start_snapshot_writer`, whose first tick would
+    // otherwise overwrite the only record of those processes.
+    reap_boot_orphans(&audit).await;
     // Singleton supervisor: every plugin invocation (preflight / on_success /
     // on_failure / notify-via-plugin) AND every agent spawn goes through it,
     // so `dotagent status`/`doctor` can see the live subprocess tree and
@@ -670,7 +728,12 @@ pub async fn run() -> Result<()> {
     // singleton supervisor, so an instance is as visible and as reapable as a
     // one-shot run — which is the whole reason this lives in the orchestrator
     // rather than beside it.
-    let pool = PersistentPool::new(supervisor.clone());
+    //
+    // `Arc` because the trigger worker runs in its own task (see
+    // `spawn_trigger_worker`) and needs an owned handle; the pool is
+    // internally synchronized, so sharing it is what keeps a chat message and
+    // a scheduled run from spawning two instances for the same key.
+    let pool = std::sync::Arc::new(PersistentPool::new(supervisor.clone()));
     let cache = ManifestCache::from_home().context("opening manifest cache")?;
 
     // Write our PID so `dotagent reload` / `dotagent status` can find us.
@@ -698,7 +761,7 @@ pub async fn run() -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("registering SIGINT")?;
 
     info!("daemon started");
-    let app_config =
+    let mut app_config =
         dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
 
     // Secrets load happens after the config is in hand because the config
@@ -709,13 +772,26 @@ pub async fn run() -> Result<()> {
     load_secrets_at_startup(&app_config, &audit);
     ensure_memory_workspace(&app_config);
 
-    // Inbound triggers. Consumed by an arm of the `select!` below rather than
-    // a spawned task, so a triggered run is serialized against the tick loop.
-    // Concurrency here would race two known hazards that stay dormant while
-    // execution is serial: the heartbeat read-modify-write in
-    // `dotagent-runner` and the lockfile unlink in `dotagent-state`.
-    let (trigger_tx, mut trigger_rx) =
+    // Inbound triggers. Drained by a worker task rather than by an arm of the
+    // `select!` below: that arm is only polled between ticks, so a long
+    // scheduled run used to hold every queued message for its whole duration.
+    // See `spawn_trigger_worker` for why there is exactly one worker and why
+    // running it beside the tick is safe.
+    let (trigger_tx, trigger_rx) =
         tokio::sync::mpsc::channel::<TriggerRequest>(TRIGGER_CHANNEL_DEPTH);
+    let trigger_worker = {
+        let state = state.clone();
+        let audit = audit.clone();
+        let plugins = plugins.clone();
+        let pool = pool.clone();
+        spawn_trigger_worker(trigger_rx, move |req| {
+            let state = state.clone();
+            let audit = audit.clone();
+            let plugins = plugins.clone();
+            let pool = pool.clone();
+            async move { handle_trigger(req, &state, &audit, &plugins, &pool).await }
+        })
+    };
 
     // Inbound chat. Off unless `[telegram]` names both a token and at least
     // one allowed user id — an empty allowlist is misconfiguration, not
@@ -735,31 +811,50 @@ pub async fn run() -> Result<()> {
         // days — so without this the recycle would go unrecorded until then.
         pool.sweep(Some(&audit)).await;
 
-        // Daily summary at 22:45 local time. Fires once per day; the
-        // `last_summary_date` guard avoids double-fire when the daemon
-        // re-enters the window (e.g., user runs `dotagent reload`).
-        if should_run_daily_summary(cycle_start, last_summary_date) {
-            if let Err(e) = crate::commands::daily_summary::run(false).await {
+        // Daily summary at `[daily_summary].time` (default 22:45 local).
+        // Fires once per window; the `last_summary_date` guard avoids a
+        // double-fire when the daemon re-enters it (e.g. `dotagent reload`).
+        // The date recorded is the window's, not today's — they differ when
+        // `grace_minutes` crosses midnight.
+        if let Some(date) =
+            should_run_daily_summary(cycle_start, last_summary_date, &app_config.daily_summary)
+        {
+            if let Err(e) =
+                crate::commands::daily_summary::run_with(&app_config.daily_summary, false).await
+            {
                 warn!(error = %e, "daily-summary delivery failed");
             }
-            last_summary_date = Some(cycle_start.date_naive());
+            // Recorded even when delivery failed: a broken notifier would
+            // otherwise re-fire on every tick for the whole grace window.
+            last_summary_date = Some(date);
         }
 
-        // Log retention sweep: runs once per day at 03:00 (chosen so it
+        // Retention sweep: runs once per day at 03:00 (chosen so it
         // happens during natural quiet hours and never fights with the
-        // 22:45 summary).
+        // 22:45 summary). Covers logs and per-window state alike — windows
+        // outlive their usefulness the same way logs do, and left alone they
+        // accumulate one file per (agent, slug, window) forever.
         if should_run_retention(cycle_start, last_retention_date) {
-            let stats = dotagent_telemetry::retention::sweep_all(&app_config.logging);
+            let stats = dotagent_telemetry::retention::sweep_all_with(
+                &app_config.logging,
+                &app_config.state,
+            );
             info!(
                 compressed = stats.compressed,
                 deleted = stats.deleted,
                 scanned = stats.scanned,
-                "log retention sweep completed"
+                windows_scanned = stats.windows_scanned,
+                windows_deleted = stats.windows_deleted,
+                "retention sweep completed"
             );
             last_retention_date = Some(cycle_start.date_naive());
         }
 
-        let sleep_target = compute_sleep_target(cycle_start, next_event);
+        let sleep_target = compute_sleep_target(
+            cycle_start,
+            next_event,
+            next_summary_at(cycle_start, &app_config.daily_summary),
+        );
         let sleep_for = (sleep_target - Local::now())
             .to_std()
             .unwrap_or(Duration::from_secs(60));
@@ -788,15 +883,17 @@ pub async fn run() -> Result<()> {
                     handle.abort();
                 }
                 telegram = start_telegram_ingress(&reloaded.telegram, &trigger_tx, &audit);
+                // Same reasoning once more, for everything the loop itself
+                // reads: retention thresholds and the daily-summary time and
+                // destination were pinned at boot, so editing config.toml and
+                // reloading looked applied while the daemon kept the old
+                // values until a full restart.
+                app_config = reloaded;
                 // Same reasoning as restarting the ingress: a persistent
                 // instance was spawned from the manifest as it read then, and
                 // leaving it up would make the reload look applied while the
                 // behavior stayed put.
                 pool.reload(Some(&audit)).await;
-                continue;
-            }
-            Some(req) = trigger_rx.recv() => {
-                handle_trigger(req, &state, &audit, &plugins, &pool).await;
                 continue;
             }
             _ = sigterm.recv() => break "SIGTERM",
@@ -805,6 +902,10 @@ pub async fn run() -> Result<()> {
     };
 
     info!(reason = exit_reason, "daemon stopping");
+    // Stop accepting new work first. A trigger already in flight loses its
+    // reply, which is the honest outcome — the run itself is a supervised
+    // subprocess and gets reaped below like everything else.
+    trigger_worker.abort();
     // Graceful supervisor shutdown — SIGTERM every live subprocess, wait
     // grace, SIGKILL stragglers. Without this, daemon exit would orphan
     // long-running plugin invocations.
@@ -830,6 +931,100 @@ pub async fn run() -> Result<()> {
         reason: exit_reason.into(),
     })?;
     Ok(())
+}
+
+/// The pid of another daemon that looks alive right now, if there is one.
+///
+/// `None` covers all the safe readings: no pidfile, an unparseable one, our
+/// own pid, or a pid nothing answers to. Only a *live, different* daemon is
+/// reason to keep our hands off shared state.
+fn live_peer_daemon() -> Option<u32> {
+    let path = pidfile_path()?;
+    let pid: u32 = std::fs::read_to_string(&path).ok()?.trim().parse().ok()?;
+    if pid == std::process::id() {
+        return None;
+    }
+    dotagent_supervisor::orphan::process_exists(pid).then_some(pid)
+}
+
+/// Collect agent and plugin processes a previous daemon left running.
+///
+/// A daemon that exits through its shutdown path reaps its children and
+/// deletes the snapshot. A daemon that is `SIGKILL`ed, panics, or is replaced
+/// by `launchctl kickstart -k` does neither: its children survive, and the
+/// deadline nobody is holding anymore never fires. Observed in production as a
+/// persistent agent alive for 26 minutes against a 600-second deadline.
+///
+/// The snapshot's mere existence at boot is the signal that the previous exit
+/// was not clean. Everything after that is proof of identity — pids are
+/// recycled, and a stale record is not a licence to signal whatever now holds
+/// the number. `dotagent_supervisor::orphan` refuses on any doubt.
+async fn reap_boot_orphans(audit: &AuditLog) {
+    let snapshot = dotagent_state::paths::supervisor_snapshot_file();
+    if !snapshot.exists() {
+        return;
+    }
+    // Two daemons at once is a misconfiguration, not a reason to kill the
+    // other one's children out from under it.
+    if let Some(pid) = live_peer_daemon() {
+        warn!(
+            peer_pid = pid,
+            "another daemon looks alive — skipping boot orphan reap"
+        );
+        return;
+    }
+
+    let report = dotagent_supervisor::orphan::OrphanReaper::new()
+        .reap_snapshot_file(&snapshot)
+        .await;
+
+    if let Some(err) = &report.snapshot_error {
+        // Nothing was signalled. Leave the file alone too: it is evidence.
+        warn!(
+            path = %snapshot.display(),
+            error = %err,
+            "supervisor snapshot is unreadable — no orphan was reaped"
+        );
+        return;
+    }
+
+    for reaped in &report.reaped {
+        let _ = audit.append(AuditEvent::OrphanReaped {
+            agent: reaped.info.owner.agent.clone(),
+            kind: reaped.info.kind.to_string(),
+            label: reaped.info.label.clone(),
+            pid: reaped.info.pid,
+            age_seconds: reaped.info.age_seconds,
+            deadline_seconds: reaped.info.deadline_seconds,
+        });
+        warn!(
+            agent = %reaped.info.owner.agent,
+            kind = %reaped.info.kind,
+            label = %reaped.info.label,
+            pid = reaped.info.pid,
+            pgid = reaped.pgid,
+            age_seconds = reaped.info.age_seconds,
+            deadline_seconds = reaped.info.deadline_seconds,
+            "reaped an orphan left by a previous daemon"
+        );
+    }
+    for (info, reason) in &report.skipped {
+        debug!(
+            agent = %info.owner.agent,
+            pid = info.pid,
+            reason = %reason,
+            "left a recorded process alone"
+        );
+    }
+    if !report.reaped.is_empty() {
+        info!(
+            reaped = report.reaped.len(),
+            skipped = report.skipped.len(),
+            "boot orphan reap completed"
+        );
+    }
+    // The record has been acted on; the snapshot writer starts fresh.
+    let _ = std::fs::remove_file(&snapshot);
 }
 
 /// Load the daemon-level secrets file (default `~/.config/dotagent/secrets.env`,
@@ -967,18 +1162,30 @@ pub async fn tick_once(
         warn!(error = ?e, "manifest cache check failed");
     }
 
-    let _ = audit.append(AuditEvent::TickStarted {
-        agents_scanned: agents.len() as u32,
-    });
+    // Ticks are telemetry, not an audit trail. "Woke up and looked at 17
+    // agents" is not a security event, and writing it made the hash-chained
+    // log 64% scheduler heartbeat — every append re-reads the whole file to
+    // find the tail hash, so the noise also made every real event more
+    // expensive to record. `tracing` already captures this, and already
+    // rotates. See `docs/guides/observability.md`.
+    debug!(agents_scanned = agents.len(), "tick started");
 
     let runs_dispatched = dispatch_due_runs(&agents, state, audit, plugins, pool, now).await;
+
+    // Alerting on conditions the run loop cannot see: an agent that stopped
+    // being scheduled never reaches `dispatch_one`, so it never fires anything.
+    sweep_health_notifications(&agents, state, audit, plugins, now).await;
+
     let next_event = compute_next_event_from_agents(&agents, state, now);
 
-    let _ = audit.append(AuditEvent::TickCompleted {
-        agents_scanned: agents.len() as u32,
+    debug!(
+        agents_scanned = agents.len(),
         runs_dispatched,
-        next_event_iso: next_event.map(|t| t.format("%Y-%m-%dT%H:%M:%S%z").to_string()),
-    });
+        next_event = next_event
+            .map(|t| t.format("%Y-%m-%dT%H:%M:%S%z").to_string())
+            .unwrap_or_else(|| "none".into()),
+        "tick completed"
+    );
 
     TickResult {
         agents_scanned: agents.len() as u32,
@@ -1065,36 +1272,104 @@ fn should_run_retention(now: DateTime<Local>, last_date: Option<chrono::NaiveDat
     }
 }
 
-/// True if we're inside the 22:45 window AND haven't fired today yet.
-/// Window is `[22:45, 23:15)` to forgive late wake-ups (laptop closed,
-/// daemon was still sleeping past 22:45).
+/// Resolve a local wall-clock time on `date` against `reference`'s timezone.
+///
+/// `None` when that wall-clock time does not exist on that date — the hour a
+/// DST jump skips. The summary for that one day is then not delivered, which
+/// only matters if `time` is inside the skipped hour (never for the 22:45
+/// default; DST transitions happen around 02:00–03:00).
+fn local_at(
+    reference: DateTime<Local>,
+    date: chrono::NaiveDate,
+    time: chrono::NaiveTime,
+) -> Option<DateTime<Local>> {
+    reference
+        .timezone()
+        .from_local_datetime(&date.and_time(time))
+        .earliest()
+}
+
+/// The summary date `now` falls into, or `None` when it is outside every
+/// delivery window.
+///
+/// Returns the date the window *opened* on, not `now`'s date. With a `time`
+/// late enough that `grace_minutes` crosses midnight the two differ, and
+/// keying the once-per-day guard on `now` would let a 00:10 delivery mark
+/// tonight's 23:50 window as already done.
+fn summary_window_date(
+    now: DateTime<Local>,
+    time: chrono::NaiveTime,
+    grace_minutes: u32,
+) -> Option<chrono::NaiveDate> {
+    let grace = chrono::Duration::minutes(i64::from(grace_minutes));
+    let today = now.date_naive();
+    let candidates = [Some(today), today.pred_opt()];
+    for date in candidates.into_iter().flatten() {
+        let Some(start) = local_at(now, date, time) else {
+            continue;
+        };
+        if now >= start && now < start + grace {
+            return Some(date);
+        }
+    }
+    None
+}
+
+/// `Some(date)` when the summary is due and has not been delivered for that
+/// window yet — the date is what the caller records as delivered.
 fn should_run_daily_summary(
     now: DateTime<Local>,
     last_summary_date: Option<chrono::NaiveDate>,
-) -> bool {
-    use chrono::Timelike;
-    let in_window =
-        (now.hour() == 22 && now.minute() >= 45) || (now.hour() == 23 && now.minute() < 15);
-    if !in_window {
-        return false;
+    cfg: &dotagent_core::DailySummaryConfig,
+) -> Option<chrono::NaiveDate> {
+    if !cfg.enabled {
+        return None;
     }
-    match last_summary_date {
-        Some(d) => d != now.date_naive(),
-        None => true,
-    }
+    let date = summary_window_date(now, cfg.time_or_default(), cfg.effective_grace_minutes())?;
+    (last_summary_date != Some(date)).then_some(date)
 }
 
-/// Returns `now + min(MAX_SLEEP, next_event)`. Falls back to `now + MAX_SLEEP`
-/// when there's no event in sight.
+/// When the daemon has to be awake next to deliver the summary.
+///
+/// Without this the loop only ever landed in the window because
+/// `MAX_SLEEP_MINUTES` happened to equal the hardcoded 30-minute window —
+/// two unrelated constants with no code connecting them. That coincidence
+/// breaks the moment a tick overruns its own sleep budget (the next sleep is
+/// then `unwrap_or(60s)`, pushing the following cycle past the window), and it
+/// never held at all for a `time`/`grace_minutes` a user picks.
+fn next_summary_at(
+    now: DateTime<Local>,
+    cfg: &dotagent_core::DailySummaryConfig,
+) -> Option<DateTime<Local>> {
+    if !cfg.enabled {
+        return None;
+    }
+    let time = cfg.time_or_default();
+    let today = now.date_naive();
+    let candidates = [Some(today), today.succ_opt()];
+    candidates
+        .into_iter()
+        .flatten()
+        .filter_map(|date| local_at(now, date, time))
+        .find(|t| *t > now)
+}
+
+/// Returns the earliest pending wake-up, capped at `now + MAX_SLEEP`.
+///
+/// The daily summary is a wake-up reason in its own right: it is the one
+/// scheduled thing the daemon does that no agent schedule accounts for.
 fn compute_sleep_target(
     now: DateTime<Local>,
     next_event: Option<DateTime<Local>>,
+    next_summary: Option<DateTime<Local>>,
 ) -> DateTime<Local> {
     let safety_cap = now + chrono::Duration::minutes(MAX_SLEEP_MINUTES);
-    match next_event {
-        Some(t) if t > now && t < safety_cap => t,
-        _ => safety_cap,
-    }
+    [next_event, next_summary]
+        .into_iter()
+        .flatten()
+        .filter(|t| *t > now && *t < safety_cap)
+        .min()
+        .unwrap_or(safety_cap)
 }
 
 fn compute_next_event_from_agents(
@@ -1335,23 +1610,33 @@ async fn give_up(
         stderr_tail: window.last_attempt_stderr.clone().unwrap_or_default(),
     });
 
-    let message = format!(
-        "🚨 {}/{} gave up after {} attempts (exit {})\n{}",
-        agent.manifest.agent.name,
-        sched.id(),
-        window.attempts,
-        window.last_attempt_exit_code.unwrap_or(-1),
-        window.last_attempt_stderr.clone().unwrap_or_default()
-    );
-    fire_on_failure_event(
-        &agent.manifest,
-        sched.id(),
-        "given_up",
-        &message,
-        plugins,
-        audit,
-    )
-    .await;
+    // Through the same ladder the tick sweep uses. An interval window that
+    // gives up, rolls forward and gives up again is one ongoing failure, not a
+    // fresh one every tick — announcing each would be 96 messages a day from a
+    // 15-minute schedule. The episode is dropped the moment the schedule
+    // succeeds, so the next real failure is still loud immediately.
+    let name = agent.manifest.agent.name.clone();
+    let now = Local::now();
+    if let Some(episode) = claim_alert(&name, sched.id(), "given_up", now.timestamp()) {
+        let message = alert_message(
+            "given_up",
+            &name,
+            sched.id(),
+            None,
+            Some(window),
+            &episode,
+            now,
+        );
+        fire_on_failure_event(
+            &agent.manifest,
+            sched.id(),
+            "given_up",
+            &message,
+            plugins,
+            audit,
+        )
+        .await;
+    }
 
     // Use the caller's store, not `StateStore::from_home()`. Re-deriving the
     // root here silently ignored an injected one, so a daemon (or a test)
@@ -1388,6 +1673,292 @@ async fn fire_on_failure_event(
         Some(audit),
     )
     .await;
+}
+
+/// What the sweep decided about one `(agent, schedule)` pair.
+enum AlertVerdict {
+    /// The current window succeeded. Forget any episode — the next failure
+    /// should be loud from its first second, not inherit a day-long silence.
+    Healthy,
+    /// Nothing to say: no window in scope, or retries are still in flight and
+    /// the run loop owns the outcome. Whatever we remembered stays remembered.
+    Quiet,
+    /// Say this, if the ladder allows it.
+    Alert(&'static str),
+}
+
+/// Which alert, if any, this pair is currently owed.
+///
+/// Reads [`HealthState`] — the same verdict `dotagent status` prints — rather
+/// than re-deriving staleness here. That is the whole point of the change: the
+/// daemon already knew `inbox-triage/every-90min` was stale, it just had no
+/// way to say so unless a human ran `status`. It also keeps the interval
+/// rolling-window subtlety in one place: dispatch judges against the *current*
+/// tick, health against the *first missed* one.
+///
+/// Pure so the policy is testable without a filesystem or a clock.
+fn alert_verdict(
+    health: HealthState,
+    expected: Option<DateTime<Local>>,
+    last_success: Option<DateTime<Local>>,
+    window: Option<&WindowState>,
+) -> AlertVerdict {
+    match health {
+        // `health_state` also calls a never-run agent stale. A freshly
+        // installed one whose first window has not come yet is not an outage,
+        // and alerting on the tick after install is the fastest way to teach
+        // someone to mute dotagent.
+        HealthState::Stale if expected.is_some() || last_success.is_some() => {
+            AlertVerdict::Alert("stale")
+        }
+        HealthState::Stale => AlertVerdict::Quiet,
+
+        // `give_up` fires this the instant the last retry burns. Repeating it
+        // is the addition: an agent broken for a week should keep asking.
+        HealthState::Failing if window.is_some_and(|w| w.given_up) => {
+            AlertVerdict::Alert("given_up")
+        }
+        // Retries still in flight — the run loop owns the outcome and will
+        // fire `given_up` itself if it runs out.
+        HealthState::Failing => AlertVerdict::Quiet,
+
+        // Cron reports no window between midnight and the daily hour, which
+        // `health_state` calls Ok. Reading that as recovery would forget the
+        // episode every night and make the ladder start over loud every
+        // morning; only an actual success ends an episode.
+        HealthState::Ok | HealthState::Degraded if expected.is_none() => AlertVerdict::Quiet,
+        HealthState::Ok | HealthState::Degraded => AlertVerdict::Healthy,
+    }
+}
+
+/// Does anything on this manifest want to hear about `event`?
+///
+/// Covers both delivery paths: built-in `[[notifiers]]` and the legacy
+/// `[[on_failure]]` plugin hooks. Empty `events` means "all" on both.
+fn anyone_listening(manifest: &AgentManifest, event: &str) -> bool {
+    manifest.notifiers.iter().any(|n| n.matches_event(event))
+        || manifest
+            .on_failure
+            .iter()
+            .any(|h| h.events.is_empty() || h.events.iter().any(|e| e == event))
+}
+
+/// Which event name to actually deliver an alert under, or `None` when nobody
+/// asked to hear about it.
+///
+/// `stale` falls back to the `given_up` channel when nothing lists it. Someone
+/// who wrote `events = ["given_up"]` asked to be told their agent is broken,
+/// and stale is the same news only worse — it stopped even trying. Making them
+/// edit every manifest to learn about the *more* severe case would recreate the
+/// exact failure this alert exists for: a config that looks complete while the
+/// worst outage stays silent.
+fn notify_channel(manifest: &AgentManifest, event: &'static str) -> Option<&'static str> {
+    if anyone_listening(manifest, event) {
+        return Some(event);
+    }
+    if event == "stale" && anyone_listening(manifest, "given_up") {
+        return Some("given_up");
+    }
+    None
+}
+
+/// `55d 4h` / `4h 12m` / `9m`. Rough on purpose — the reader wants an order of
+/// magnitude, not a stopwatch.
+fn human_duration(seconds: i64) -> String {
+    let s = seconds.max(0);
+    let (d, h, m) = (s / 86_400, (s % 86_400) / 3_600, (s % 3_600) / 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+/// Keep the tail of what the agent printed. The end is where the error is, and
+/// a notification that scrolls past a phone screen gets dismissed unread.
+fn stderr_tail(window: Option<&WindowState>) -> String {
+    const MAX: usize = 400;
+    let raw = window
+        .and_then(|w| w.last_attempt_stderr.as_deref())
+        .unwrap_or_default()
+        .trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if raw.chars().count() <= MAX {
+        return format!("\n{raw}");
+    }
+    let tail: String = raw.chars().skip(raw.chars().count() - MAX).collect();
+    format!("\n…{tail}")
+}
+
+/// The alert text: what, which schedule, how long, and the last thing the agent
+/// said. Enough to decide whether to care without opening a terminal.
+fn alert_message(
+    event: &str,
+    agent: &str,
+    schedule: &str,
+    last_success: Option<DateTime<Local>>,
+    window: Option<&WindowState>,
+    episode: &AlertEpisode,
+    now: DateTime<Local>,
+) -> String {
+    let repeat = if episode.count > 1 {
+        format!(" (notice #{})", episode.count)
+    } else {
+        String::new()
+    };
+    let body = match event {
+        "stale" => {
+            let age = match last_success {
+                Some(ls) => format!(
+                    "no successful run in {}",
+                    human_duration((now - ls).num_seconds())
+                ),
+                None => "it has never run successfully".to_string(),
+            };
+            format!("⏰ {agent}/{schedule} is not being scheduled — {age}{repeat}.")
+        }
+        // The first notice is the moment it happened, so it reads in the past
+        // tense and says nothing about elapsed time. Repeats are reminders
+        // about something still true, and the age is the point of sending one.
+        _ if episode.count <= 1 => {
+            let attempts = window.map(|w| w.attempts).unwrap_or(0);
+            let exit = window.and_then(|w| w.last_attempt_exit_code).unwrap_or(-1);
+            format!("🚨 {agent}/{schedule} gave up after {attempts} attempts (exit {exit})")
+        }
+        _ => {
+            let attempts = window.map(|w| w.attempts).unwrap_or(0);
+            let exit = window.and_then(|w| w.last_attempt_exit_code).unwrap_or(-1);
+            let since = window
+                .and_then(|w| w.given_up_at)
+                .map(|t| human_duration(now.timestamp() - t))
+                .unwrap_or_else(|| "?".into());
+            format!(
+                "🚨 {agent}/{schedule} still given up after {attempts} attempts \
+                 (exit {exit}), {since} ago{repeat}."
+            )
+        }
+    };
+    format!("{body}{}", stderr_tail(window))
+}
+
+/// Alert on conditions the run loop cannot report, because they are the absence
+/// of a run rather than a failed one.
+///
+/// Runs once per tick, after dispatch, so a give-up that just happened is
+/// already on record and does not get announced twice.
+async fn sweep_health_notifications(
+    agents: &[DiscoveredAgent],
+    state: &StateStore,
+    audit: &AuditLog,
+    plugins: &PluginClient,
+    now: DateTime<Local>,
+) {
+    let store = NotifyDedupStore::from_home();
+    let mut table = store.load();
+    let mut changed = false;
+
+    for agent in agents {
+        if !agent.manifest.agent.monitor {
+            continue;
+        }
+        let name = &agent.manifest.agent.name;
+        for sched in &agent.manifest.schedules {
+            let policy = ResolvedPolicy::resolve(&agent.manifest, sched);
+            let slug = slug_from_args(sched.args());
+            let hb = state.read_heartbeat(name, &slug).ok().flatten();
+            let last_success = hb
+                .as_ref()
+                .and_then(|h| h.last_success_at)
+                .and_then(|s| Local.timestamp_opt(s, 0).single());
+            let expected = expected_at(sched, now, last_success);
+            let window = expected.and_then(|e| state.read_window(name, &slug, e).ok().flatten());
+            let (health, _) = health_state(sched, &policy, hb.as_ref(), window.as_ref(), now);
+
+            let event = match alert_verdict(health, expected, last_success, window.as_ref()) {
+                AlertVerdict::Alert(e) => e,
+                AlertVerdict::Healthy => {
+                    changed |= table.clear_pair(name, sched.id());
+                    continue;
+                }
+                AlertVerdict::Quiet => continue,
+            };
+
+            // Nobody configured to hear it: say nothing, and remember nothing.
+            // Recording an episode no one will read would grow the dedup file
+            // for every agent that never wired up a notifier.
+            let Some(channel) = notify_channel(&agent.manifest, event) else {
+                continue;
+            };
+
+            // Keyed on the condition, not the channel it goes out on, so
+            // editing a manifest's `events` never resets a running ladder.
+            let key = alert_key(name, sched.id(), event);
+            if !table.should_notify(&key, now.timestamp()) {
+                continue;
+            }
+            let episode = table.record(&key, now.timestamp());
+            changed = true;
+
+            warn!(
+                agent = %name,
+                schedule = %sched.id(),
+                event,
+                channel,
+                notice = episode.count,
+                "health alert"
+            );
+            let message = alert_message(
+                event,
+                name,
+                sched.id(),
+                last_success,
+                window.as_ref(),
+                &episode,
+                now,
+            );
+            fire_on_failure_event(
+                &agent.manifest,
+                sched.id(),
+                channel,
+                &message,
+                plugins,
+                audit,
+            )
+            .await;
+        }
+    }
+
+    if changed {
+        if let Err(e) = store.save(&table) {
+            warn!(error = %e, "writing alert dedup state failed");
+        }
+    }
+}
+
+/// Ask the ladder whether this alert may speak right now, recording it when the
+/// answer is yes. `None` means stay quiet.
+///
+/// One policy, two callers: [`give_up`], which alerts the instant the last
+/// retry burns, and the tick sweep, which alerts on a condition nobody else
+/// reports. Sharing the table is what stops the same failure being announced
+/// twice inside a second, and what makes a still-broken agent keep asking on
+/// one cadence regardless of which path noticed.
+fn claim_alert(agent: &str, schedule: &str, event: &str, now: i64) -> Option<AlertEpisode> {
+    let store = NotifyDedupStore::from_home();
+    let mut table = store.load();
+    let key = alert_key(agent, schedule, event);
+    if !table.should_notify(&key, now) {
+        return None;
+    }
+    let episode = table.record(&key, now);
+    if let Err(e) = store.save(&table) {
+        warn!(error = %e, "writing alert dedup state failed");
+    }
+    Some(episode)
 }
 
 /// Update the manifest cache. Emits `phantom_agent_detected` for unseen
@@ -1450,8 +2021,321 @@ fn check_cache(agents: &[DiscoveredAgent], cache: &ManifestCache, audit: &AuditL
 }
 
 #[cfg(test)]
+mod trigger_worker_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::time::{advance, Duration as TokioDuration, Instant};
+
+    // Why an integration-style test on paused time rather than a pure
+    // "what should run now" function:
+    //
+    // The bug was never a wrong decision — every decision the daemon made was
+    // correct. It was *when* the decision got a chance to be made: the
+    // `select!` arm holding `trigger_rx` is not polled while a tick awaits a
+    // scheduled run inline. A pure function cannot express "was not polled".
+    // The property under test is temporal, so the test has to be too.
+    //
+    // `tokio::time::pause()` makes it deterministic and instant: sleeps
+    // auto-advance, so "the tick takes 20 minutes" costs microseconds, and
+    // the assertions are on the *virtual* clock, not on wall-clock luck.
+
+    fn req(agent: &str) -> TriggerRequest {
+        TriggerRequest {
+            agent: agent.into(),
+            schedule: None,
+            args: Vec::new(),
+            source: TriggerSource::Telegram,
+            actor: None,
+            reply_to: Some("42".into()),
+            payload: None,
+        }
+    }
+
+    /// The regression: a 20-minute scheduled run must not delay a message that
+    /// arrived 21 seconds into it. Reproduces the production timeline
+    /// (dispatch → trigger 21s later → answered 19m45s late).
+    #[tokio::test(start_paused = true)]
+    async fn a_long_scheduled_run_does_not_delay_a_trigger() {
+        let seen: Arc<Mutex<Vec<TokioDuration>>> = Arc::new(Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(TRIGGER_CHANNEL_DEPTH);
+        let sink = seen.clone();
+        let worker = spawn_trigger_worker(rx, move |_req| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(Instant::now() - t0);
+            }
+        });
+
+        // The main loop, busy the way it was: one scheduled run awaited inline
+        // for 1200 seconds. Nothing in here touches the trigger channel.
+        let tick = tokio::spawn(async move {
+            tokio::time::sleep(TokioDuration::from_secs(1200)).await;
+        });
+
+        advance(TokioDuration::from_secs(21)).await;
+        tx.send(req("telegram-assistant")).await.unwrap();
+        // Yield enough for the worker task to be scheduled and run.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(TokioDuration::from_millis(1)).await;
+
+        let observed = seen.lock().unwrap().clone();
+        assert_eq!(observed.len(), 1, "the trigger was never picked up");
+        assert!(
+            observed[0] < TokioDuration::from_secs(60),
+            "trigger waited {:?} — it must not wait for the scheduled run",
+            observed[0]
+        );
+
+        tick.await.unwrap();
+        worker.abort();
+    }
+
+    /// A conversation's messages must come out in the order they went in, even
+    /// when each one takes real time. This is the property that rules out
+    /// "just `tokio::spawn` each trigger".
+    #[tokio::test(start_paused = true)]
+    async fn messages_are_handled_one_at_a_time_in_order() {
+        let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(TRIGGER_CHANNEL_DEPTH);
+        let (o, f, m) = (order.clone(), inflight.clone(), max_inflight.clone());
+        let worker = spawn_trigger_worker(rx, move |req: TriggerRequest| {
+            let (o, f, m) = (o.clone(), f.clone(), m.clone());
+            async move {
+                use std::sync::atomic::Ordering::SeqCst;
+                let now = f.fetch_add(1, SeqCst) + 1;
+                m.fetch_max(now, SeqCst);
+                // A persistent agent answering a chat message takes seconds.
+                tokio::time::sleep(TokioDuration::from_secs(30)).await;
+                o.lock().unwrap().push(req.agent.clone());
+                f.fetch_sub(1, SeqCst);
+            }
+        });
+
+        for name in ["first", "second", "third"] {
+            tx.send(req(name)).await.unwrap();
+        }
+        // No explicit `advance`: with the clock paused, an idle runtime jumps
+        // to the next pending timer on its own, so the worker's three 30s
+        // sleeps resolve in sequence inside this one.
+        tokio::time::sleep(TokioDuration::from_secs(200)).await;
+
+        assert_eq!(*order.lock().unwrap(), vec!["first", "second", "third"]);
+        assert_eq!(
+            max_inflight.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a burst must not become concurrent agent processes"
+        );
+        worker.abort();
+    }
+
+    /// Closing the channel ends the worker instead of leaking a task that
+    /// spins on a dead receiver.
+    #[tokio::test(start_paused = true)]
+    async fn worker_stops_when_the_channel_closes() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(4);
+        let worker = spawn_trigger_worker(rx, |_req| async {});
+        drop(tx);
+        tokio::time::timeout(TokioDuration::from_secs(1), worker)
+            .await
+            .expect("worker should finish")
+            .expect("worker should not panic");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- daily summary scheduling ---
+    //
+    // Two bugs live here. The window used to be hardcoded to `[22:45, 23:15)`
+    // while the module doc claimed a configurable `daily_summary_time`, and
+    // nothing ever scheduled a wake-up for it: the loop reached the window
+    // only because `MAX_SLEEP_MINUTES` (30) happened to equal the window's
+    // width, which no code stated and a long tick already broke.
+
+    fn dt(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Local> {
+        Local.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    fn summary_cfg(time: &str, grace: u32) -> dotagent_core::DailySummaryConfig {
+        dotagent_core::DailySummaryConfig {
+            time: time.into(),
+            grace_minutes: grace,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn summary_fires_inside_the_configured_window() {
+        let cfg = summary_cfg("07:30", 30);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+        for (h, m) in [(7, 30), (7, 45), (7, 59)] {
+            assert_eq!(
+                should_run_daily_summary(dt(2026, 8, 6, h, m), None, &cfg),
+                Some(day),
+                "{h}:{m} is inside [07:30, 08:00)"
+            );
+        }
+    }
+
+    #[test]
+    fn summary_does_not_fire_outside_the_window() {
+        let cfg = summary_cfg("07:30", 30);
+        for (h, m) in [(7, 29), (8, 0), (22, 45), (0, 0)] {
+            assert_eq!(
+                should_run_daily_summary(dt(2026, 8, 6, h, m), None, &cfg),
+                None,
+                "{h}:{m} is outside [07:30, 08:00)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_window_is_still_2245() {
+        // The comment promised 22:45 long before anything read it from config.
+        // Nobody who never opens config.toml should notice this change.
+        let cfg = dotagent_core::DailySummaryConfig::default();
+        assert!(should_run_daily_summary(dt(2026, 8, 6, 22, 45), None, &cfg).is_some());
+        assert!(should_run_daily_summary(dt(2026, 8, 6, 23, 14), None, &cfg).is_some());
+        assert!(should_run_daily_summary(dt(2026, 8, 6, 23, 15), None, &cfg).is_none());
+        assert!(should_run_daily_summary(dt(2026, 8, 6, 22, 44), None, &cfg).is_none());
+    }
+
+    #[test]
+    fn summary_fires_once_per_window() {
+        let cfg = summary_cfg("22:45", 30);
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+        assert_eq!(
+            should_run_daily_summary(dt(2026, 8, 6, 22, 50), Some(day), &cfg),
+            None
+        );
+        // Next day's window is a different window.
+        assert!(should_run_daily_summary(dt(2026, 8, 7, 22, 50), Some(day), &cfg).is_some());
+    }
+
+    #[test]
+    fn a_window_crossing_midnight_keys_on_the_date_it_opened() {
+        // 23:50 + 30min grace runs to 00:20. Keying the once-a-day guard on
+        // `now` would record Aug 7 for a delivery that belongs to Aug 6's
+        // window — and then skip Aug 7's own 23:50 delivery entirely.
+        let cfg = summary_cfg("23:50", 30);
+        let aug6 = chrono::NaiveDate::from_ymd_opt(2026, 8, 6).unwrap();
+        let aug7 = chrono::NaiveDate::from_ymd_opt(2026, 8, 7).unwrap();
+
+        assert_eq!(
+            should_run_daily_summary(dt(2026, 8, 7, 0, 10), None, &cfg),
+            Some(aug6),
+            "00:10 belongs to the window that opened yesterday"
+        );
+        assert_eq!(
+            should_run_daily_summary(dt(2026, 8, 7, 0, 10), Some(aug6), &cfg),
+            None,
+            "already delivered for that window"
+        );
+        assert_eq!(
+            should_run_daily_summary(dt(2026, 8, 7, 23, 50), Some(aug6), &cfg),
+            Some(aug7),
+            "tonight's window must not be swallowed by yesterday's guard"
+        );
+    }
+
+    #[test]
+    fn a_disabled_summary_never_fires_and_never_wakes_the_daemon() {
+        let cfg = dotagent_core::DailySummaryConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            should_run_daily_summary(dt(2026, 8, 6, 22, 45), None, &cfg),
+            None
+        );
+        assert_eq!(next_summary_at(dt(2026, 8, 6, 10, 0), &cfg), None);
+    }
+
+    #[test]
+    fn a_zero_grace_window_is_not_an_empty_one() {
+        // `grace_minutes = 0` would make the half-open window empty and stop
+        // delivery with no error anywhere.
+        let cfg = summary_cfg("22:45", 0);
+        assert!(should_run_daily_summary(dt(2026, 8, 6, 22, 45), None, &cfg).is_some());
+    }
+
+    #[test]
+    fn an_unparseable_time_falls_back_instead_of_silencing_delivery() {
+        let cfg = summary_cfg("quarter to eleven", 30);
+        assert!(should_run_daily_summary(dt(2026, 8, 6, 22, 45), None, &cfg).is_some());
+    }
+
+    #[test]
+    fn the_daemon_schedules_a_wake_up_for_the_summary() {
+        // The regression that mattered: with no agent event in sight the loop
+        // used to sleep the full safety cap and reach the window only because
+        // the cap happened to equal the window width.
+        let cfg = summary_cfg("22:45", 30);
+        let now = dt(2026, 8, 6, 22, 30);
+        assert_eq!(
+            compute_sleep_target(now, None, next_summary_at(now, &cfg)),
+            dt(2026, 8, 6, 22, 45)
+        );
+    }
+
+    #[test]
+    fn a_narrow_window_no_longer_depends_on_the_safety_cap() {
+        // A one-minute grace is unreachable by a 30-minute sleep cap alone.
+        let cfg = summary_cfg("22:45", 1);
+        let now = dt(2026, 8, 6, 22, 20);
+        let target = compute_sleep_target(now, None, next_summary_at(now, &cfg));
+        assert_eq!(target, dt(2026, 8, 6, 22, 45));
+        assert!(should_run_daily_summary(target, None, &cfg).is_some());
+    }
+
+    #[test]
+    fn the_earlier_of_agent_event_and_summary_wins() {
+        let cfg = summary_cfg("22:45", 30);
+        let now = dt(2026, 8, 6, 22, 30);
+        let agent_event = dt(2026, 8, 6, 22, 35);
+        assert_eq!(
+            compute_sleep_target(now, Some(agent_event), next_summary_at(now, &cfg)),
+            agent_event
+        );
+        let later_event = dt(2026, 8, 6, 22, 50);
+        assert_eq!(
+            compute_sleep_target(now, Some(later_event), next_summary_at(now, &cfg)),
+            dt(2026, 8, 6, 22, 45)
+        );
+    }
+
+    #[test]
+    fn a_summary_past_the_safety_cap_does_not_extend_the_sleep() {
+        // The cap also bounds how stale the loaded manifests may get; a
+        // wake-up 8 hours out must not override it.
+        let cfg = summary_cfg("22:45", 30);
+        let now = dt(2026, 8, 6, 14, 0);
+        assert_eq!(
+            compute_sleep_target(now, None, next_summary_at(now, &cfg)),
+            now + chrono::Duration::minutes(MAX_SLEEP_MINUTES)
+        );
+    }
+
+    #[test]
+    fn the_next_wake_up_rolls_to_tomorrow_once_today_passed() {
+        let cfg = summary_cfg("22:45", 30);
+        assert_eq!(
+            next_summary_at(dt(2026, 8, 6, 22, 45), &cfg),
+            Some(dt(2026, 8, 7, 22, 45)),
+            "exactly at the time, the next one is tomorrow's"
+        );
+        assert_eq!(
+            next_summary_at(dt(2026, 8, 6, 23, 59), &cfg),
+            Some(dt(2026, 8, 7, 22, 45))
+        );
+    }
 
     fn req(source: TriggerSource) -> TriggerRequest {
         TriggerRequest {
@@ -1764,5 +2648,342 @@ mod tests {
     fn slug_is_namespaced_per_source() {
         assert_eq!(req(TriggerSource::Telegram).slug(), "trigger-telegram");
         assert_eq!(req(TriggerSource::Mcp).slug(), "trigger-mcp");
+    }
+
+    // --- health alerts. `stale` is the failure with no output channel: the
+    // agent stops being scheduled, so nothing runs, so nothing fails, so
+    // nothing fires. Two real agents sat dead for 55 and 5 days in silence. ---
+
+    fn at(hour: u32, minute: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 5, 19, hour, minute, 0)
+            .single()
+            .unwrap()
+    }
+
+    fn given_up_window(attempts: u32, stderr: &str) -> WindowState {
+        WindowState {
+            agent: "a".into(),
+            schedule_id: "daily".into(),
+            expected_at: 0,
+            attempts,
+            last_attempt_at: None,
+            last_attempt_exit_code: Some(1),
+            last_attempt_stderr: Some(stderr.into()),
+            given_up: true,
+            given_up_at: Some(at(2, 0).timestamp()),
+        }
+    }
+
+    /// 2026-05-19 is a Tuesday (weekday 2).
+    const CRON_8AM: &str =
+        "id = \"daily\"\ntype = \"cron\"\nweekdays = [0,1,2,3,4,5,6]\nhours = [8]";
+    const EVERY_15MIN: &str = "id = \"q\"\ntype = \"interval\"\ninterval_minutes = 15";
+
+    fn heartbeat_at(ls: DateTime<Local>) -> Heartbeat {
+        Heartbeat {
+            name: "a".into(),
+            slug: "default".into(),
+            args: vec![],
+            started_at: ls.timestamp(),
+            started_at_iso: String::new(),
+            finished_at: Some(ls.timestamp()),
+            finished_at_iso: None,
+            exit_code: Some(0),
+            duration_seconds: Some(1),
+            last_success_at: Some(ls.timestamp()),
+            last_success_at_iso: None,
+        }
+    }
+
+    /// Drives the real [`health_state`] rather than feeding a [`HealthState`]
+    /// in, because the interesting bugs live in the seam: interval windows roll
+    /// forward for dispatch but are judged for staleness from the first missed
+    /// one, and getting that wrong is what made a 55-day-dead agent look busy.
+    fn verdict(
+        schedule_toml: &str,
+        stale_after: u32,
+        last_success: Option<DateTime<Local>>,
+        window: Option<&WindowState>,
+        now: DateTime<Local>,
+    ) -> AlertVerdict {
+        let m: AgentManifest = toml::from_str(&format!(
+            "[agent]\nname = \"a\"\n[run]\ncommand = \"true\"\n\
+             [defaults]\nstale_after_minutes = {stale_after}\n\
+             [[schedules]]\n{schedule_toml}\n"
+        ))
+        .expect("test manifest must parse");
+        let sched = &m.schedules[0];
+        let policy = ResolvedPolicy::resolve(&m, sched);
+        let hb = last_success.map(heartbeat_at);
+        let expected = expected_at(sched, now, last_success);
+        let (health, _) = health_state(sched, &policy, hb.as_ref(), window, now);
+        alert_verdict(health, expected, last_success, window)
+    }
+
+    #[test]
+    fn a_cron_window_aged_past_stale_is_alerted() {
+        // Exactly the case `dispatch_one` refuses to touch: too old to retry,
+        // so nothing runs, so nothing else would ever say a word.
+        let v = verdict(CRON_8AM, 60, Some(at(7, 0)), None, at(12, 0));
+        assert!(matches!(v, AlertVerdict::Alert("stale")));
+    }
+
+    #[test]
+    fn an_interval_agent_dead_for_weeks_is_alerted() {
+        // The production case. Interval windows roll forward every tick so
+        // dispatch never sees a stale one; judging from the first missed window
+        // is what makes weeks of silence visible.
+        let long_ago = at(8, 0) - chrono::Duration::days(55);
+        let v = verdict(EVERY_15MIN, 60, Some(long_ago), None, at(12, 0));
+        assert!(matches!(v, AlertVerdict::Alert("stale")));
+    }
+
+    #[test]
+    fn an_interval_agent_that_just_missed_a_tick_is_not_stale_yet() {
+        let v = verdict(EVERY_15MIN, 60, Some(at(11, 40)), None, at(12, 0));
+        assert!(!matches!(v, AlertVerdict::Alert("stale")));
+    }
+
+    #[test]
+    fn an_agent_that_never_ran_still_alerts_once_its_window_ages_out() {
+        let v = verdict(CRON_8AM, 60, None, None, at(12, 0));
+        assert!(matches!(v, AlertVerdict::Alert("stale")));
+    }
+
+    #[test]
+    fn a_freshly_installed_agent_is_not_an_outage() {
+        // Cron window is tonight, nothing has run, nothing is wrong. Alerting
+        // on the tick after install is how you teach someone to mute dotagent.
+        let m = "id = \"nightly\"\ntype = \"cron\"\nweekdays = [0,1,2,3,4,5,6]\nhours = [22]";
+        assert!(matches!(
+            verdict(m, 60, None, None, at(10, 0)),
+            AlertVerdict::Quiet
+        ));
+        // Same for an interval agent with no anchor: the OS scheduler
+        // bootstraps the first run, dotagent never forces it.
+        assert!(matches!(
+            verdict(EVERY_15MIN, 60, None, None, at(10, 0)),
+            AlertVerdict::Quiet
+        ));
+    }
+
+    #[test]
+    fn no_window_in_scope_does_not_clear_a_chronic_failure() {
+        // Cron reports no window between midnight and the daily hour. Reading
+        // that as recovery would forget the episode every night and make the
+        // ladder start over loud every morning.
+        assert!(matches!(
+            verdict(
+                CRON_8AM,
+                60,
+                Some(at(8, 0) - chrono::Duration::days(3)),
+                None,
+                at(2, 0)
+            ),
+            AlertVerdict::Quiet
+        ));
+    }
+
+    #[test]
+    fn a_window_that_succeeded_is_healthy() {
+        let v = verdict(CRON_8AM, 60, Some(at(8, 5)), None, at(12, 0));
+        assert!(matches!(v, AlertVerdict::Healthy));
+    }
+
+    #[test]
+    fn retries_in_flight_are_the_run_loops_business() {
+        // Inside `stale_after_minutes`, not given up — the daemon is working on
+        // it and will fire `given_up` itself if it runs out.
+        let mut w = given_up_window(1, "boom");
+        w.given_up = false;
+        let v = verdict(CRON_8AM, 60, Some(at(7, 0)), Some(&w), at(8, 30));
+        assert!(matches!(v, AlertVerdict::Quiet));
+    }
+
+    #[test]
+    fn a_window_that_gave_up_keeps_asking() {
+        let w = given_up_window(3, "boom");
+        let v = verdict(CRON_8AM, 60, Some(at(7, 0)), Some(&w), at(8, 30));
+        assert!(matches!(v, AlertVerdict::Alert("given_up")));
+    }
+
+    #[test]
+    fn stale_wins_over_given_up() {
+        // Both are true once a given-up window ages out. "Not being scheduled
+        // at all" is the more urgent thing to say.
+        let w = given_up_window(3, "boom");
+        let v = verdict(CRON_8AM, 60, Some(at(7, 0)), Some(&w), at(12, 0));
+        assert!(matches!(v, AlertVerdict::Alert("stale")));
+    }
+
+    #[test]
+    fn the_stale_message_says_agent_schedule_and_how_long() {
+        let episode = AlertEpisode {
+            first_notified_at: 0,
+            last_notified_at: 0,
+            count: 1,
+        };
+        let msg = alert_message(
+            "stale",
+            "inbox-triage",
+            "every-90min",
+            Some(at(12, 0) - chrono::Duration::days(55)),
+            None,
+            &episode,
+            at(12, 0),
+        );
+        assert!(msg.contains("inbox-triage/every-90min"), "{msg}");
+        assert!(msg.contains("55d"), "{msg}");
+        assert!(!msg.contains("notice #"), "first notice is not numbered");
+    }
+
+    #[test]
+    fn a_repeat_notice_is_numbered_so_it_reads_as_a_reminder() {
+        let episode = AlertEpisode {
+            first_notified_at: 0,
+            last_notified_at: 0,
+            count: 4,
+        };
+        let msg = alert_message("stale", "a", "daily", None, None, &episode, at(12, 0));
+        assert!(msg.contains("notice #4"), "{msg}");
+        assert!(msg.contains("never run successfully"), "{msg}");
+    }
+
+    #[test]
+    fn the_first_give_up_notice_reads_as_an_event_not_a_reminder() {
+        let episode = AlertEpisode {
+            first_notified_at: 0,
+            last_notified_at: 0,
+            count: 1,
+        };
+        let w = given_up_window(3, "boom");
+        let msg = alert_message("given_up", "a", "daily", None, Some(&w), &episode, at(2, 0));
+        assert!(msg.contains("gave up after 3 attempts"), "{msg}");
+        assert!(!msg.contains("still"), "nothing has elapsed yet: {msg}");
+        assert!(!msg.contains("0m ago"), "{msg}");
+    }
+
+    #[test]
+    fn the_given_up_message_carries_the_last_stderr() {
+        let episode = AlertEpisode {
+            first_notified_at: 0,
+            last_notified_at: 0,
+            count: 2,
+        };
+        let w = given_up_window(3, "ImportError: no module named gmail");
+        let msg = alert_message(
+            "given_up",
+            "a",
+            "daily",
+            None,
+            Some(&w),
+            &episode,
+            at(12, 0),
+        );
+        assert!(msg.contains("3 attempts"), "{msg}");
+        assert!(msg.contains("ImportError"), "{msg}");
+        assert!(msg.contains("10h"), "10h since give-up: {msg}");
+    }
+
+    #[test]
+    fn no_message_ever_renders_a_rust_struct() {
+        // CLAUDE.md forbids `{:?}` in anything user-facing, and these go to a
+        // phone. A `Some(` in the output means a Debug leak.
+        let episode = AlertEpisode {
+            first_notified_at: 0,
+            last_notified_at: 0,
+            count: 1,
+        };
+        for event in ["stale", "given_up"] {
+            let msg = alert_message(
+                event,
+                "a",
+                "daily",
+                None,
+                Some(&given_up_window(1, "x")),
+                &episode,
+                at(12, 0),
+            );
+            assert!(!msg.contains("Some("), "{msg}");
+            assert!(!msg.contains("WindowState"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_huge_stderr_is_truncated_from_the_front() {
+        let w = given_up_window(1, &format!("{}THE-ACTUAL-ERROR", "noise ".repeat(500)));
+        let tail = stderr_tail(Some(&w));
+        assert!(
+            tail.contains("THE-ACTUAL-ERROR"),
+            "the end is the useful end"
+        );
+        assert!(tail.starts_with("\n…"));
+        assert!(tail.chars().count() < 450, "len {}", tail.chars().count());
+    }
+
+    #[test]
+    fn an_empty_stderr_adds_nothing() {
+        assert_eq!(stderr_tail(None), "");
+        assert_eq!(stderr_tail(Some(&given_up_window(1, "   \n "))), "");
+    }
+
+    // --- which channel a health alert goes out on ---
+
+    fn manifest_with(notifiers: &str) -> AgentManifest {
+        let raw = format!("[agent]\nname = \"a\"\n[run]\ncommand = \"bash\"\n{notifiers}");
+        toml::from_str(&raw).expect("test manifest must parse")
+    }
+
+    #[test]
+    fn an_agent_with_no_notifiers_is_not_alerted() {
+        assert_eq!(notify_channel(&manifest_with(""), "stale"), None);
+        assert_eq!(notify_channel(&manifest_with(""), "given_up"), None);
+    }
+
+    #[test]
+    fn a_notifier_that_lists_stale_gets_it_on_its_own_channel() {
+        let m = manifest_with(
+            "[[notifiers]]\ndriver = \"desktop\"\nevents = [\"given_up\", \"stale\"]\n",
+        );
+        assert_eq!(notify_channel(&m, "stale"), Some("stale"));
+    }
+
+    #[test]
+    fn stale_reaches_a_given_up_only_notifier() {
+        // Every agent in the wild was written as `events = ["given_up"]`.
+        // Requiring a manifest edit to hear about the *worse* failure would
+        // reproduce the outage this alert exists to end.
+        let m = manifest_with("[[notifiers]]\ndriver = \"desktop\"\nevents = [\"given_up\"]\n");
+        assert_eq!(notify_channel(&m, "stale"), Some("given_up"));
+    }
+
+    #[test]
+    fn a_notifier_with_no_event_filter_hears_everything_directly() {
+        let m = manifest_with("[[notifiers]]\ndriver = \"desktop\"\n");
+        assert_eq!(notify_channel(&m, "stale"), Some("stale"));
+    }
+
+    #[test]
+    fn a_notifier_listening_for_something_else_entirely_is_left_alone() {
+        let m = manifest_with("[[notifiers]]\ndriver = \"desktop\"\nevents = [\"recovered\"]\n");
+        assert_eq!(notify_channel(&m, "stale"), None);
+    }
+
+    #[test]
+    fn legacy_on_failure_hooks_count_as_listeners() {
+        let m = manifest_with("[[on_failure]]\nplugin = \"sink-file\"\nevents = [\"given_up\"]\n");
+        assert_eq!(notify_channel(&m, "stale"), Some("given_up"));
+        assert_eq!(notify_channel(&m, "given_up"), Some("given_up"));
+    }
+
+    #[test]
+    fn durations_read_at_a_glance() {
+        assert_eq!(human_duration(0), "0m");
+        assert_eq!(human_duration(9 * 60), "9m");
+        assert_eq!(human_duration(4 * 3600 + 12 * 60), "4h 12m");
+        assert_eq!(human_duration(55 * 86_400 + 4 * 3600), "55d 4h");
+        // A clock that moved backwards must not print a negative age.
+        assert_eq!(human_duration(-500), "0m");
     }
 }

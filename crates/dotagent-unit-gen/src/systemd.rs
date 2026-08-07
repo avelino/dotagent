@@ -2,6 +2,14 @@
 //!
 //! Template: `templates/daemon.service`. Variables: `LABEL`, `BINARY`,
 //! `STDOUT_LOG`, `STDERR_LOG`.
+//!
+//! `StandardError=` stays an append file on purpose — **do not point it at
+//! `null`.** The daemon no longer mirrors `tracing` events there (see
+//! `dotagent-telemetry`), so it is a low-volume crash channel: panics,
+//! aborts, loader failures, and anything that dies before the subscriber
+//! exists. Those never reach the structured JSON log. Rewiring this to
+//! `journal` is fine, but then set `DOTAGENT_LOG_STDERR=1` so the mirror
+//! comes back.
 
 use crate::template::{find_unrendered_placeholder, render};
 use crate::{GenContext, Result, UnitGenError, UnitPath, DAEMON_LABEL};
@@ -66,5 +74,21 @@ mod tests {
             "leftover: {out}"
         );
         assert!(out.contains("ExecStart=/usr/bin/dotagent daemon"));
+    }
+
+    #[test]
+    fn service_captures_stderr_to_a_real_file() {
+        let ctx = GenContext {
+            dotagent_binary: PathBuf::from("/usr/bin/dotagent"),
+            log_dir: PathBuf::from("/var/log"),
+        };
+        let out = render_service(&ctx);
+
+        assert!(out.contains("StandardError=append:/var/log/run.avelino.dotagent-error.log"));
+        assert!(out.contains("StandardOutput=append:/var/log/run.avelino.dotagent.log"));
+        assert!(
+            !out.contains("StandardError=null"),
+            "discarding stderr erases panic diagnostics"
+        );
     }
 }

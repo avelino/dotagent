@@ -4,6 +4,8 @@
 //! orchestration logic for `tick`, `status`, `daily-summary`, `run`, etc.
 //! lives in `commands/`.
 
+use std::io::IsTerminal;
+
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
@@ -172,8 +174,16 @@ async fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("telemetry init failed: {e}"))?,
         ),
         _ => {
+            // Same colour rule as the daemon's stderr mirror: no escapes when
+            // stderr is a pipe or a file, and `NO_COLOR` wins over the TTY.
+            // Redirecting `dotagent status 2> log` must not litter the file.
+            let ansi = dotagent_telemetry::ansi_enabled(
+                std::io::stderr().is_terminal(),
+                std::env::var("NO_COLOR").ok().as_deref(),
+            );
             tracing_subscriber::fmt()
                 .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_ansi(ansi)
                 .with_writer(std::io::stderr)
                 .init();
             None

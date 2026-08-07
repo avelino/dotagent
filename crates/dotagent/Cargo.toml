@@ -43,3 +43,8 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# `test-util` gives the tests a pausable clock. The daemon-loop regression it
+# exists for ("a slow scheduled run must not delay an inbound trigger") is a
+# statement about time, and asserting it on the wall clock would either be
+# flaky or take 20 minutes.
+tokio = { workspace = true, features = ["test-util"] }

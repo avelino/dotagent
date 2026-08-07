@@ -28,13 +28,21 @@ The example in [`first-agent.md`](first-agent.md) already wired a
 ```toml
 [[notifiers]]
 driver = "slack"
-webhook_url = "https://hooks.slack.com/services/..."
+webhook_url = "${SLACK_WEBHOOK_URL}"
 events = ["given_up", "recovered"]
 ```
 
+Note the `${VAR}`. A Slack webhook URL *is* the credential, and an
+`agent.toml` lives in a repo — put the value in
+`~/.config/dotagent/secrets.env` (mode `0600`) and dotagent resolves it at
+send time. The same holds for `ntfy.token`/`base_url`/`topic`,
+`pushover.token`/`user`, and `telegram.bot_token`.
+
 → **Read**: [`concepts/notifications.md`](../concepts/notifications.md)
-for every driver, the tiered-notify pattern (desktop on every fail,
-phone only on `given_up`), and rate-limit semantics.
+for every driver, per-driver message size caps, the tiered-notify pattern
+(desktop on every fail, phone only on `given_up`), and rate-limit
+semantics. [`concepts/secrets.md`](../concepts/secrets.md) covers the
+secrets file.
 
 ---
 

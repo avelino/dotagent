@@ -97,14 +97,72 @@ pub enum AuditEvent {
         path: String,
         sha256: String,
     },
+    /// A process a previous daemon left running was killed at boot.
+    ///
+    /// Identity is confirmed before any signal — group leadership, start time
+    /// and command all have to match the snapshot, so a recycled pid is
+    /// refused rather than killed. See `dotagent_supervisor::orphan`.
+    OrphanReaped {
+        agent: String,
+        kind: String,
+        label: String,
+        pid: u32,
+        age_seconds: u64,
+        deadline_seconds: u64,
+    },
     AuditChainBroken {
         position: usize,
         expected_prev_hash: String,
         actual_prev_hash: String,
     },
+    /// The log was rotated: everything up to `tail_hash` now lives in
+    /// `rotated_to`, and this entry is the first line of the fresh file.
+    ///
+    /// It is the **seam**. Its `prev_hash` equals `tail_hash`, so the chain
+    /// continues across the rename with no gap — and its presence is what
+    /// lets verification tell retention from truncation. An operator who
+    /// deletes an old segment leaves this entry behind, still covered by the
+    /// chain, declaring exactly what went away; someone who cuts lines off the
+    /// head of the current file removes the seam along with them, and the
+    /// orphaned `prev_hash` that remains is accounted for by nothing.
+    ///
+    /// That distinction is the whole reason a rotated audit log is still an
+    /// audit log. See `docs/security/threat-model.md` for what it does and
+    /// does not buy.
+    AuditLogRotated {
+        /// File name only, never a path — the segment is a sibling of
+        /// `audit.log`. Verification refuses anything containing a separator,
+        /// because this string comes off disk like any other attacker-writable
+        /// field.
+        rotated_to: String,
+        /// How many entries moved. Recorded here so a segment that is gone can
+        /// still be described.
+        entries: usize,
+        /// `ts` of the first entry in the rotated segment, or `"unknown"` when
+        /// its head was already unreadable.
+        first_ts: String,
+        /// sha256 of the segment's last line. Equals this entry's `prev_hash`;
+        /// a seam where the two disagree is not a seam.
+        tail_hash: String,
+    },
+    /// **Read-only.** No longer emitted — see [`AuditEvent::TickCompleted`].
     TickStarted {
         agents_scanned: u32,
     },
+    /// **Read-only.** No longer emitted.
+    ///
+    /// A tick is telemetry, not an auditable event: "woke up and looked at 17
+    /// agents" tells a forensic reader nothing, and it dominated the file —
+    /// 64% of one real 38k-entry log was these two variants. Because
+    /// `AuditLog::append` re-reads the whole file to find the tail hash, the
+    /// noise also made every event worth recording quadratically more
+    /// expensive to write. The daemon emits `tracing` at `debug` instead, which
+    /// already rotates.
+    ///
+    /// **Kept so old logs stay readable.** Deleting the variants would make
+    /// `dotagent status --audit` and `verify_chain` fail on every existing
+    /// install the moment they reach a historic tick entry — and a hash chain
+    /// you can no longer verify is worse than one carrying dead weight.
     TickCompleted {
         agents_scanned: u32,
         runs_dispatched: u32,
@@ -276,6 +334,10 @@ impl AuditEvent {
             // finds without the severity being wrong the rest of the time.
             | AuditEvent::CommandDispatched { .. }
             | AuditEvent::PersistentAgentStarted { .. }
+            // Not Info: rotation restructures the forensic artifact, and a
+            // reader who missed it would mistake the seam for a truncated log.
+            // Not Critical: it is the log doing its housekeeping on schedule.
+            | AuditEvent::AuditLogRotated { .. }
             | AuditEvent::PluginInvoked { ok: false, .. } => Severity::Notice,
 
             // Recycling is routine except when it isn't. `crashed` and
@@ -293,6 +355,7 @@ impl AuditEvent {
             | AuditEvent::PreflightFailed { .. }
             | AuditEvent::ManifestDriftDetected { .. }
             | AuditEvent::PhantomAgentDetected { .. }
+            | AuditEvent::OrphanReaped { .. }
             | AuditEvent::SecretsRefused { .. }
             | AuditEvent::TriggerRejected { .. }
             | AuditEvent::ManifestInvalid { .. }
@@ -303,3 +366,49 @@ impl AuditEvent {
 }
 
 pub const GENESIS_HASH: &str = "GENESIS";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verbatim lines from a real `audit.log`, written before the daemon
+    /// stopped emitting ticks. Tens of thousands of these exist on installs in
+    /// the wild; `dotagent status --audit` and `verify_chain` walk every one of
+    /// them, so the day they stop parsing is the day the chain stops being
+    /// verifiable.
+    const HISTORIC_TICK_STARTED: &str = r#"{"ts":"2026-05-19T08:31:07-0300","severity":"info","event":{"event_type":"tick_started","agents_scanned":0},"prev_hash":"2c94629858b453eef01ea41eca0783054a3b6816adb2b9997e0bdbfce2cb9698"}"#;
+    const HISTORIC_TICK_COMPLETED: &str = r#"{"ts":"2026-05-19T08:31:07-0300","severity":"info","event":{"event_type":"tick_completed","agents_scanned":17,"runs_dispatched":2,"next_event_iso":"2026-05-19T09:00:00-0300"},"prev_hash":"a69720c4ed3b953b0507257af6cca66e9131d52cc97305de489d99b0116b2801"}"#;
+
+    #[test]
+    fn historic_tick_entries_still_deserialize() {
+        let started: AuditEntry = serde_json::from_str(HISTORIC_TICK_STARTED).unwrap();
+        assert!(matches!(
+            started.event,
+            AuditEvent::TickStarted { agents_scanned: 0 }
+        ));
+
+        let completed: AuditEntry = serde_json::from_str(HISTORIC_TICK_COMPLETED).unwrap();
+        match completed.event {
+            AuditEvent::TickCompleted {
+                agents_scanned,
+                runs_dispatched,
+                next_event_iso,
+            } => {
+                assert_eq!((agents_scanned, runs_dispatched), (17, 2));
+                assert_eq!(next_event_iso.as_deref(), Some("2026-05-19T09:00:00-0300"));
+            }
+            other => panic!("expected tick_completed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn historic_tick_entries_re_serialize_byte_for_byte() {
+        // `verify_chain` recomputes each hash from the entry's JSON. A field
+        // reordered or renamed would leave every historic hash unreproducible
+        // and report the chain as broken — indistinguishable from tampering.
+        for line in [HISTORIC_TICK_STARTED, HISTORIC_TICK_COMPLETED] {
+            let entry: AuditEntry = serde_json::from_str(line).unwrap();
+            assert_eq!(serde_json::to_string(&entry).unwrap(), line);
+        }
+    }
+}

@@ -2,6 +2,13 @@
 //!
 //! Template: `templates/daemon.plist`. Variables: `LABEL`, `BINARY`,
 //! `STDOUT_LOG`, `STDERR_LOG`.
+//!
+//! `StandardErrorPath` stays a real file on purpose — **do not point it at
+//! `/dev/null`.** The daemon no longer mirrors `tracing` events there (see
+//! `dotagent-telemetry`), so it is a low-volume crash channel: panics,
+//! aborts, dyld failures, and anything that dies before the subscriber
+//! exists. Those never reach the structured JSON log, and discarding them
+//! would erase the single most useful crash diagnostic.
 
 use crate::template::{find_unrendered_placeholder, render};
 use crate::{GenContext, Result, UnitGenError, UnitPath, DAEMON_LABEL};
@@ -67,5 +74,25 @@ mod tests {
         );
         assert!(out.contains(DAEMON_LABEL));
         assert!(out.contains("/usr/local/bin/dotagent"));
+    }
+
+    #[test]
+    fn plist_captures_stderr_to_a_real_file() {
+        let ctx = GenContext {
+            dotagent_binary: PathBuf::from("/usr/local/bin/dotagent"),
+            log_dir: PathBuf::from("/tmp/logs"),
+        };
+        let out = render_plist(&ctx);
+
+        assert!(
+            out.contains("<key>StandardErrorPath</key>"),
+            "stderr must stay captured — it is the only crash channel"
+        );
+        assert!(out.contains("/tmp/logs/run.avelino.dotagent-error.log"));
+        assert!(out.contains("/tmp/logs/run.avelino.dotagent.log"));
+        assert!(
+            !out.contains("/dev/null"),
+            "discarding stderr erases panic diagnostics"
+        );
     }
 }

@@ -14,7 +14,7 @@ and you immediately get:
 - Each agent's stdout+stderr → `~/.config/dotagent/logs/agents/<name>/<name>.log` (raw, rotated daily)
 - Rotated files older than 1 day → gzipped automatically
 - Files older than 30 days (daemon) / 14 days (agents) → deleted automatically
-- Audit log → `~/.config/dotagent/audit.log` (append-only, never rotated)
+- Audit log → `~/.config/dotagent/audit.log` (append-only, hash-chained; rotates at 32MB into segments that are never deleted)
 
 The `config.toml` file is **entirely optional**. Create one only if you
 want to:
@@ -41,7 +41,7 @@ dotagent has **four** distinct log streams:
 flowchart LR
     daemon[daemon process] --> daemon_log["logs/daemon/dotagent.log<br/>(JSON, rotated daily)"]
     agent[agent subprocess] --> agent_log["logs/agents/&lt;name&gt;/&lt;name&gt;.log<br/>(raw stdout/stderr, rotated daily)"]
-    daemon --> stderr["stderr<br/>(launchd/systemd captures)"]
+    daemon -.only when stderr is a TTY.-> stderr["stderr<br/>(compact, human-readable)"]
     daemon --> audit["audit.log<br/>(append-only, hash-chained)"]
     daemon -.OTLP optional.-> otel[OpenTelemetry collector]
 ```
@@ -50,11 +50,29 @@ flowchart LR
 |-------------------------|---------------------|-----------------------|------------------|----------------------------------------------|
 | `logs/daemon/dotagent.log` | daemon's `tracing` | JSON (one line per record) | daily, gzip → delete | Structured operational logs for debugging   |
 | `logs/agents/<name>/<name>.log` | agent process stdout+stderr | Raw text         | daily, gzip → delete | What the agent script actually said          |
-| stderr                  | daemon's `tracing` | Compact text          | (launchd / systemd handles) | Human-friendly tail-able stream           |
-| `audit.log`             | daemon              | Newline-delimited JSON, hash-chained | NEVER rotates | Tamper-evident security event ledger |
+| stderr                  | daemon's `tracing` | Compact text          | **only installed when stderr is a TTY** | Human-friendly stream for an interactive run |
+| `audit.log`             | daemon              | Newline-delimited JSON, hash-chained | 32MB → sealed segment, **never deleted** | Tamper-evident security event ledger |
 
 OpenTelemetry (when enabled) re-emits the **same** structured records as
 OTLP spans, so any backend gets the full picture.
+
+### stderr is conditional, on purpose
+
+Run `dotagent daemon` in a terminal and you get the compact stream. Run it
+under launchd or systemd and you do not: there stderr is an appended plain
+file (`logs/daemon/run.avelino.dotagent-error.log`) that no rotation policy
+covers, so mirroring into it would duplicate an already-rotated log into one
+that grows forever.
+
+That leaves the stderr file as a **crash channel** — panics, and startup
+failures that happen before logging is up. An empty `…-error.log` under a
+service manager is the healthy state. To follow what the daemon is doing,
+read `logs/daemon/dotagent.log`.
+
+`DOTAGENT_LOG_STDERR=1` forces the mirror on (units rewired to journald, which
+does rotate); `DOTAGENT_LOG_STDERR=0` forces it off. ANSI colour follows the
+same TTY rule and additionally honours `NO_COLOR`, in the daemon and in every
+subcommand.
 
 ## Filesystem layout
 
@@ -80,9 +98,10 @@ Everything under `$DOTAGENT_HOME` (default `~/.config/dotagent`):
 │       ├── finops-weekly/
 │       │   ├── finops-weekly.log
 │       │   └── finops-weekly.log.2026-05-19
-│       └── linkedin-hot-take/
-│           └── linkedin-hot-take.log
-└── audit.log                           # append-only, NEVER rotates
+│       └── inbox-triage/
+│           └── inbox-triage.log
+├── audit.log                           # append-only, hash-chained (live)
+└── audit.log.20260806T101500           # sealed segment, never deleted
 ```
 
 ## Log format
@@ -134,7 +153,7 @@ threshold: 20%
 🚨 disk-alert: 18% free on /
     avail: 87.3 GB / 460.4 GB
     threshold: 20%
-    host: avelino-igloo
+    host: workstation-01
 ```
 
 Mixing structured (daemon) + raw (agent) is deliberate: the daemon's
@@ -153,6 +172,7 @@ ships these defaults:
 | `retention_days`           | `30`    | daemon logs older than this are deleted               |
 | `per_agent_retention_days` | `14`    | agent logs (typically noisier; shorter horizon)       |
 | `compress_after_days`      | `1`     | rotated files older than this are gzipped             |
+| `window_retention_days`    | `30`    | `state/windows/` files older than this are deleted (`[state]`, not `[logging]`) |
 
 If those match what you want, **don't create a `config.toml`** — the
 defaults kick in automatically.
@@ -191,12 +211,23 @@ The daemon runs an internal cleanup pass once per day at **03:00 local
 time**. It:
 
 1. Walks `logs/daemon/` and every `logs/agents/<name>/` directory.
-2. Files older than `compress_after_days` get gzipped in-place.
+2. Rotated files older than `compress_after_days` get gzipped in-place.
 3. Files older than `retention_days` (or `per_agent_retention_days`
-   inside agent dirs) get deleted.
+   inside agent dirs) get deleted — **rotated files only**. The active
+   (non-rotated) log is skipped no matter how old it is: launchd and
+   systemd hold an open fd on it, and unlinking a file someone is still
+   writing to strands every subsequent line in an unnamed inode. A
+   long-lived daemon with a quiet log would otherwise have its live file
+   deleted out from under it at day 31.
+4. Walks `state/windows/` and deletes windows older than
+   `window_retention_days`, each together with its `.lock`. Windows are
+   never gzipped — the daemon reads them as JSON, so a compressed
+   window is a corrupted one. A window whose lock is currently held is
+   skipped.
 
-The audit log is **never** swept — see [Audit log vs operational
-log](#audit-log-vs-operational-log).
+The audit log is **never** swept. It rotates by size, but its segments
+are not subject to `[logs]` retention and nothing deletes them — see
+[Audit log vs operational log](#audit-log-vs-operational-log).
 
 To trigger a sweep manually:
 
@@ -291,7 +322,7 @@ service_name = "dotagent"          # default
 
 [telemetry.resource]                # extra attributes attached to every span
 "deployment.environment" = "production"
-"host.name" = "avelino-igloo"
+"host.name" = "workstation-01"
 ```
 
 ### Vendor recipes
@@ -386,11 +417,18 @@ These look similar but serve different purposes — **do not conflate them**.
 | Format         | NDJSON, hash-chained (`prev_hash`) | NDJSON (`tracing` style)             |
 | Producer       | daemon, on consequential events    | daemon's `tracing` macros            |
 | Frequency      | sparse (5–50 entries/day)          | dense (thousands/day)                |
-| Rotation       | **NEVER**                          | daily, gzip, then delete             |
-| Retention      | indefinite                         | configurable (default 30/14 days)    |
+| Rotation       | by size (32MB), across a hash seam | daily, gzip, then delete             |
+| Retention      | indefinite — segments are **never** auto-deleted | configurable (default 30/14 days)    |
 | Mutability     | append-only; tamper detectable     | overwritten on rotation              |
 | Schema         | strict (typed `AuditEvent` variants) | unstructured (`tracing` Fields)    |
 | Use case       | forensics, security audit          | debugging, tail-the-app              |
+
+Rotation is the one thing the two now share, and they share only the
+word. An operational log rolls and is eventually deleted; the audit log
+rolls into a **sealed segment** stitched to the new file by a hash seam,
+and dotagent never removes it. Pruning old segments is supported and
+stays legible to verification — the reasoning is in
+[`security/threat-model.md`](../security/threat-model.md#what-the-hash-chain-guarantees-and-what-it-does-not).
 
 You should `grep` the audit log when answering "was this run authorized?
 who changed manifest X? when did the daemon last say a plugin was

@@ -18,6 +18,7 @@
 
 #![deny(missing_debug_implementations)]
 
+pub mod orphan;
 pub mod reaper;
 mod signal;
 
@@ -127,6 +128,20 @@ pub struct ProcessInfo {
     pub age_seconds: u64,
     /// `age / deadline` as a 0..=100 integer (clamped). Useful for warnings.
     pub deadline_pct: u8,
+    /// Process-group id, when the platform gave us one (always `Some(pid)` on
+    /// Unix — every supervised spawn is its own group leader).
+    ///
+    /// Persisted, together with [`ProcessInfo::command`], so a *later* daemon
+    /// can prove a pid it reads off disk is still the process that was
+    /// recorded before it signals anything. See [`crate::orphan`]. Both carry
+    /// `#[serde(default)]` because a snapshot written by an older build has
+    /// neither, and a record that cannot be identity-checked must deserialize
+    /// into one that is refused rather than fail the whole file.
+    #[serde(default)]
+    pub pgid: Option<i32>,
+    /// The command line as spawned, tokens separated by single spaces.
+    #[serde(default)]
+    pub command: String,
 }
 
 /// Audit-ish event the supervisor publishes. The orchestrator wires this into
@@ -256,6 +271,11 @@ impl Supervisor {
         #[cfg(unix)]
         cmd.process_group(0);
 
+        // Snapshotted before the spawn consumes it: the next daemon needs to
+        // know what this pid was running to tell it apart from a process that
+        // merely inherited the number. See `orphan::classify`.
+        let command = render_command(&cmd);
+
         let child = cmd.spawn().map_err(SupervisorError::Spawn)?;
         let pid = child.id();
         // On Unix, with `process_group(0)`, the child becomes its own group
@@ -280,6 +300,8 @@ impl Supervisor {
             deadline_seconds: spec.deadline.as_secs(),
             age_seconds: 0,
             deadline_pct: 0,
+            pgid,
+            command,
         };
 
         {
@@ -488,6 +510,17 @@ impl Inner {
             }
         }
     }
+}
+
+/// Program + args, single-space separated, lossy on non-UTF8.
+///
+/// Not a shell-quoted command line — it is never executed, only compared
+/// against what `ps` reports for a pid a later daemon is about to signal.
+fn render_command(cmd: &Command) -> String {
+    let std = cmd.as_std();
+    let mut parts = vec![std.get_program().to_string_lossy().into_owned()];
+    parts.extend(std.get_args().map(|a| a.to_string_lossy().into_owned()));
+    parts.join(" ")
 }
 
 fn project_info(
@@ -790,6 +823,8 @@ mod tests {
             deadline_seconds: 5,
             age_seconds: 0,
             deadline_pct: 0,
+            pgid: Some(100),
+            command: "sleep 1".into(),
         };
         let p = project_info(&base, started, Duration::from_secs(5), now);
         assert_eq!(p.deadline_pct, 100);
@@ -809,6 +844,8 @@ mod tests {
             deadline_seconds: 0,
             age_seconds: 0,
             deadline_pct: 0,
+            pgid: Some(100),
+            command: "sleep 1".into(),
         };
         let p = project_info(&base, now, Duration::ZERO, now);
         assert_eq!(p.deadline_pct, 0);
