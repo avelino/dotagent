@@ -28,8 +28,11 @@
 //! second instead of inheriting a day-long silence from the previous one.
 
 use std::collections::BTreeMap;
+use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
+use std::sync::Mutex;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::StateError;
@@ -136,13 +139,28 @@ impl NotifyDedup {
 }
 
 /// Reader/writer for the episode table.
+///
+/// This store is read-modify-write, and two processes really do run the same
+/// cycle: the daemon's per-tick sweep and `dotagent tick`. Without exclusion
+/// they interleave, and the update that gets lost is usually a `clear_pair` —
+/// an episode that should have ended survives, so the next genuine failure
+/// inherits a day-long backoff. That is the exact silence this module exists to
+/// close, which is why the lock is held across the whole cycle rather than
+/// around the write alone.
 pub struct NotifyDedupStore {
     path: PathBuf,
+    /// Held from [`Self::load`] until [`Self::save`], or until the store is
+    /// dropped. `alerts.lock`, never unlinked — see `write_json` in `lib.rs`
+    /// for why unlinking a lock file while holding it breaks exclusion.
+    lock: Mutex<Option<File>>,
 }
 
 impl NotifyDedupStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            lock: Mutex::new(None),
+        }
     }
 
     pub fn from_home() -> Self {
@@ -156,24 +174,75 @@ impl NotifyDedupStore {
     /// A missing or corrupt table means "nothing has been notified yet", which
     /// costs at most one duplicate alert. Losing the alert entirely would be
     /// the expensive failure, so this never returns an error.
+    ///
+    /// Takes the store's lock, which the matching [`Self::save`] releases.
     pub fn load(&self) -> NotifyDedup {
+        self.acquire();
         if !self.path.exists() {
             return NotifyDedup::default();
         }
-        std::fs::File::open(&self.path)
+        File::open(&self.path)
             .ok()
             .and_then(|f| serde_json::from_reader(f).ok())
             .unwrap_or_default()
     }
 
     pub fn save(&self, table: &NotifyDedup) -> Result<(), StateError> {
+        let written = self.write(table);
+        // Released even when the write failed: holding it past the end of the
+        // cycle would wedge the other process out for the life of this one.
+        self.release();
+        written
+    }
+
+    fn write(&self, table: &NotifyDedup) -> Result<(), StateError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = self.path.with_extension("json.tmp");
+        // Per-pid temp name. A fixed one lets two processes write the same file
+        // and rename whichever half-written copy finishes last.
+        let tmp = self
+            .path
+            .with_extension(format!("json.tmp.{}", std::process::id()));
         std::fs::write(&tmp, serde_json::to_vec_pretty(table)?)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
+    }
+
+    /// Best effort on purpose: a lock we cannot take costs at most a duplicate
+    /// alert, while refusing to sweep would cost the alert itself.
+    fn acquire(&self) {
+        let Ok(mut slot) = self.lock.lock() else {
+            return;
+        };
+        if slot.is_some() {
+            // flock is per open file description, so a second handle opened by
+            // this same process would block on the lock we already hold.
+            return;
+        }
+        if let Some(parent) = self.path.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
+        }
+        let opened = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(self.path.with_extension("lock"));
+        if let Ok(f) = opened {
+            if f.lock_exclusive().is_ok() {
+                *slot = Some(f);
+            }
+        }
+    }
+
+    /// Dropping the `File` is what releases the flock.
+    fn release(&self) {
+        if let Ok(mut slot) = self.lock.lock() {
+            *slot = None;
+        }
     }
 }
 
@@ -335,6 +404,56 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = NotifyDedupStore::new(dir.path().join("alerts.json"));
         store.save(&NotifyDedup::default()).unwrap();
-        assert!(!dir.path().join("alerts.json.tmp").exists());
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "left behind {leftovers:?}");
+    }
+
+    #[test]
+    fn a_concurrent_sweep_cannot_lose_an_update() {
+        // The daemon (`sweep_health_notifications`) and `dotagent tick` run the
+        // same load → mutate → save cycle. Interleaved, one of them writes a
+        // table that never saw the other's change; when the lost change is a
+        // `clear_pair`, a dead episode survives and the next real failure
+        // inherits its backoff.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alerts.json");
+
+        std::thread::scope(|s| {
+            for t in 0..4u32 {
+                let path = path.clone();
+                s.spawn(move || {
+                    for i in 0..10u32 {
+                        // A fresh store per cycle: each is a separate
+                        // `NotifyDedupStore::from_home()` in the real callers.
+                        let store = NotifyDedupStore::new(path.clone());
+                        let mut table = store.load();
+                        table.record(&alert_key(&format!("a{t}"), "daily", &format!("e{i}")), 0);
+                        store.save(&table).unwrap();
+                    }
+                });
+            }
+        });
+
+        let store = NotifyDedupStore::new(path.clone());
+        assert_eq!(store.load().episodes.len(), 40, "an update was lost");
+        assert!(
+            path.with_extension("lock").exists(),
+            "the lock file must survive the cycle"
+        );
+    }
+
+    #[test]
+    fn loading_twice_without_saving_does_not_deadlock_on_our_own_lock() {
+        // A sweep that finds nothing to change returns without saving. The next
+        // `load` on the same store must not block on the lock it already holds.
+        let dir = tempfile::tempdir().unwrap();
+        let store = NotifyDedupStore::new(dir.path().join("alerts.json"));
+        let _ = store.load();
+        let _ = store.load();
     }
 }

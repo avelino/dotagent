@@ -49,6 +49,11 @@ struct Summary {
 /// against. Deriving it here from `last_success_at` instead produced a
 /// filename that only matched when a run finished inside its own window
 /// minute, so `degraded` was effectively unreachable in the daily summary.
+///
+/// The dispatched window comes from
+/// [`status::last_dispatched_window`](super::status::last_dispatched_window):
+/// for interval schedules the key cannot be rebuilt from the schedule at all,
+/// because a success re-phases the tick sequence.
 fn collect(agents: &[DiscoveredAgent], state: &StateStore, now: DateTime<Local>) -> Summary {
     let mut summary = Summary::default();
 
@@ -61,7 +66,8 @@ fn collect(agents: &[DiscoveredAgent], state: &StateStore, now: DateTime<Local>)
             let policy = ResolvedPolicy::resolve(&agent.manifest, sched);
             let slug = slug_from_args(sched.args());
             let hb = state.read_heartbeat(name, &slug).ok().flatten();
-            let window = window_key(sched, hb.as_ref(), now)
+            let dispatched = super::status::last_dispatched_window(state, name, &slug, now);
+            let window = window_key(sched, hb.as_ref(), dispatched, now)
                 .and_then(|key| state.read_window(name, &slug, key).ok().flatten());
             let (health, reason) = health_state(sched, &policy, hb.as_ref(), window.as_ref(), now);
             let label = format!("{}/{} — {}", name, sched.id(), reason);

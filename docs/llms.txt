@@ -971,6 +971,7 @@ dotagent inspect <name>          # heartbeat + windows + schedule resolution
 dotagent daily-summary           # ad-hoc daily roll-up
 dotagent run-now <name>          # force a run now, ignoring schedule windows
 dotagent mcp                     # serve every agent as an MCP tool over stdio
+dotagent audit verify --full     # verify the audit log's hash chain; exits 1 on a break
 dotagent completions <shell>     # bash|zsh|fish|elvish|powershell — tab-completes agent names
 ```
 

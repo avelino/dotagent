@@ -331,7 +331,15 @@ daemon restarts.
 
 ### `<any state file>.lock`
 
-Empty file beside every JSON state file, held with `flock` during a write.
+Empty file beside every JSON state file, held with `flock` while the file is
+being changed.
+
+Most are held for the write alone, because the write is the whole update.
+`notify/alerts.lock` and `audit.log.lock` are held longer — across the entire
+read-modify-write cycle — because both files are read, edited, and written
+back, and two processes really do run those cycles (the daemon and `dotagent
+tick`). A lock scoped to the write alone would let one of them save a table
+that never saw the other's change.
 
 It is **not** removed afterwards, on purpose. Unlinking it while still holding
 the lock lets the next writer open a fresh inode and take its own "exclusive"
@@ -578,8 +586,12 @@ Verification has two scopes:
 
 | Scope | What it walks | Used by |
 |---|---|---|
-| current segment | the live `audit.log` only | daemon at boot — the live file is the only one that changes |
-| full | follows seams backwards through every segment still present | on demand, when you want the guarantee to reach `GENESIS` |
+| current segment | the live `audit.log` only | daemon at boot, and `dotagent audit verify` — the live file is the only one that changes |
+| full | follows seams backwards through every segment still present | `dotagent audit verify --full`, when you want the guarantee to reach `GENESIS` |
+
+`dotagent audit verify` prints the verdict and exits non-zero on a break
+or an unexplained truncation; `--json` emits one machine-parseable line.
+See [`cli.md`](cli.md#audit-verify).
 
 Example line (pretty-printed):
 
@@ -646,7 +658,7 @@ daemon emits `tracing` at `debug` level instead, which already rotates — see
 [observability](../guides/observability.md).
 
 The enum variants are **kept** so existing logs stay parseable. Removing them
-would make `dotagent status --audit` and chain verification fail the moment
+would make `dotagent audit verify` and chain verification fail the moment
 they reached a historic tick entry, and a chain you can no longer verify is
 worse than one carrying dead weight.
 

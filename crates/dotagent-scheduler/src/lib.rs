@@ -130,21 +130,53 @@ fn last_success_of(heartbeat: Option<&Heartbeat>) -> Option<DateTime<Local>> {
 /// opened. That coincidence was why exactly one schedule ever reported a
 /// window state and every other one silently read `None`.
 ///
-/// The key is the window currently *due* — `expected_at`, the same value the
-/// daemon dispatches and writes against, and the same one [`health_state`]
-/// derives internally. Not the first missed window: that one answers "how long
-/// has this been broken", which [`health_state`] already computes on its own.
+/// Re-deriving the key from `(schedule, heartbeat, now)` fixes that for cron
+/// and *only* for cron. A cron key is anchored on the calendar, so it survives
+/// a success; an interval key is anchored on `last_success`, so a success
+/// re-phases the whole tick sequence and the tick the daemon dispatched stops
+/// belonging to it. A 90-minute agent dispatched at 10:30 that finishes at
+/// 10:52 re-derives to 10:52 — a filename nobody ever wrote — which is the
+/// original bug, restricted to the one schedule type this PR set out to fix.
+///
+/// So the key stops being reconstructed and starts being *read*:
+/// `last_dispatched` is the newest window the daemon actually wrote a file
+/// for, a fact about storage that no schedule can predict. It is only
+/// consulted for a window that already succeeded, which is the one case where
+/// the derived key drifts:
+///
+/// - **succeeded** (`last_success >= expected_at`) — the health being reported
+///   belongs to the window the successful run was dispatched against, and only
+///   `last_dispatched` knows which one that was. `None` (no window file on
+///   disk yet, or a caller that cannot look) falls back to the derived key,
+///   i.e. exactly the previous behaviour.
+/// - **missed** — the window under judgement is the one currently due, and the
+///   daemon writes against that same derived key. Deferring to an *older*
+///   dispatched window here would resurrect a stale attempt count and hide the
+///   `window due Nmin ago, no attempt` case, which exists to say "the daemon
+///   never even tried".
 ///
 /// Lives here rather than in a CLI module because every reader of a window
-/// file has to agree with the writer on the key, and the writer's key comes
-/// from [`expected_at`]. Two independent re-derivations of it is exactly how
-/// the same bug landed in two commands.
+/// file has to agree with the writer on the key. Two independent
+/// re-derivations of it is exactly how the same bug landed in two commands.
 pub fn window_key(
     schedule: &Schedule,
     heartbeat: Option<&Heartbeat>,
+    last_dispatched: Option<DateTime<Local>>,
     now: DateTime<Local>,
 ) -> Option<DateTime<Local>> {
-    expected_at(schedule, now, last_success_of(heartbeat))
+    let last_success = last_success_of(heartbeat);
+    let expected = expected_at(schedule, now, last_success)?;
+    if !last_success.is_some_and(|ls| ls >= expected) {
+        return Some(expected);
+    }
+    // A dispatched window newer than the one due cannot describe a success
+    // that already happened — a clock jump is the only way to produce it, and
+    // trusting it would report another window's attempts as this one's.
+    Some(
+        last_dispatched
+            .filter(|w| *w <= expected)
+            .unwrap_or(expected),
+    )
 }
 
 fn cron_expected_at(
@@ -294,7 +326,15 @@ pub enum HealthState {
     Degraded,
     /// Window passed without success, retrying or given up.
     Failing,
-    /// Never ran, or window is older than `stale_after_minutes`.
+    /// Never ran, or the schedule has been broken for longer than
+    /// `stale_after_minutes`.
+    ///
+    /// Measured from the *first* window missed since the last success, not
+    /// from the one currently due. Interval windows roll forward so dispatch
+    /// stays alive, so the due window is never more than one interval old —
+    /// judging staleness against it would report an agent that has been dead
+    /// for weeks as a fresh failure, forever. Cron windows do not roll, so for
+    /// them the two are the same window.
     Stale,
 }
 
@@ -330,10 +370,10 @@ pub fn health_state(
             // been failing for weeks still reads as stale, not as fresh.
             let stale_ref = first_missed_window(schedule, last_success).unwrap_or(exp);
             if is_stale(stale_ref, policy.stale_after_minutes, now) {
-                let age_min = (now - stale_ref).num_minutes();
+                let age = human_age((now - stale_ref).num_minutes());
                 (
                     HealthState::Stale,
-                    format!("window missed {age_min}min ago (stale)"),
+                    format!("window missed {age} ago (stale)"),
                 )
             } else if let Some(ws) = window_state {
                 if ws.given_up {
@@ -348,13 +388,31 @@ pub fn health_state(
                     )
                 }
             } else {
-                let age_min = (now - exp).num_minutes();
+                let age = human_age((now - exp).num_minutes());
                 (
                     HealthState::Failing,
-                    format!("window due {age_min}min ago, no attempt"),
+                    format!("window due {age} ago, no attempt"),
                 )
             }
         }
+    }
+}
+
+/// Render an age the way a person reads it: `45min`, `3h 20m`, `55d 4h`.
+///
+/// These strings reach the user verbatim in `dotagent status` and in the daily
+/// summary. The agent that motivated this work had been dead for 55 days and
+/// reported `window missed 79200min ago` — arithmetically correct and useless
+/// at the exact moment someone needed to grasp how bad it was.
+fn human_age(minutes: i64) -> String {
+    let m = minutes.max(0);
+    let (d, h, rem) = (m / 1440, (m % 1440) / 60, m % 60);
+    if d > 0 {
+        format!("{d}d {h}h")
+    } else if h > 0 {
+        format!("{h}h {rem}m")
+    } else {
+        format!("{rem}min")
     }
 }
 
@@ -711,7 +769,7 @@ mod tests {
         let s = cron("morning", vec![0, 1, 2, 3, 4, 5, 6], vec![10], 0);
         let hb = heartbeat_with_success(Some(now_at(10, 12)));
         assert_eq!(
-            window_key(&s, Some(&hb), now_at(10, 30)),
+            window_key(&s, Some(&hb), Some(now_at(10, 0)), now_at(10, 30)),
             Some(now_at(10, 0))
         );
     }
@@ -722,19 +780,139 @@ mod tests {
     fn window_key_follows_the_rolling_interval_tick() {
         let s = interval("every-90min", 90);
         let hb = heartbeat_with_success(Some(now_at(9, 0)));
-        // Ticks: 09:00, 10:30, 12:00 — at 11:00 the due one is 10:30.
+        // Ticks: 09:00, 10:30, 12:00 — at 11:00 the due one is 10:30, and it
+        // has not succeeded, so nothing the daemon dispatched earlier applies.
         assert_eq!(
-            window_key(&s, Some(&hb), now_at(11, 0)),
+            window_key(&s, Some(&hb), Some(now_at(9, 0)), now_at(11, 0)),
             Some(now_at(10, 30))
+        );
+    }
+
+    /// The blocker this signature exists for. An every-90-minutes schedule
+    /// dispatched against the 10:30 tick, burned two attempts, and succeeded
+    /// on the third — which finished at 10:52. Re-deriving the key from
+    /// `last_success_at` lands on 10:52, a filename the daemon never wrote, so
+    /// the retries vanish and the schedule reads `ok`. Only a run that finished
+    /// inside its own dispatch minute ever matched, which is precisely the
+    /// coincidence this whole function was introduced to kill.
+    #[test]
+    fn window_key_survives_an_interval_run_that_outlived_its_dispatch_minute() {
+        let s = interval("every-90min", 90);
+        let hb = heartbeat_with_success(Some(now_at(10, 52)));
+        assert_eq!(
+            window_key(&s, Some(&hb), Some(now_at(10, 30)), now_at(11, 0)),
+            Some(now_at(10, 30))
+        );
+    }
+
+    /// Same shape end-to-end: the window says three dispatches with the last
+    /// one exit 0, so two failed and the schedule is `degraded`, not `ok`.
+    #[test]
+    fn health_interval_recovered_after_retries_is_degraded() {
+        let s = interval("every-90min", 90);
+        let hb = heartbeat_with_success(Some(now_at(10, 52)));
+        let ws = WindowState {
+            agent: "inbox-triage".into(),
+            schedule_id: "every-90min".into(),
+            expected_at: now_at(10, 30).timestamp(),
+            attempts: 3,
+            last_attempt_at: Some(now_at(10, 50).timestamp()),
+            last_attempt_exit_code: Some(0),
+            ..Default::default()
+        };
+        let key = window_key(&s, Some(&hb), Some(now_at(10, 30)), now_at(11, 0));
+        assert_eq!(key, Some(now_at(10, 30)), "wrong window file would be read");
+
+        let (state, reason) = health_state(&s, &policy(120), Some(&hb), Some(&ws), now_at(11, 0));
+        assert_eq!(state, HealthState::Degraded, "reason was: {reason}");
+        assert!(reason.contains('2'), "expected 2 failed attempts: {reason}");
+    }
+
+    /// A manual `dotagent run` rescues an interval schedule whose scheduled
+    /// attempts all failed. The rescue writes no window file, so the newest
+    /// dispatched window is still the one that burned them — and that is the
+    /// one the report has to read.
+    #[test]
+    fn window_key_after_a_manual_rescue_is_the_last_dispatched_window() {
+        let s = interval("every-90min", 90);
+        let hb = heartbeat_with_success(Some(now_at(10, 45)));
+        assert_eq!(
+            window_key(&s, Some(&hb), Some(now_at(10, 30)), now_at(11, 0)),
+            Some(now_at(10, 30))
+        );
+    }
+
+    /// A window the daemon never dispatched must stay unreadable, otherwise
+    /// `window due Nmin ago, no attempt` — the only signal that says "the
+    /// daemon is not running" — silently reports an older window's attempts.
+    #[test]
+    fn window_key_of_a_missed_window_ignores_older_dispatches() {
+        let s = interval("every-90min", 90);
+        let hb = heartbeat_with_success(Some(now_at(9, 0)));
+        assert_eq!(
+            window_key(&s, Some(&hb), Some(now_at(9, 0)), now_at(11, 0)),
+            Some(now_at(10, 30)),
+        );
+    }
+
+    /// Nothing on disk yet, or a caller that cannot look: fall back to the
+    /// derived key, which is what every reader did before.
+    #[test]
+    fn window_key_without_a_dispatched_window_falls_back_to_expected() {
+        let s = cron("morning", vec![0, 1, 2, 3, 4, 5, 6], vec![10], 0);
+        let hb = heartbeat_with_success(Some(now_at(10, 12)));
+        assert_eq!(
+            window_key(&s, Some(&hb), None, now_at(10, 30)),
+            Some(now_at(10, 0))
+        );
+    }
+
+    /// A dispatched window in the future of the due one cannot describe a
+    /// success that already happened; only a clock jump produces it.
+    #[test]
+    fn window_key_ignores_a_dispatched_window_newer_than_the_due_one() {
+        let s = cron("morning", vec![0, 1, 2, 3, 4, 5, 6], vec![10], 0);
+        let hb = heartbeat_with_success(Some(now_at(10, 12)));
+        assert_eq!(
+            window_key(&s, Some(&hb), Some(now_at(23, 0)), now_at(10, 30)),
+            Some(now_at(10, 0))
         );
     }
 
     #[test]
     fn window_key_without_heartbeat_matches_expected_at() {
         let s = cron("morning", vec![0, 1, 2, 3, 4, 5, 6], vec![10], 0);
-        assert_eq!(window_key(&s, None, now_at(10, 30)), Some(now_at(10, 0)));
+        assert_eq!(
+            window_key(&s, None, None, now_at(10, 30)),
+            Some(now_at(10, 0))
+        );
         // Interval has no anchor without a success, so there is no window.
-        assert_eq!(window_key(&interval("iv", 90), None, now_at(10, 30)), None);
+        assert_eq!(
+            window_key(&interval("iv", 90), None, None, now_at(10, 30)),
+            None
+        );
+    }
+
+    /// The counters reach the user verbatim, and 79200 minutes is not a
+    /// duration anyone reads.
+    #[test]
+    fn human_age_scales_past_the_minute() {
+        assert_eq!(human_age(0), "0min");
+        assert_eq!(human_age(45), "45min");
+        assert_eq!(human_age(200), "3h 20m");
+        assert_eq!(human_age(79_200), "55d 0h");
+        assert_eq!(human_age(-5), "0min");
+    }
+
+    /// The 55-day agent, rendered. The old string was `79200min ago`.
+    #[test]
+    fn stale_reason_reads_in_days() {
+        let s = interval("every-90min", 90);
+        let now = now_at(12, 0);
+        let hb = heartbeat_with_success(Some(now - chrono::Duration::days(55)));
+        let (state, reason) = health_state(&s, &policy(120), Some(&hb), None, now);
+        assert_eq!(state, HealthState::Stale);
+        assert!(reason.contains("54d"), "unreadable age: {reason}");
     }
 
     #[test]

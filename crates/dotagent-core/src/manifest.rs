@@ -246,6 +246,21 @@ impl AgentManifest {
                     "duplicate schedule id: {id}"
                 )));
             }
+            // A zero interval has no cadence, and the scheduler cannot invent
+            // one. It survives every gate as "already succeeded", so the agent
+            // reads `ok` forever and is never dispatched — a silent death, from
+            // a typo, in the one subsystem whose job is to make death loud.
+            if matches!(
+                sched,
+                Schedule::Interval {
+                    interval_minutes: 0,
+                    ..
+                }
+            ) {
+                return Err(Error::InvalidManifest(format!(
+                    "schedule {id}: interval_minutes must be greater than 0"
+                )));
+            }
         }
         self.lifecycle
             .validate(self.agent.timeout_seconds)
@@ -322,5 +337,23 @@ mod tests {
     #[test]
     fn an_unknown_mode_is_a_parse_error_not_a_silent_oneshot() {
         assert!(parse("[lifecycle]\nmode = \"forever\"").is_err());
+    }
+
+    /// `interval_minutes = 0` used to load fine and then never dispatch: the
+    /// scheduler treats it as permanently up to date, so the agent reports
+    /// `ok` and never runs again. Rejecting it at load turns a silent death
+    /// into a startup error.
+    #[test]
+    fn a_zero_interval_is_rejected_instead_of_never_dispatching() {
+        let err = parse("[[schedules]]\nid = \"q\"\ntype = \"interval\"\ninterval_minutes = 0")
+            .unwrap_err();
+        assert!(err.to_string().contains("interval_minutes"), "{err}");
+    }
+
+    #[test]
+    fn a_positive_interval_still_loads() {
+        let m =
+            parse("[[schedules]]\nid = \"q\"\ntype = \"interval\"\ninterval_minutes = 90").unwrap();
+        assert_eq!(m.schedules.len(), 1);
     }
 }

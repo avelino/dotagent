@@ -27,6 +27,7 @@
 //! counts.
 
 use std::fmt;
+use std::fmt::Write as _;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -120,8 +121,32 @@ impl NtfyConfig {
             Some(t) => Some(expand_env(TOKEN_FIELD, t).map_err(NotifyError::Config)?),
             None => None,
         };
-        if topic.trim().is_empty() {
+        let topic = topic.trim();
+        if topic.is_empty() {
             return Err(NotifyError::Config("ntfy: topic is required".into()));
+        }
+        // The topic is interpolated straight into the request path, so a
+        // character with meaning in a URL silently retargets the publish and
+        // ntfy still answers 200: `alerts#prod` publishes to `alerts` (the
+        // fragment never leaves the client), `alerts?x` to `alerts`, and
+        // `a/b` to a topic nobody configured. Delivered to the wrong place is
+        // worse than not delivered — nothing looks broken.
+        //
+        // Checked after expansion, because `${NTFY_TOPIC}` now reads from
+        // `secrets.env`, where the value gets no review at all.
+        if let Some(bad) = topic.chars().find(|c| matches!(c, '/' | '?' | '#')) {
+            return Err(NotifyError::Config(format!(
+                "{TOPIC_FIELD}: {bad:?} is not allowed in a topic — it is a URL \
+                 separator, and the request would publish somewhere else"
+            )));
+        }
+        // Same failure, via path normalization rather than a separator: `..`
+        // resolves away the topic segment entirely and posts to the base URL.
+        if topic == "." || topic == ".." {
+            return Err(NotifyError::Config(format!(
+                "{TOPIC_FIELD}: {topic:?} is not a topic — it resolves to the \
+                 base URL, and the request would publish somewhere else"
+            )));
         }
         if !base_url.trim().starts_with("http") {
             return Err(NotifyError::Config(
@@ -130,7 +155,7 @@ impl NtfyConfig {
         }
         Ok(Resolved {
             base_url: base_url.trim().to_string(),
-            topic: topic.trim().to_string(),
+            topic: topic.to_string(),
             token,
         })
     }
@@ -208,7 +233,9 @@ fn q_encode_char(c: char, out: &mut String) {
     }
     let mut buf = [0u8; 4];
     for b in c.encode_utf8(&mut buf).as_bytes() {
-        out.push_str(&format!("={b:02X}"));
+        // `write!` into the existing buffer; `push_str(&format!(…))` allocated a
+        // `String` per byte, and this runs once per byte of every title.
+        let _ = write!(out, "={b:02X}");
     }
 }
 
@@ -227,7 +254,7 @@ impl Notifier for NtfyConfig {
         let url = format!("{}/{}", base_url.trim_end_matches('/'), topic);
         // The body is the message and nothing else, so ntfy's byte cap is
         // measured against exactly the bytes it will count.
-        let mut req = reqwest::Client::new().post(&url).body(truncate_bytes(
+        let mut req = crate::http::client().post(&url).body(truncate_bytes(
             ctx.message,
             MAX_MESSAGE_BYTES,
             TRUNCATION_NOTICE,
@@ -589,6 +616,67 @@ mod tests {
                 matches!(err, NotifyError::Config(_)),
                 "topic {bad:?} should be rejected, got {err:?}"
             );
+        }
+    }
+
+    // --- deny: a topic that would retarget the request ----------------------
+
+    #[test]
+    fn resolution_rejects_a_topic_that_would_publish_somewhere_else() {
+        // The topic is interpolated into the request path. Every one of these
+        // reaches a different topic than the manifest names — and ntfy answers
+        // 200, so the operator sees a healthy notifier and no alert.
+        for bad in [
+            "alerts#prod",                     // fragment: `prod` never leaves the client
+            "alerts?poll=1",                   // query: `alerts`, with a param
+            "alerts/prod",                     // a second path segment
+            "/alerts",                         // empty segment, then `alerts`
+            "https://attacker.example/alerts", // an entirely different host
+            "..",                              // normalizes to the base URL
+            ".",
+        ] {
+            let mut c = cfg("https://ntfy.sh");
+            c.topic = bad.into();
+            let Err(NotifyError::Config(msg)) = c.resolve() else {
+                panic!("topic {bad:?} was accepted");
+            };
+            assert!(msg.contains(TOPIC_FIELD), "must name the field: {msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn send_rejects_a_topic_that_would_publish_somewhere_else() {
+        // The guard belongs in `resolve`, before a request exists — a request
+        // that reaches the wire at all has already published to the wrong place.
+        let mut c = cfg("https://ntfy.sh");
+        c.topic = "alerts#prod".into();
+        let err = c.send(&ctx("m")).await.unwrap_err();
+        assert!(matches!(err, NotifyError::Config(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_topic_coming_from_secrets_env_is_validated_too() {
+        // `${VAR}` moved this value into `secrets.env`, which nobody reviews.
+        // Validating only what is written literally in the manifest would check
+        // the half that was already under review.
+        let out =
+            crate::secrets::with_store(&[("DOTAGENT_TEST_NTFY_TOPIC", "alerts#prod")], || {
+                let mut c = cfg("https://ntfy.sh");
+                c.topic = "${DOTAGENT_TEST_NTFY_TOPIC}".into();
+                c.resolve()
+            });
+        assert!(
+            matches!(out, Err(NotifyError::Config(_))),
+            "an expanded topic must face the same guard"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_topic_still_resolves() {
+        for good in ["dotagent-alerts", "disk_alert", "hn-digest2", "AlertsPROD"] {
+            let mut c = cfg("https://ntfy.sh");
+            c.topic = good.into();
+            assert_eq!(c.resolve().expect(good).topic, good);
         }
     }
 

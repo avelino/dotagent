@@ -105,7 +105,7 @@ impl Notifier for SlackConfig {
         // `reqwest::Error`'s `Display` carries the request URL, and the URL is
         // the secret — convert here, before the error can become a
         // `NotifyError` and reach `warn!(error = %e)` in the runner.
-        let res = match reqwest::Client::new().post(url).json(&body).send().await {
+        let res = match crate::http::client().post(url).json(&body).send().await {
             Ok(r) => r,
             Err(e) => return Err(NotifyError::Backend(sanitize_reqwest_err("slack", &e))),
         };

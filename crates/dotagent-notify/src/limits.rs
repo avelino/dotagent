@@ -5,10 +5,11 @@
 //! turns "silently undelivered" into "delivered, minus the tail", and the
 //! notice says which one you got.
 //!
-//! Two cutters, because the backends do not agree on what they are counting:
-//! Telegram, Slack and Pushover cap **characters**, ntfy caps **bytes**. That
-//! distinction is not academic for pt-BR alert text — `ç`/`ã` are 2 bytes and
-//! an emoji is 4, so 4096 characters can be 16 KB on the wire.
+//! Three cutters, because the backends do not agree on what they are counting:
+//! Slack and Pushover cap **characters**, ntfy caps **bytes**, and Telegram
+//! caps **UTF-16 code units**. That distinction is not academic for pt-BR alert
+//! text — `ç`/`ã` are 2 bytes and an emoji is 4, so 4096 characters can be
+//! 16 KB on the wire, and 4096 emoji are 8192 units to Telegram.
 
 /// Appended when the tail was dropped. Leading newline so it does not run into
 /// the last line of the body.
@@ -19,15 +20,7 @@ pub(crate) const TRUNCATION_NOTICE: &str = "\n[truncated]";
 pub(crate) const ELLIPSIS_NOTICE: &str = "…";
 
 /// Trim `text` to at most `max_chars` characters, appending `notice`.
-///
-/// `fixup` runs on the head *before* the notice is appended, and must never
-/// grow it — Telegram uses it to drop a backslash the cut orphaned.
-pub(crate) fn truncate_chars_with(
-    text: &str,
-    max_chars: usize,
-    notice: &str,
-    fixup: impl FnOnce(&mut String),
-) -> String {
+pub(crate) fn truncate_chars(text: &str, max_chars: usize, notice: &str) -> String {
     if text.chars().count() <= max_chars {
         return text.to_string();
     }
@@ -38,14 +31,59 @@ pub(crate) fn truncate_chars_with(
         return text.chars().take(max_chars).collect();
     }
     let mut head: String = text.chars().take(max_chars - notice_len).collect();
+    head.push_str(notice);
+    head
+}
+
+/// Trim `text` so its **UTF-16** encoding is at most `max_units` code units,
+/// appending `notice`.
+///
+/// Telegram's 4096 is a UTF-16 count, not a character count
+/// (<https://core.telegram.org/api/entities>): every codepoint outside the BMP —
+/// which is every emoji — costs 2. A character-based cutter therefore lets
+/// 3000 `🚨` through as "well under the cap" and hands Telegram 6000 units,
+/// earning the `message is too long` 400 the cutter exists to prevent.
+///
+/// `fixup` runs on the head *before* the notice is appended, and must never
+/// grow it — Telegram uses it to drop a backslash the cut orphaned.
+pub(crate) fn truncate_utf16_with(
+    text: &str,
+    max_units: usize,
+    notice: &str,
+    fixup: impl FnOnce(&mut String),
+) -> String {
+    if text.encode_utf16().count() <= max_units {
+        return text.to_string();
+    }
+    let notice_units = notice.encode_utf16().count();
+    // Same trade as the other cutters: a notice that does not fit would push
+    // the body back over the cap, and losing the marker beats losing the send.
+    if notice_units >= max_units {
+        return take_utf16(text, max_units);
+    }
+    let mut head = take_utf16(text, max_units - notice_units);
     fixup(&mut head);
     head.push_str(notice);
     head
 }
 
-/// Trim `text` to at most `max_chars` characters, appending `notice`.
-pub(crate) fn truncate_chars(text: &str, max_chars: usize, notice: &str) -> String {
-    truncate_chars_with(text, max_chars, notice, |_| {})
+/// Longest prefix of `text` fitting in `max_units` UTF-16 code units.
+///
+/// A character is taken whole or not at all. Half a surrogate pair is not a
+/// `char` and `String` cannot hold one, so a budget that lands mid-pair leaves
+/// the result one unit under — under is correct, over is a 400.
+fn take_utf16(text: &str, max_units: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for c in text.chars() {
+        let width = c.len_utf16();
+        if used + width > max_units {
+            break;
+        }
+        out.push(c);
+        used += width;
+    }
+    out
 }
 
 /// Trim `text` so its UTF-8 encoding is at most `max_bytes` bytes, appending
@@ -114,9 +152,88 @@ mod tests {
         assert_eq!(out, "xxxxx");
     }
 
+    // --- utf-16 ------------------------------------------------------------
+
     #[test]
-    fn chars_runs_the_fixup_on_the_head_only() {
-        let out = truncate_chars_with(&"x".repeat(50), 20, "!", |head| {
+    fn utf16_leaves_short_text_alone() {
+        assert_eq!(
+            truncate_utf16_with("hi", 100, TRUNCATION_NOTICE, |_| {}),
+            "hi"
+        );
+    }
+
+    #[test]
+    fn utf16_counts_astral_codepoints_as_two() {
+        // 200 emoji is 200 *chars* — a char-based cutter calls that half of a
+        // 400 cap and ships 400 units. This is the axis nobody counted.
+        let text = "🚨".repeat(200);
+        assert_eq!(text.chars().count(), 200);
+        assert_eq!(text.encode_utf16().count(), 400);
+        let out = truncate_utf16_with(&text, 100, TRUNCATION_NOTICE, |_| {});
+        assert!(
+            out.encode_utf16().count() <= 100,
+            "{} units",
+            out.encode_utf16().count()
+        );
+        assert!(out.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn utf16_treats_bmp_text_exactly_like_the_char_cutter() {
+        // Inside the BMP the two counts agree, so the stricter cutter must not
+        // trim anything the char cutter would have kept.
+        let text = "ação concluída ".repeat(40);
+        for cap in 1..200 {
+            assert_eq!(
+                truncate_utf16_with(&text, cap, TRUNCATION_NOTICE, |_| {}),
+                truncate_chars(&text, cap, TRUNCATION_NOTICE),
+                "cap {cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_never_splits_a_surrogate_pair() {
+        // Mixed BMP + astral at every cap in a range: the budget lands mid-pair
+        // for half of them, and the answer is to drop the whole character.
+        let text = "ação 🚨 ok çé 🔥 ".repeat(20);
+        for cap in 1..200 {
+            let out = truncate_utf16_with(&text, cap, TRUNCATION_NOTICE, |_| {});
+            assert!(
+                out.encode_utf16().count() <= cap,
+                "cap {cap} produced {} units",
+                out.encode_utf16().count()
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_drops_a_notice_that_does_not_fit() {
+        let out = truncate_utf16_with(&"x".repeat(50), 5, TRUNCATION_NOTICE, |_| {});
+        assert_eq!(out, "xxxxx");
+    }
+
+    #[test]
+    fn utf16_handles_a_zero_cap() {
+        assert_eq!(
+            truncate_utf16_with("🚨anything", 0, TRUNCATION_NOTICE, |_| {}),
+            ""
+        );
+    }
+
+    #[test]
+    fn utf16_keeps_text_that_lands_exactly_on_the_cap() {
+        let text = "🚨🚨"; // 2 chars, 4 units
+        assert_eq!(text.encode_utf16().count(), 4);
+        assert_eq!(
+            truncate_utf16_with(text, 4, TRUNCATION_NOTICE, |_| {}),
+            text
+        );
+    }
+
+    #[test]
+    fn utf16_runs_the_fixup_on_the_head_only() {
+        let out = truncate_utf16_with(&"x".repeat(50), 20, "!", |head| {
             head.pop();
         });
         assert_eq!(out, format!("{}!", "x".repeat(18)));

@@ -23,6 +23,7 @@ clap-generated help.
 | [`doctor`](#doctor)        | Validate manifests, resolve plugin references, warn on drift.         |
 | [`plugin list`](#plugin-list) | List discovered plugins.                                           |
 | [`plugin invoke`](#plugin-invoke) | Invoke a plugin manually for debugging. *Not implemented yet.* |
+| [`audit verify`](#audit-verify) | Verify the audit log's hash chain and report how far back the guarantee reaches. |
 | [`logs`](#logs)            | Tail the daemon-captured stdout/stderr for one or all agents.         |
 | [`inspect`](#inspect)      | Dump heartbeat + manifest hash + schedule state for one agent.        |
 | [`reload`](#reload)        | Send SIGHUP to the running daemon.                                    |
@@ -507,6 +508,52 @@ echo '{
 
 See [`reference/plugin-protocol.md`](plugin-protocol.md) for the
 payload shape.
+
+---
+
+## `audit verify`
+
+Verify the hash chain in `$DOTAGENT_HOME/audit.log` and print what
+verification could actually establish.
+
+```bash
+dotagent audit verify           # the live audit.log only
+dotagent audit verify --full    # follow the seams back through every segment
+dotagent audit verify --json    # one JSON line, for scripts
+```
+
+The daemon runs the same check at boot, but it only asks yes/no. This
+asks *how far back*, which is the question a rotated log makes real: a
+history the operator pruned must not read the same as one somebody
+beheaded.
+
+**Verdicts:**
+
+| Output | Meaning | Exit |
+|---|---|---|
+| `chain intact from GENESIS` | Every entry still on disk was checked, back to the first line ever written | `0` |
+| `chain intact since <ts>` | Every entry checked links, and the oldest is a **seam** naming where the rest went. The text says whether that segment is still on disk (re-run with `--full`) or gone (retention — or evidence removed; the chain cannot tell those apart) | `0` |
+| `unexplained truncation` | The oldest entry links to a hash nothing accounts for: no `GENESIS`, no seam. The head of the log was removed | `1` |
+| `chain broken at position N` | A link mismatch, or a line nobody can parse, inside the data that is present. Names the segment and both hashes | `1` |
+
+```text
+✗ chain broken at position 42
+  in:       audit.log.20260806T101500
+  expected: c8d2f1…
+  actual:   9a3b07…
+  file:     ~/.config/dotagent/audit.log
+  scope:    full — following seams back through every segment on disk
+  segments: 2 on disk (audit.log.20260806T101500, audit.log.20261104T093000)
+```
+
+Without `--full` the walk stops at the first seam, which is what the
+daemon does at boot — the live file is the only one that changes, so it
+is the cheap check worth running every time. `--full` is the one to run
+when you actually want the guarantee to reach `GENESIS`.
+
+What the chain does and does not prove (short version: it catches partial
+edits, never a total rewrite) is in
+[`security/threat-model.md`](../security/threat-model.md).
 
 ---
 

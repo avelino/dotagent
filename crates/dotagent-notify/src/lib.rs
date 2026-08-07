@@ -44,6 +44,7 @@
 //! API. Every other driver is fully native.
 
 pub mod desktop;
+pub(crate) mod http;
 pub mod imessage;
 pub(crate) mod limits;
 pub mod ntfy;
@@ -69,7 +70,14 @@ pub type Result<T> = std::result::Result<T, NotifyError>;
 /// that `?` no longer compiles, so a driver has to route transport failures
 /// through [`redact::sanitize_reqwest_err`] and the leak stays unrepresentable
 /// rather than merely unwritten.
+///
+/// `#[non_exhaustive]` lands in the same release as that removal, deliberately.
+/// Dropping `Http` is already a breaking change for anyone matching on this
+/// enum, so the one-time cost of adding a `_ =>` arm is being paid right now —
+/// and paying it once buys the next variant for free instead of charging a
+/// second major for it.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum NotifyError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

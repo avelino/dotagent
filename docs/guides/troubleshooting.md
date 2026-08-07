@@ -585,6 +585,20 @@ RUST_LOG=warn dotagent daemon
 
 ## Audit log
 
+### Ask the log what it can still prove
+
+```bash
+dotagent audit verify --full
+```
+
+Start here for anything in this section. It prints one of four verdicts —
+intact from `GENESIS`, intact since a named rotation, unexplained
+truncation, or broken at a position — and exits non-zero for the last
+two. `--json` for scripts. Without `--full` it checks only the live
+`audit.log`, which is what the daemon does at boot.
+
+Full output reference: [`reference/cli.md`](../reference/cli.md#audit-verify).
+
 ### `audit_chain_broken` event in the log
 
 The daemon detected tampering (or a partial write) of `audit.log`. The
@@ -604,13 +618,17 @@ sed -n '40,45p' ~/.config/dotagent/audit.log | jq .
 Cause is almost always:
 
 - Someone (or you) edited the file by hand.
-- A crash mid-write left a half-line.
+- A crash mid-write left a half-line, or bytes cut inside a multibyte
+  character. dotagent steps over that garbage on the next append rather
+  than refusing to write — the line stays on disk and verification keeps
+  reporting it, which is the loud half of the trade.
 - Disk corruption.
 - The head of the file was removed — see the next section, which is the
   one case that is easy to cause by accident.
 
 dotagent continues operating — the new chain is anchored to the broken
-position. Forensics is on you.
+position. Forensics is on you; `dotagent audit verify --full` names the
+position and the segment.
 
 ### `position: 0` with `expected_prev_hash: "GENESIS"`
 

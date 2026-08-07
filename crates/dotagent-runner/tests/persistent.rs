@@ -373,6 +373,13 @@ done
     let pool = PersistentPool::new(Supervisor::with_grace(Duration::from_millis(50)));
 
     run_once(&pool, &f, &state, &[]).await;
+    // stderr is drained by a task of its own, so a line the agent wrote before
+    // its answer has not necessarily reached the ring by the time the answer
+    // is read. The second request's mark is taken the instant it starts; under
+    // load that raced the reader and failed this test roughly one run in ten.
+    // Waiting here tests what the assertion is about — scoping — instead of
+    // how fast the machine is.
+    tokio::time::sleep(Duration::from_millis(250)).await;
     let second = run_once(&pool, &f, &state, &[]).await;
 
     assert!(

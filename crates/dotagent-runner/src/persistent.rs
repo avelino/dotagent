@@ -40,8 +40,12 @@ use tracing::{debug, info, warn};
 use crate::protocol::{HelloFrame, InboundFrame, RequestFrame, TriggerFrame};
 use crate::{tail_lines, RunOutcome, RunSpec, RunnerError, TAIL_LINES, TIMED_OUT_EXIT_CODE};
 
-/// Key used when the manifest declares no `[lifecycle] key`.
+/// Slice used when the manifest declares no `[lifecycle] key`.
 pub const DEFAULT_INSTANCE_KEY: &str = "default";
+
+/// Scope of a run the scheduler dispatched, as opposed to one something
+/// triggered. See [`resolve_key`].
+pub const SCHEDULED_SCOPE: &str = "scheduled";
 
 /// Longest a resolved key may be before it is hashed. Keys land in process
 /// labels and audit entries; a 4 KB chat field should not.
@@ -687,37 +691,19 @@ impl PersistentPool {
     /// sitting idle would only be noticed (and audited) when the next message
     /// arrived, which for an idle conversation could be never.
     pub async fn sweep(&self, audit: Option<&AuditLog>) {
-        let entries: Vec<((String, String), Slot)> = {
-            let slots = self.slots.lock().await;
-            slots
-                .iter()
-                .map(|(k, e)| (k.clone(), e.slot.clone()))
-                .collect()
-        };
-        let mut dead: Vec<(String, String)> = Vec::new();
-        for (key, slot) in entries {
-            // A locked slot has a request in flight — leave it alone.
-            let Ok(mut guard) = slot.try_lock() else {
-                continue;
-            };
-            let exited = match guard.as_mut() {
-                Some(inst) => inst.handle.try_wait().ok().flatten().is_some(),
-                None => true,
-            };
-            if exited {
-                let invocations = guard.as_ref().map(|i| i.invocations).unwrap_or(0);
-                let had_instance = guard.take().is_some();
-                if had_instance {
-                    self.record_recycle(&key.0, &key.1, RecycleReason::Idle, invocations, audit);
-                }
-                dead.push(key);
-            }
-        }
-        if !dead.is_empty() {
+        // Decide and remove under one hold of the map — see [`reap_dead`].
+        // Everything with a cost (terminating, auditing) happens after the
+        // lock is back: `record_recycle` writes to a flocked file, and
+        // dropping an `Instance` deletes its temp dir.
+        let reaped = {
             let mut slots = self.slots.lock().await;
-            for key in dead {
-                slots.remove(&key);
-            }
+            reap_dead(&mut slots)
+        };
+        for (key, instance) in reaped {
+            let Some(inst) = instance else { continue };
+            let invocations = inst.invocations;
+            drop(inst);
+            self.record_recycle(&key.0, &key.1, RecycleReason::Idle, invocations, audit);
         }
     }
 
@@ -773,12 +759,78 @@ impl PersistentPool {
     }
 }
 
+/// Remove every slot whose process is gone, returning what was removed.
+///
+/// Takes the map itself rather than `&self` on purpose. Sweeping used to
+/// snapshot the map, release it, decide, and then take it again to delete —
+/// and a dispatch landing in that gap could create a slot, put a live instance
+/// in it, and have the sweep delete the entry from under it. The instance
+/// stayed alive in an `Arc` nobody could reach: `reload` would not drain it,
+/// `shutdown` would not audit it, `live_count` would not see it, and only
+/// `Supervisor::shutdown` would ever kill it, blindly. Holding the map across
+/// the whole decision makes that gap unrepresentable — hence no `.await` in
+/// here, and none allowed.
+///
+/// A locked slot has a request in flight and is left alone.
+fn reap_dead(
+    slots: &mut HashMap<(String, String), SlotEntry>,
+) -> Vec<((String, String), Option<Instance>)> {
+    let mut reaped = Vec::new();
+    slots.retain(|key, entry| {
+        let Ok(mut guard) = entry.slot.try_lock() else {
+            return true;
+        };
+        let exited = match guard.as_mut() {
+            Some(inst) => inst.handle.try_wait().ok().flatten().is_some(),
+            None => true,
+        };
+        if !exited {
+            return true;
+        }
+        reaped.push((key.clone(), guard.take()));
+        false
+    });
+    reaped
+}
+
 /// Which instance answers this request.
 ///
-/// The key is a *selector over the payload the daemon already attested*, never
-/// something the sender can point anywhere: it names a field, and whatever is
-/// in that field is sanitized before it reaches a process label.
+/// Two parts, `<scope>:<slice>`.
+///
+/// The **slice** is a *selector over the payload the daemon already attested*,
+/// never something the sender can point anywhere: `[lifecycle] key` names a
+/// field, and whatever is in that field is sanitized before it reaches a
+/// process label.
+///
+/// The **scope** is where the request came from, and it exists because the
+/// slice alone collapses to `default` for every agent that does not declare a
+/// `key` — and a scheduled run never carries a payload, so it collapses there
+/// too. A persistent agent with both a `[[schedules]]` entry and a chat would
+/// then put both through one instance and one mutex, and a 1200-second
+/// scheduled run would hold the chat message for its whole duration: exactly
+/// the head-of-line blocking that moving triggers off the tick was meant to
+/// end. Separating them costs one extra process (the ceiling is
+/// `max_instances`, default 8) and buys a chat that answers while a scheduled
+/// run is in flight.
 fn resolve_key(spec: &RunSpec<'_>) -> String {
+    format!("{}:{}", instance_scope(spec), instance_slice(spec))
+}
+
+/// `scheduled` for a run the loop dispatched, `trigger-<source>` for one
+/// something asked for. Sanitized: the source is dotagent's own enum today,
+/// and this string ends up in a process label.
+fn instance_scope(spec: &RunSpec<'_>) -> String {
+    match spec
+        .extra_env
+        .iter()
+        .find(|(k, _)| k == "AGENT_TRIGGER_SOURCE")
+    {
+        Some((_, source)) => format!("trigger-{}", sanitize_key(source)),
+        None => SCHEDULED_SCOPE.to_string(),
+    }
+}
+
+fn instance_slice(spec: &RunSpec<'_>) -> String {
     let Some(field) = spec.manifest.lifecycle.key.as_deref() else {
         return DEFAULT_INSTANCE_KEY.to_string();
     };
@@ -945,5 +997,157 @@ mod tests {
     fn recycle_reasons_render_as_the_documented_strings() {
         assert_eq!(RecycleReason::MaxInvocations.as_str(), "max_invocations");
         assert_eq!(RecycleReason::ConfigChanged.as_str(), "config_changed");
+    }
+
+    // --- which instance answers what ---
+
+    fn manifest(toml_src: &str) -> dotagent_core::AgentManifest {
+        toml::from_str(toml_src).expect("fixture manifest must parse")
+    }
+
+    fn persistent_manifest(key: Option<&str>) -> dotagent_core::AgentManifest {
+        let key_line = key.map(|k| format!("key = \"{k}\"")).unwrap_or_default();
+        manifest(&format!(
+            r#"
+[agent]
+name = "dispatcher"
+[run]
+command = "true"
+[lifecycle]
+mode = "persistent"
+{key_line}
+"#
+        ))
+    }
+
+    fn spec<'a>(
+        m: &'a dotagent_core::AgentManifest,
+        extra_env: &'a [(String, String)],
+    ) -> RunSpec<'a> {
+        RunSpec {
+            manifest: m,
+            manifest_dir: std::path::Path::new("/tmp"),
+            schedule_id: "daily",
+            args: &[],
+            dry_run: false,
+            manifest_sha256: None,
+            slug_override: None,
+            extra_env,
+        }
+    }
+
+    fn telegram_env(payload: &str) -> Vec<(String, String)> {
+        vec![
+            ("AGENT_TRIGGER_SOURCE".into(), "telegram".into()),
+            ("AGENT_TRIGGER_PAYLOAD".into(), payload.into()),
+        ]
+    }
+
+    #[test]
+    fn a_scheduled_run_and_a_chat_never_share_one_instance() {
+        // The regression: without `[lifecycle] key`, both resolved to
+        // "default" — one process, one mutex, and a 1200-second scheduled run
+        // holding every chat message until it finished.
+        let m = persistent_manifest(None);
+        let chat = telegram_env(r#"{"chat_id":12345}"#);
+        assert_ne!(resolve_key(&spec(&m, &chat)), resolve_key(&spec(&m, &[])));
+    }
+
+    #[test]
+    fn a_scheduled_run_and_a_chat_stay_apart_even_with_a_key_declared() {
+        // A declared `key` names a payload field, and a scheduled run carries
+        // no payload — so it lands on the default slice, which is exactly
+        // where a chat with no such field lands too.
+        let m = persistent_manifest(Some("chat_id"));
+        let keyless_chat = telegram_env(r#"{"text":"oi"}"#);
+        assert_ne!(
+            resolve_key(&spec(&m, &keyless_chat)),
+            resolve_key(&spec(&m, &[]))
+        );
+    }
+
+    #[test]
+    fn one_conversation_keeps_one_instance() {
+        let m = persistent_manifest(Some("chat_id"));
+        let first = telegram_env(r#"{"chat_id":12345}"#);
+        let again = telegram_env(r#"{"chat_id":12345,"text":"and another"}"#);
+        let other = telegram_env(r#"{"chat_id":99999}"#);
+
+        assert_eq!(
+            resolve_key(&spec(&m, &first)),
+            resolve_key(&spec(&m, &again))
+        );
+        assert_ne!(
+            resolve_key(&spec(&m, &first)),
+            resolve_key(&spec(&m, &other))
+        );
+        assert!(resolve_key(&spec(&m, &first)).contains("12345"));
+    }
+
+    #[test]
+    fn a_scheduled_key_says_so() {
+        let m = persistent_manifest(None);
+        assert_eq!(
+            resolve_key(&spec(&m, &[])),
+            format!("{SCHEDULED_SCOPE}:{DEFAULT_INSTANCE_KEY}")
+        );
+    }
+
+    #[test]
+    fn a_hostile_source_cannot_shape_the_key() {
+        // The source is dotagent's own enum today. It still lands in a process
+        // label, so it goes through the same sanitizer as the payload slice.
+        let m = persistent_manifest(None);
+        let env = vec![("AGENT_TRIGGER_SOURCE".to_string(), "../../etc".to_string())];
+        let key = resolve_key(&spec(&m, &env));
+        assert!(!key.contains('/'), "{key}");
+        assert!(!key.contains('.'), "{key}");
+    }
+
+    // --- sweeping ---
+
+    fn empty_slot() -> SlotEntry {
+        SlotEntry {
+            slot: Arc::new(Mutex::new(None)),
+            last_used: Instant::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sweep_removes_exactly_what_it_reports() {
+        // Deciding under one hold of the map and deleting under a later one is
+        // what let a sweep remove a slot a concurrent dispatch had just filled.
+        // The signature is the fix; this pins the behaviour it has to keep.
+        let mut slots: HashMap<(String, String), SlotEntry> = HashMap::new();
+        slots.insert(("a".into(), "gone".into()), empty_slot());
+        slots.insert(("a".into(), "also-gone".into()), empty_slot());
+
+        let reaped = reap_dead(&mut slots);
+
+        assert_eq!(reaped.len(), 2);
+        assert!(
+            slots.is_empty(),
+            "every reported key must be gone from the map"
+        );
+        assert!(reaped.iter().all(|(_, inst)| inst.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_sweep_leaves_a_request_in_flight_alone() {
+        let mut slots: HashMap<(String, String), SlotEntry> = HashMap::new();
+        let busy = empty_slot();
+        let held = busy.slot.clone().lock_owned().await;
+        slots.insert(("a".into(), "busy".into()), busy);
+        slots.insert(("a".into(), "gone".into()), empty_slot());
+
+        let reaped = reap_dead(&mut slots);
+
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0].0, ("a".to_string(), "gone".to_string()));
+        assert!(
+            slots.contains_key(&("a".to_string(), "busy".to_string())),
+            "a locked slot is answering something — removing it would strand the instance"
+        );
+        drop(held);
     }
 }
