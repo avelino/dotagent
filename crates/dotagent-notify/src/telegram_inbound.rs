@@ -478,14 +478,14 @@ mod tests {
             {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},
              "text":"quem é thiago avelino?",
              "reply_to_message":{"message_id":8,"chat":{"id":2},
-              "text":"sincroniza calendários pro Buser — última rodada às 19:01"}}}
+              "text":"sincroniza calendários pro cliente — última rodada às 19:01"}}}
         ]}"#;
         let m = &extract(updates_json(raw))[0];
         assert_eq!(m.text, "quem é thiago avelino?");
         assert_eq!(m.text.as_bytes(), "quem é thiago avelino?".as_bytes());
         assert_eq!(
             m.reply_to_text.as_deref(),
-            Some("sincroniza calendários pro Buser — última rodada às 19:01")
+            Some("sincroniza calendários pro cliente — última rodada às 19:01")
         );
         assert!(
             !m.text.contains('Ã') && !m.reply_to_text.as_deref().unwrap().contains('Ã'),
@@ -516,7 +516,7 @@ mod tests {
             {"update_id":1,"message":{"message_id":9,"from":{"id":1},"chat":{"id":2},
              "text":"pq?",
              "reply_to_message":{"message_id":8,"chat":{"id":2},
-              "text":"🚨 calendar-prep-1h/hourly-30 gave up after 2 attempts"}}}
+              "text":"🚨 disk-alert/every-15min gave up after 3 attempts"}}}
         ]}"#;
         let m = &extract(updates_json(raw))[0];
         assert!(m.reply_to_text.as_deref().unwrap().starts_with('🚨'));
