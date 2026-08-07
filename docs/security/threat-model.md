@@ -456,6 +456,20 @@ The seam is what makes retention legible:
 | head of the live file cut off | **unexplained truncation** → `audit_chain_broken`, critical | the seam went with the deleted lines; nothing accounts for the remaining `prev_hash` |
 | a line edited anywhere present | **broken at position N**, naming the segment | hashes stop reproducing |
 | segment truncated at its end | **broken**, seam's `tail_hash` vs. actual | the seam pinned the tail before the segment left |
+| a line nobody can parse | **broken at position N**, naming the segment | an entry that will not deserialize is as much a hole as one that will not hash |
+| a seam graph that loops back on itself | **broken**, naming the segment | rotation only ever writes seams forward; a cycle was assembled |
+
+You read that table with:
+
+```bash
+dotagent audit verify --full        # exits 1 on the rows that say "broken"
+dotagent audit verify --json        # same verdict, one machine-parseable line
+```
+
+The daemon runs the same check at boot, but only over the live file and
+only for yes/no — after the first rotation it never re-reads a rotated
+segment. Everything below the first two rows needs `--full` to be seen.
+Flags and output shapes: [`reference/cli.md`](../reference/cli.md#audit-verify).
 
 Could an attacker forge a seam — write an `audit_log_rotated` entry pointing at
 a segment that never existed, to explain away entries they deleted? Yes. But

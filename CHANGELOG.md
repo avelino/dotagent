@@ -82,12 +82,29 @@ schema and the plugin protocol are flagged in each entry.
   triggered runs never write window state, and every audit append takes an
   exclusive lock. Scheduled runs remain serialized against each other.
 
-  One behaviour change worth knowing: SIGHUP retires persistent instances by
-  waiting for the slot each one holds, so a `dotagent reload` that lands while
-  a triggered request is in flight is applied after it finishes, bounded by
-  that agent's `timeout_seconds`. Previously a reload and a trigger could not
-  overlap at all. Lock order is always `slots` → `slot`, so there is no
-  deadlock.
+  The worker is watched. Its `JoinHandle` is one arm of the loop's `select!`,
+  so a handler that panics stops the daemon — loud, and restarted by
+  launchd/systemd — instead of ending the task, closing the channel, and
+  leaving a permanently deaf bot on a daemon that keeps ticking and reports
+  itself healthy. That is the behaviour a trigger running inline used to have
+  for free.
+
+  SIGHUP retires persistent instances on a task of its own. Draining the pool
+  waits for the slot each instance holds, and a slot busy with a request stays
+  held for that request's whole deadline — awaiting that inline would stop the
+  scheduler ticking, dispatching and summarizing for up to `timeout_seconds`
+  (1200 in one production manifest). Reloads therefore no longer overlap with
+  the loop at all; a request in flight finishes and its instance is retired
+  after. Lock order is always `slots` → `slot`, so there is no deadlock.
+
+  A scheduled run and a triggered one no longer share a persistent instance.
+  The pool key is now `<scope>:<slice>`, where scope is `scheduled` or
+  `trigger-<source>` and slice is the resolved `[lifecycle] key` (or
+  `default`). Without the scope both collapsed to `default` for any agent that
+  declares no `key` — a scheduled run carries no payload to resolve one from —
+  so a 1200-second scheduled run held the chat behind the same per-key mutex,
+  which is the blocking this whole entry is about. `AGENT_PERSIST_KEY` and the
+  `key` field of `persistent_agent_*` audit entries carry the composed value.
 
 - **A daemon that died without shutting down orphaned its children forever.**
   The supervisor holds every deadline in memory. `SIGKILL`, a panic, or
@@ -136,10 +153,17 @@ schema and the plugin protocol are flagged in each entry.
   were corrupted and none were clean.
 
   `dotagent-runner` now names a UTF-8 locale (`en_US.UTF-8` on macOS,
-  `C.UTF-8` elsewhere) when neither `LANG` nor `LC_ALL` reaches the agent. An
-  inherited locale is never overridden and `[env.extra]` still wins over both.
-  Reproduced against fish 3.7.1: `c3 a9` round-trips as `c3 83 c2 a9` under
-  `C`, unchanged under `en_US.UTF-8`.
+  `C.UTF-8` elsewhere) when the agent inherits **no** locale at all — none of
+  `LC_ALL`, `LC_CTYPE` or `LANG`. It is set as **`LC_CTYPE`**, not `LANG`:
+  `MB_CUR_MAX` is the character-type category alone, while `LANG` is the
+  fallback for every category, and moving `LC_COLLATE` to `en_US.UTF-8` on
+  macOS would swap byte ordering for ICU collation — silently changing `sort`,
+  `[[ a < b ]]` and `[a-z]` ranges for every shell agent, on macOS only. An
+  inherited locale is never overridden (POSIX precedence is `LC_ALL` >
+  `LC_CTYPE` > `LANG`, and an `ssh` session forwards `LC_CTYPE` alone), and a
+  manifest naming any locale variable in `[env.extra]` stands the injection
+  down entirely. Reproduced against fish 3.7.1: `c3 a9` round-trips as
+  `c3 83 c2 a9` under `C`, unchanged under `en_US.UTF-8`.
 
 - **An interval agent that gave up stayed dead forever.** `expected_at` for
   `type = "interval"` returned a frozen `last_success + interval`. Once that

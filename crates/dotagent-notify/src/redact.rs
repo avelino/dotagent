@@ -56,8 +56,10 @@ pub(crate) fn sanitize_reqwest_err(driver: &str, e: &reqwest::Error) -> String {
 /// after the last `:` or `/`. That tail is the high-entropy half of both shapes
 /// we handle — `<bot-id>:<token>` and `…/B00000000/<webhook-secret>`.
 ///
-/// Tails under 8 chars are left alone: they over-match ordinary words, and
-/// nothing that short is worth stealing.
+/// Tails under 8 **bytes** are left alone: they over-match ordinary words, and
+/// nothing that short is worth stealing. Bytes rather than characters because
+/// the check is a length floor, not a display width — and every credential
+/// shape this handles is ASCII, where the two are the same number anyway.
 pub(crate) fn redact(text: &str, secret: &str) -> String {
     let secret = secret.trim();
     if secret.is_empty() {

@@ -97,7 +97,7 @@ impl Notifier for PushoverConfig {
         if let Some(p) = self.priority {
             form.push(("priority", p.to_string()));
         }
-        let res = match reqwest::Client::new()
+        let res = match crate::http::client()
             .post(ENDPOINT)
             .form(&form)
             .send()

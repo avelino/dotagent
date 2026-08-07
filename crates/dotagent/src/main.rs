@@ -85,6 +85,12 @@ enum Command {
         command: PluginCommand,
     },
 
+    /// Audit log forensics.
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
+
     /// Tail the daemon-captured logs for an agent.
     ///
     /// Omit `name` to tail logs from every agent at once (each line is
@@ -150,6 +156,26 @@ enum Command {
 }
 
 #[derive(Subcommand, Debug)]
+enum AuditCommand {
+    /// Verify the audit log's hash chain and say how far back the guarantee
+    /// reaches.
+    ///
+    /// Exits 1 when the chain is broken or its head was removed with nothing
+    /// accounting for it. A log that rotated and whose old segments were pruned
+    /// exits 0 — that is a legitimate state, and the output names what is gone.
+    Verify {
+        /// Follow the seams back through every rotated segment still on disk.
+        /// Without it, only the live `audit.log` is checked — which is what the
+        /// daemon does at boot, and it stops at the first seam.
+        #[arg(long)]
+        full: bool,
+        /// Emit the verdict as a single JSON line (stable, machine-parseable).
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum PluginCommand {
     /// List discovered plugins.
     List,
@@ -204,6 +230,9 @@ async fn main() -> Result<()> {
         Command::Install { all, name } => commands::install(all, name).await,
         Command::Uninstall { all, name } => commands::uninstall(all, name).await,
         Command::Doctor => commands::doctor().await,
+        Command::Audit { command } => match command {
+            AuditCommand::Verify { full, json } => commands::audit::verify(full, json),
+        },
         Command::Plugin { command } => match command {
             PluginCommand::List => commands::plugin_list().await,
             PluginCommand::Invoke { name, payload } => commands::plugin_invoke(name, payload).await,

@@ -16,7 +16,7 @@
 //! surfaced, and `Debug` redacts the token explicitly.
 //!
 //! Message bodies are escaped for the configured parse mode and then trimmed
-//! to Telegram's 4096-char cap — in that order, see [`render_body`].
+//! to Telegram's 4096-**UTF-16-unit** cap — in that order, see [`render_body`].
 
 use std::fmt;
 
@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::limits::{truncate_chars_with, TRUNCATION_NOTICE};
+use crate::limits::{truncate_utf16_with, TRUNCATION_NOTICE};
 use crate::redact::scrub_detail;
 use crate::secrets::expand_env;
 use crate::{Notifier, NotifyContext, NotifyError, Result};
@@ -119,14 +119,24 @@ pub(crate) fn escape_markdown_v2(text: &str) -> String {
     out
 }
 
-/// Telegram's hard cap on a single message body.
-pub(crate) const MAX_MESSAGE_CHARS: usize = 4096;
+/// Telegram's hard cap on a single message body — **UTF-16 code units**, not
+/// characters.
+///
+/// Telegram measures message length the way its own protocol does, in UTF-16
+/// (<https://core.telegram.org/api/entities>), so every codepoint outside the
+/// BMP counts twice. 3000 emoji is 3000 characters and 6000 units: a
+/// character-based cap waves it through and Telegram answers
+/// `message is too long`. MarkdownV2 has accidental slack here — its
+/// backslashes are counted locally and stripped by Telegram's parser — but
+/// plain text has none, and plain text is both the default and what a reply
+/// uses.
+pub(crate) const MAX_MESSAGE_UNITS: usize = 4096;
 
 /// Trim to Telegram's limit, saying so rather than silently losing the tail.
 ///
 /// `parse_mode` is the mode `text` was *already* rendered for — see
 /// [`render_body`] for why the order is escape-then-truncate. The cut itself
-/// is [`crate::limits::truncate_chars_with`]; what is Telegram-specific is the
+/// is [`crate::limits::truncate_utf16_with`]; what is Telegram-specific is the
 /// notice needing the same escaping as the body, and the dangling-escape guard.
 pub(crate) fn truncate(text: &str, parse_mode: Option<ParseMode>) -> String {
     let markdown_v2 = matches!(parse_mode, Some(ParseMode::MarkdownV2));
@@ -137,7 +147,7 @@ pub(crate) fn truncate(text: &str, parse_mode: Option<ParseMode>) -> String {
     } else {
         TRUNCATION_NOTICE.to_string()
     };
-    truncate_chars_with(text, MAX_MESSAGE_CHARS, &notice, |head| {
+    truncate_utf16_with(text, MAX_MESSAGE_UNITS, &notice, |head| {
         if !markdown_v2 {
             return;
         }
@@ -155,9 +165,9 @@ pub(crate) fn truncate(text: &str, parse_mode: Option<ParseMode>) -> String {
 /// Render the wire body: escape for the parse mode, then trim to the cap.
 ///
 /// Order matters, and it is escape-first. Escaping inserts a backslash per
-/// reserved char, so it *grows* the text — a body that fits under 4096 before
-/// escaping can blow past it after, which is a 400 the truncation was supposed
-/// to prevent. Trimming the escaped form is the only way to bound what
+/// reserved char, so it *grows* the text — a body that fits under the cap
+/// before escaping can blow past it after, which is a 400 the truncation was
+/// supposed to prevent. Trimming the escaped form is the only way to bound what
 /// actually goes on the wire; the cost is the dangling-escape guard inside
 /// [`truncate`].
 pub(crate) fn render_body(text: &str, parse_mode: Option<ParseMode>) -> String {
@@ -210,21 +220,12 @@ impl Notifier for TelegramConfig {
     }
 }
 
-/// Shared HTTP client.
-///
-/// Built once: the inbound poller holds a `getUpdates` connection open for up
-/// to 50 seconds per iteration, and rebuilding the TLS stack every time (which
-/// is what `Client::new()` per call did) is wasted work on a hot path. The
-/// timeout has to clear the longest long-poll, hence 90s rather than something
-/// tighter.
+/// The client every Telegram call shares — outbound `sendMessage` and the
+/// inbound `getUpdates` long-poll alike. Built once, with a timeout sized for
+/// the poll; see [`crate::http`] for why that sizing keeps it separate from the
+/// client the other drivers use.
 pub(crate) fn client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(90))
-            .build()
-            .unwrap_or_default()
-    })
+    crate::http::long_poll_client()
 }
 
 /// Post one message to an arbitrary chat.
@@ -383,6 +384,13 @@ mod tests {
         false
     }
 
+    /// What Telegram actually counts. Every assertion about the cap has to be
+    /// in these units: `chars()` and UTF-16 agree only inside the BMP, and the
+    /// text where they disagree is exactly the text the cap is there for.
+    fn units(s: &str) -> usize {
+        s.encode_utf16().count()
+    }
+
     // --- truncation -------------------------------------------------------
 
     #[test]
@@ -392,32 +400,52 @@ mod tests {
 
     #[test]
     fn truncate_marks_long_text_and_respects_the_cap() {
-        let long = "x".repeat(MAX_MESSAGE_CHARS + 500);
+        let long = "x".repeat(MAX_MESSAGE_UNITS + 500);
         let out = truncate(&long, None);
         assert!(out.ends_with("[truncated]"));
-        assert!(out.chars().count() <= MAX_MESSAGE_CHARS);
+        assert!(units(&out) <= MAX_MESSAGE_UNITS);
     }
 
     #[test]
-    fn truncate_counts_characters_not_bytes() {
-        // 2 bytes per char: a byte-based cut would slice mid-codepoint.
-        let long = "é".repeat(MAX_MESSAGE_CHARS + 10);
+    fn truncate_counts_units_not_bytes() {
+        // 2 bytes per char, 1 UTF-16 unit each: a byte-based cut would slice
+        // mid-codepoint, and a unit-based one must not trim what fits.
+        let long = "é".repeat(MAX_MESSAGE_UNITS + 10);
         let out = truncate(&long, None);
-        assert!(out.chars().count() <= MAX_MESSAGE_CHARS);
+        assert!(units(&out) <= MAX_MESSAGE_UNITS);
+        assert_eq!(out.chars().count(), MAX_MESSAGE_UNITS);
+    }
+
+    #[test]
+    fn truncate_counts_astral_codepoints_the_way_telegram_does() {
+        // The regression: 3000 emoji is 3000 chars — a character cap waves it
+        // through — and 6000 UTF-16 units on the wire, which is a 400
+        // `message is too long`. Plain text, because plain text is the default
+        // and has none of MarkdownV2's accidental slack.
+        let text = "🚨".repeat(3000);
+        assert_eq!(text.chars().count(), 3000);
+        assert_eq!(units(&text), 6000, "the axis nobody was counting");
+        let out = truncate(&text, None);
+        assert!(
+            units(&out) <= MAX_MESSAGE_UNITS,
+            "{} units on the wire",
+            units(&out)
+        );
+        assert!(out.ends_with("[truncated]"));
     }
 
     #[test]
     fn truncate_escapes_its_own_notice_in_markdown_v2() {
         // "[truncated]" carries reserved chars; an unescaped notice would be
         // the 400 the truncation exists to prevent.
-        let long = "x".repeat(MAX_MESSAGE_CHARS + 1);
+        let long = "x".repeat(MAX_MESSAGE_UNITS + 1);
         let out = truncate(&long, Some(ParseMode::MarkdownV2));
         assert!(
             out.ends_with(r"\[truncated\]"),
             "{}",
             &out[out.len() - 40..]
         );
-        assert!(out.chars().count() <= MAX_MESSAGE_CHARS);
+        assert!(units(&out) <= MAX_MESSAGE_UNITS);
         assert!(!has_dangling_escape(&out));
     }
 
@@ -426,9 +454,9 @@ mod tests {
         // "a-" escapes to "a\-" (3 chars), so the cut boundary lands on the
         // backslash of a pair for this input — exactly the case that would
         // ship invalid markdown and earn another 400.
-        let escaped = escape_markdown_v2(&"a-".repeat(MAX_MESSAGE_CHARS));
+        let escaped = escape_markdown_v2(&"a-".repeat(MAX_MESSAGE_UNITS));
         let out = truncate(&escaped, Some(ParseMode::MarkdownV2));
-        assert!(out.chars().count() <= MAX_MESSAGE_CHARS);
+        assert!(units(&out) <= MAX_MESSAGE_UNITS);
         assert!(!has_dangling_escape(&out), "cut split an escape pair");
     }
 
@@ -436,10 +464,38 @@ mod tests {
     fn truncate_keeps_a_whole_escaped_backslash_pair() {
         // Source backslashes escape to "\\": an even trailing run is content,
         // not a dangling escape, and must survive the cut.
-        let escaped = escape_markdown_v2(&"\\".repeat(MAX_MESSAGE_CHARS));
+        let escaped = escape_markdown_v2(&"\\".repeat(MAX_MESSAGE_UNITS));
         let out = truncate(&escaped, Some(ParseMode::MarkdownV2));
-        assert!(out.chars().count() <= MAX_MESSAGE_CHARS);
+        assert!(units(&out) <= MAX_MESSAGE_UNITS);
         assert!(!has_dangling_escape(&out));
+    }
+
+    #[test]
+    fn truncate_never_dangles_an_escape_at_any_cut_offset() {
+        // The two tests above each pin a *single* cut offset, because their
+        // input is homogeneous. The parity argument they rely on is structural
+        // and holds — but a future change to the escaper would break it without
+        // either test noticing. `limits::bytes_never_slices_a_codepoint` sweeps
+        // a range for the same reason; this is the missing half of that pair.
+        //
+        // `truncate` takes no cap argument, so the sweep moves the *input*
+        // instead: `pad` leading characters shift every downstream offset by
+        // one, and the mixed unit is short enough that 0..120 covers every
+        // alignment of it against the boundary.
+        let unit = escape_markdown_v2("ação-1 \\ b.c 🚨 [x]_y* ~z~ ");
+        let repeats = MAX_MESSAGE_UNITS / unit.encode_utf16().count() + 2;
+        let base = unit.repeat(repeats);
+        assert!(units(&base) > MAX_MESSAGE_UNITS, "input must actually cut");
+        for pad in 0..120 {
+            let text = format!("{}{base}", "x".repeat(pad));
+            let out = truncate(&text, Some(ParseMode::MarkdownV2));
+            assert!(
+                units(&out) <= MAX_MESSAGE_UNITS,
+                "pad {pad} produced {} units",
+                units(&out)
+            );
+            assert!(!has_dangling_escape(&out), "pad {pad} split an escape pair");
+        }
     }
 
     // --- render_body: the escape-then-truncate order ----------------------
@@ -449,21 +505,42 @@ mod tests {
         // Regression for the 113 undelivered alerts: a body under the cap
         // *before* escaping can blow past it after, because every reserved
         // char grows by one. Truncating first would not have caught this.
-        let text = ".".repeat(MAX_MESSAGE_CHARS - 1);
-        assert!(text.chars().count() < MAX_MESSAGE_CHARS);
+        let text = ".".repeat(MAX_MESSAGE_UNITS - 1);
+        assert!(units(&text) < MAX_MESSAGE_UNITS);
         let body = render_body(&text, Some(ParseMode::MarkdownV2));
         assert!(
-            body.chars().count() <= MAX_MESSAGE_CHARS,
-            "escaped body is {} chars",
-            body.chars().count()
+            units(&body) <= MAX_MESSAGE_UNITS,
+            "escaped body is {} units",
+            units(&body)
         );
         assert!(!has_dangling_escape(&body));
     }
 
     #[test]
+    fn render_body_fits_the_cap_on_astral_text_at_any_offset() {
+        // End-to-end sweep of escape-then-truncate over text where chars and
+        // UTF-16 units disagree — the interaction the two guards only cover
+        // separately.
+        let unit = "🚨 falha-1. ação 🔥 ";
+        let base = unit.repeat(MAX_MESSAGE_UNITS);
+        for pad in 0..120 {
+            let text = format!("{}{base}", "🔥".repeat(pad));
+            for mode in [None, Some(ParseMode::MarkdownV2)] {
+                let body = render_body(&text, mode);
+                assert!(
+                    units(&body) <= MAX_MESSAGE_UNITS,
+                    "pad {pad} / {mode:?} produced {} units",
+                    units(&body)
+                );
+                assert!(!has_dangling_escape(&body), "pad {pad} / {mode:?}");
+            }
+        }
+    }
+
+    #[test]
     fn render_body_truncates_plain_text_too() {
-        let body = render_body(&"x".repeat(MAX_MESSAGE_CHARS * 2), None);
-        assert!(body.chars().count() <= MAX_MESSAGE_CHARS);
+        let body = render_body(&"x".repeat(MAX_MESSAGE_UNITS * 2), None);
+        assert!(units(&body) <= MAX_MESSAGE_UNITS);
         assert!(body.ends_with("[truncated]"));
     }
 

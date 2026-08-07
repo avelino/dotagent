@@ -20,31 +20,55 @@
 //!
 //! 1. **Group leadership.** Every supervised spawn gets `setpgid(0, 0)`, so
 //!    `pgid == pid`. A recycled pid that is not its own group leader is out.
-//! 2. **Start time.** The OS-reported start must match the recorded one within
-//!    [`DEFAULT_START_TOLERANCE`]. A process that inherited the number started
-//!    later — after the old daemon died, which is after the record was written.
+//! 2. **Start time.** The window is deliberately *asymmetric* — see
+//!    [`DEFAULT_START_TOLERANCE`] and [`START_FORWARD_TOLERANCE`].
 //! 3. **Command.** The observed command line must be consistent with the one
-//!    that was spawned.
+//!    that was spawned, down to the script — not merely to the interpreter.
 //!
 //! All three must pass. Anything missing, ambiguous, or unparseable is a
 //! **skip**, never a kill: leaving one orphan alive costs memory, and killing
 //! the wrong process costs somebody's work.
+//!
+//! Identity is proved **twice**: once to decide who gets a `SIGTERM`, and
+//! again after the grace window, before anything is escalated to `SIGKILL`.
+//! An orphan has been reparented to init, which `waitpid`s it the instant it
+//! dies, so a pid the `SIGTERM` freed is immediately available to somebody
+//! else. The whole point of the grace window is that the process exits during
+//! it, which makes the first proof stale exactly when it matters most.
 
 use std::path::Path;
 use std::time::Duration;
 
-use chrono::{DateTime, Local, NaiveDateTime};
+use chrono::{DateTime, Local, NaiveDateTime, TimeDelta};
 use tracing::warn;
 
 use crate::{signal, ProcessInfo, DEFAULT_KILL_GRACE};
 
-/// How far the OS-reported start time may differ from the recorded one.
+/// How much *earlier* than the record the OS-reported start may be.
 ///
 /// The record is stamped after `spawn()` returns, so the OS value is always
-/// slightly *earlier*; `ps` also reports whole seconds. Five seconds absorbs
-/// both without being wide enough to matter — a pid can only be reused after
-/// wrapping the whole pid space, which does not happen in five seconds.
+/// slightly earlier; `ps` also truncates to whole seconds, pushing it earlier
+/// still. Five seconds absorbs both, plus a small NTP step.
 pub const DEFAULT_START_TOLERANCE: Duration = Duration::from_secs(5);
+
+/// How much *later* than the record the OS-reported start may be.
+///
+/// Almost none, and that asymmetry is the whole point. `record.started_at` is
+/// taken after `spawn()` returns, so a genuine process always started before
+/// it. A recycled pid is the opposite by construction: it only exists because
+/// the original died, and the original died *after* its record was written —
+/// so every impostor sits on the positive side. A symmetric window would
+/// donate exactly the region where no legitimate process is ever found and
+/// every impostor is.
+///
+/// One second, not zero, because `ps` reports whole seconds and a clock step
+/// can land the wrong side of a boundary.
+pub const START_FORWARD_TOLERANCE: Duration = Duration::from_secs(1);
+
+/// How long to wait for a `SIGKILL`ed group to actually disappear before
+/// admitting it did not.
+const KILL_CONFIRM_ATTEMPTS: u32 = 20;
+const KILL_CONFIRM_INTERVAL: Duration = Duration::from_millis(25);
 
 /// What the OS says about a live pid right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +79,23 @@ pub struct ProcessFacts {
     pub command: String,
 }
 
+/// What one probe of a pid found.
+///
+/// "The OS said nothing I could read" and "there is no such process" are
+/// different answers with different consequences, so they are different
+/// variants. Collapsing them is how a broken parser turns into a reaper that
+/// believes every pid is free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Probed {
+    /// `ps` answered and the line parsed. Here is what it says.
+    Facts(ProcessFacts),
+    /// `ps` answered — so the pid *is* alive — but the line did not parse.
+    /// Alive-but-unidentifiable is never a licence to signal.
+    Unreadable,
+    /// `ps` found nothing. The pid is free.
+    Gone,
+}
+
 /// Why a recorded process was left alone. Every variant means "did not
 /// signal anything".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +104,9 @@ pub enum SkipReason {
     Unusable,
     /// No such process — it already exited. The common case.
     Gone,
+    /// A process is there, but the OS description of it did not parse. Not
+    /// the same as [`SkipReason::Gone`], and not something to signal.
+    Unreadable,
     /// The live process is not its own group leader, so it is not ours.
     NotGroupLeader,
     /// The live process started at a different time than the record says.
@@ -78,6 +122,7 @@ impl std::fmt::Display for SkipReason {
         let s = match self {
             SkipReason::Unusable => "unusable_record",
             SkipReason::Gone => "already_gone",
+            SkipReason::Unreadable => "unreadable_process",
             SkipReason::NotGroupLeader => "not_group_leader",
             SkipReason::StartTimeMismatch => "start_time_mismatch",
             SkipReason::CommandMismatch => "command_mismatch",
@@ -107,8 +152,14 @@ pub struct ReapedOrphan {
 /// Everything one boot-time sweep did, and everything it deliberately did not.
 #[derive(Debug, Clone, Default)]
 pub struct OrphanReport {
+    /// Signalled *and observed gone afterwards*. This is what feeds the audit
+    /// log, which is a record of what happened — not of what was attempted.
     pub reaped: Vec<ReapedOrphan>,
     pub skipped: Vec<(ProcessInfo, SkipReason)>,
+    /// Signalled, but still alive at the end of the sweep — or the signal
+    /// itself failed (`EPERM`), or the pid stopped looking like ours during
+    /// the grace window so the escalation was called off.
+    pub survived: Vec<(ProcessInfo, String)>,
     /// Set when the snapshot itself could not be read or parsed. Nothing is
     /// signalled in that case — a corrupt registry is exactly when guessing
     /// is most expensive.
@@ -117,12 +168,15 @@ pub struct OrphanReport {
 
 impl OrphanReport {
     pub fn is_empty(&self) -> bool {
-        self.reaped.is_empty() && self.skipped.is_empty() && self.snapshot_error.is_none()
+        self.reaped.is_empty()
+            && self.skipped.is_empty()
+            && self.survived.is_empty()
+            && self.snapshot_error.is_none()
     }
 }
 
-type ProbeFn = Box<dyn Fn(u32) -> Option<ProcessFacts> + Send + Sync>;
-type KillFn = Box<dyn Fn(i32, i32) + Send + Sync>;
+type ProbeFn = Box<dyn Fn(u32) -> Probed + Send + Sync>;
+type KillFn = Box<dyn Fn(i32, i32) -> std::io::Result<()> + Send + Sync>;
 
 /// Sweeps a previous daemon's snapshot and kill-trees whatever is still alive
 /// *and provably ours*.
@@ -157,10 +211,8 @@ impl Default for OrphanReaper {
 impl OrphanReaper {
     pub fn new() -> Self {
         Self {
-            probe: Box::new(process_facts),
-            kill: Box::new(|pgid, sig| {
-                let _ = signal::killpg(pgid, sig);
-            }),
+            probe: Box::new(probe_process),
+            kill: Box::new(signal::killpg),
             grace: DEFAULT_KILL_GRACE,
             tolerance: DEFAULT_START_TOLERANCE,
             self_pid: std::process::id(),
@@ -171,7 +223,7 @@ impl OrphanReaper {
     #[must_use]
     pub fn with_probe<F>(mut self, f: F) -> Self
     where
-        F: Fn(u32) -> Option<ProcessFacts> + Send + Sync + 'static,
+        F: Fn(u32) -> Probed + Send + Sync + 'static,
     {
         self.probe = Box::new(f);
         self
@@ -179,10 +231,13 @@ impl OrphanReaper {
 
     /// Replace the signal call. Test affordance — a test that asserts "this
     /// pid must NOT be killed" needs to observe the absence of the call.
+    ///
+    /// The result is not decorative: a `killpg` that fails with `EPERM` means
+    /// nothing was signalled, and the report must not claim otherwise.
     #[must_use]
     pub fn with_killer<F>(mut self, f: F) -> Self
     where
-        F: Fn(i32, i32) + Send + Sync + 'static,
+        F: Fn(i32, i32) -> std::io::Result<()> + Send + Sync + 'static,
     {
         self.kill = Box::new(f);
         self
@@ -227,20 +282,30 @@ impl OrphanReaper {
     }
 
     /// Classify every record, then kill-tree the confirmed ones:
-    /// `SIGTERM` to each group, one shared grace window, then `SIGKILL`.
+    /// `SIGTERM` to each group, one shared grace window, then — for whatever
+    /// is *still provably ours* — `SIGKILL`.
     pub async fn reap(&self, records: &[ProcessInfo]) -> OrphanReport {
         let mut report = OrphanReport::default();
         let mut victims: Vec<(ProcessInfo, i32)> = Vec::new();
 
         for record in records {
-            let facts = if usable(record, self.self_pid) {
-                (self.probe)(record.pid)
-            } else {
-                None
-            };
-            match classify(record, facts.as_ref(), self.self_pid, self.tolerance) {
+            match classify(
+                record,
+                &self.probe_record(record),
+                self.self_pid,
+                self.tolerance,
+            ) {
                 Verdict::Reap { pgid } => victims.push((record.clone(), pgid)),
-                Verdict::Skip(reason) => report.skipped.push((record.clone(), reason)),
+                Verdict::Skip(reason) => {
+                    if reason == SkipReason::Unreadable {
+                        warn!(
+                            pid = record.pid,
+                            label = %record.label,
+                            "a process holds this pid but the OS description did not parse — left alone"
+                        );
+                    }
+                    report.skipped.push((record.clone(), reason));
+                }
             }
         }
 
@@ -248,7 +313,8 @@ impl OrphanReaper {
             return report;
         }
 
-        for (info, pgid) in &victims {
+        let mut signalled: Vec<(ProcessInfo, i32)> = Vec::new();
+        for (info, pgid) in victims {
             warn!(
                 pid = info.pid,
                 pgid,
@@ -259,16 +325,88 @@ impl OrphanReaper {
                 deadline_seconds = info.deadline_seconds,
                 "orphan from a previous daemon — sending SIGTERM to its process group"
             );
-            (self.kill)(*pgid, signal::SIGTERM);
+            match (self.kill)(pgid, signal::SIGTERM) {
+                Ok(()) => signalled.push((info, pgid)),
+                Err(e) => {
+                    warn!(pid = info.pid, pgid, error = %e, "SIGTERM was refused");
+                    report.survived.push((info, format!("SIGTERM failed: {e}")));
+                }
+            }
+        }
+
+        if signalled.is_empty() {
+            return report;
         }
 
         tokio::time::sleep(self.grace).await;
 
-        for (info, pgid) in victims {
-            (self.kill)(pgid, signal::SIGKILL);
-            report.reaped.push(ReapedOrphan { info, pgid });
+        for (info, pgid) in signalled {
+            self.escalate(info, pgid, &mut report).await;
         }
         report
+    }
+
+    /// The grace window has elapsed. Prove identity *again* before escalating.
+    async fn escalate(&self, info: ProcessInfo, pgid: i32, report: &mut OrphanReport) {
+        match classify(
+            &info,
+            &self.probe_record(&info),
+            self.self_pid,
+            self.tolerance,
+        ) {
+            // The SIGTERM did the job. The pid is free — which is exactly why
+            // it must not be signalled again.
+            Verdict::Skip(SkipReason::Gone) => report.reaped.push(ReapedOrphan { info, pgid }),
+            Verdict::Reap { .. } => match (self.kill)(pgid, signal::SIGKILL) {
+                Ok(()) if self.confirm_gone(info.pid).await => {
+                    report.reaped.push(ReapedOrphan { info, pgid })
+                }
+                Ok(()) => {
+                    warn!(pid = info.pid, pgid, "still alive after SIGKILL");
+                    report
+                        .survived
+                        .push((info, "still alive after SIGKILL".into()));
+                }
+                Err(e) => {
+                    warn!(pid = info.pid, pgid, error = %e, "SIGKILL was refused");
+                    report.survived.push((info, format!("SIGKILL failed: {e}")));
+                }
+            },
+            // Something answers to this pid, but it is no longer the process
+            // we proved before the SIGTERM. Escalating now would kill it.
+            Verdict::Skip(reason) => {
+                warn!(
+                    pid = info.pid,
+                    pgid,
+                    reason = %reason,
+                    "pid stopped matching during the grace window — not escalating to SIGKILL"
+                );
+                report
+                    .survived
+                    .push((info, format!("identity changed during grace: {reason}")));
+            }
+        }
+    }
+
+    fn probe_record(&self, record: &ProcessInfo) -> Probed {
+        if usable(record, self.self_pid) {
+            (self.probe)(record.pid)
+        } else {
+            Probed::Gone
+        }
+    }
+
+    /// Did the `SIGKILL` actually land? Signal delivery is asynchronous, so a
+    /// single immediate probe would report a live process that is already on
+    /// its way out.
+    async fn confirm_gone(&self, pid: u32) -> bool {
+        for _ in 0..KILL_CONFIRM_ATTEMPTS {
+            if (self.probe)(pid) == Probed::Gone {
+                return true;
+            }
+            tokio::time::sleep(KILL_CONFIRM_INTERVAL).await;
+        }
+        false
     }
 }
 
@@ -283,7 +421,7 @@ fn usable(record: &ProcessInfo, self_pid: u32) -> bool {
 /// is the part that gets tested directly.
 pub fn classify(
     record: &ProcessInfo,
-    facts: Option<&ProcessFacts>,
+    probed: &Probed,
     self_pid: u32,
     tolerance: Duration,
 ) -> Verdict {
@@ -303,14 +441,21 @@ pub fn classify(
     if pgid != record.pid as i32 {
         return Verdict::Skip(SkipReason::Ambiguous);
     }
-    let Some(facts) = facts else {
-        return Verdict::Skip(SkipReason::Gone);
+    let facts = match probed {
+        Probed::Facts(f) => f,
+        Probed::Unreadable => return Verdict::Skip(SkipReason::Unreadable),
+        Probed::Gone => return Verdict::Skip(SkipReason::Gone),
     };
     if facts.pgid != pgid {
         return Verdict::Skip(SkipReason::NotGroupLeader);
     }
-    let drift = (facts.started_at - record.started_at).abs();
-    if drift.to_std().map(|d| d > tolerance).unwrap_or(true) {
+    // Positive means the OS says it started *before* the record was stamped,
+    // which is where every genuine process lives. See the two tolerance
+    // constants: the window is asymmetric on purpose.
+    let behind = record.started_at - facts.started_at;
+    let forward = TimeDelta::from_std(START_FORWARD_TOLERANCE).unwrap_or(TimeDelta::MAX);
+    let backward = TimeDelta::from_std(tolerance).unwrap_or(TimeDelta::MAX);
+    if behind < -forward || behind > backward {
         return Verdict::Skip(SkipReason::StartTimeMismatch);
     }
     if !command_matches(&record.command, &facts.command) {
@@ -321,13 +466,26 @@ pub fn classify(
 
 /// Is the observed command line consistent with the one we spawned?
 ///
-/// Two ways to agree, because one alone has a known blind spot:
+/// The interpreter alone proves nothing. Every agent in this project is some
+/// flavour of `fish agent.fish`, and the user's login shell is also `fish` —
+/// and, being a session leader, it satisfies the process-group axis too. Since
+/// the kill is a `killpg`, "same program name" as a sufficient condition means
+/// the reaper can take down the user's whole working session.
 ///
-/// - Same program basename. Handles the ordinary case (`fish …` stays `fish`).
-/// - The observed line mentions the recorded first argument. Handles exec
-///   shims — `/usr/bin/env python3 agent.py` shows up as `python3 agent.py`,
-///   where the basenames differ but the script path is right there and is far
-///   more identifying than the interpreter anyway.
+/// So two things must hold:
+///
+/// 1. **The program is one this record names.** Same basename, or the observed
+///    program appears as a token in the recorded line — which is what an exec
+///    shim looks like: `/usr/bin/env python3 agent.py` runs as
+///    `python3 agent.py`.
+/// 2. **The identifying token is there, verbatim, as a whole token.** That is
+///    the last recorded token that looks like a path: the script, not the
+///    interpreter. `contains()` would not do — an unanchored substring match
+///    lets `vim /agents/x/agent.py` pass for the agent it is editing.
+///
+/// When the recorded line has no path-shaped token at all (`sleep 120`), there
+/// is nothing more identifying than the arguments themselves, so they must
+/// match exactly.
 ///
 /// Anything else is a mismatch, and a mismatch is a skip.
 fn command_matches(recorded: &str, observed: &str) -> bool {
@@ -336,13 +494,32 @@ fn command_matches(recorded: &str, observed: &str) -> bool {
     let (Some(rec_prog), Some(obs_prog)) = (rec.first(), obs.first()) else {
         return false;
     };
-    if basename(rec_prog) == basename(obs_prog) {
+
+    let program_is_named = basename(rec_prog) == basename(obs_prog)
+        || rec.iter().any(|t| basename(t) == basename(obs_prog));
+    if !program_is_named {
+        return false;
+    }
+
+    match rec.iter().rev().find(|t| looks_like_path(t)) {
+        Some(anchor) => obs.iter().any(|t| t == anchor),
+        None => rec[1..] == obs[1..],
+    }
+}
+
+/// Does this token look like something on the filesystem — a script, a binary,
+/// a data file — rather than a flag or a bare word?
+fn looks_like_path(token: &str) -> bool {
+    if token.starts_with('-') {
+        return false;
+    }
+    if token.contains('/') {
         return true;
     }
-    match rec.get(1) {
-        Some(arg) if !arg.is_empty() => observed.contains(arg),
-        _ => false,
-    }
+    // `agent.fish`, `index.js`: a relative script still names a file.
+    token.rsplit_once('.').is_some_and(|(stem, ext)| {
+        !stem.is_empty() && !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric())
+    })
 }
 
 fn basename(path: &str) -> &str {
@@ -352,9 +529,36 @@ fn basename(path: &str) -> &str {
 /// Does a process with this pid exist right now?
 ///
 /// Used by the daemon to decide whether another instance of itself is alive
-/// before it touches anything a previous one recorded.
+/// before it touches anything a previous one recorded. Deliberately answered
+/// by `ps`'s exit status alone: the question is "did the OS find the pid",
+/// not "could I read every field it printed". Tying liveness to a successful
+/// parse means one bad `ps` line silently retires the peer-daemon guard.
+#[cfg(unix)]
 pub fn process_exists(pid: u32) -> bool {
-    process_facts(pid).is_some()
+    ps_command(pid)
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+pub fn process_exists(_pid: u32) -> bool {
+    false
+}
+
+/// The `ps` invocation both probes share.
+///
+/// `LC_ALL=C` is load-bearing, not hygiene. `lstart` is rendered through the
+/// locale's `%c`, so a daemon started from a terminal with, say,
+/// `LC_TIME=pt_BR.UTF-8` gets `sex  7 ago 05:30:03 2026` — a different month
+/// name *and* a different field order. The parse then fails for every pid,
+/// which fails safe here but turns the whole feature into a silent no-op.
+#[cfg(unix)]
+fn ps_command(pid: u32) -> std::process::Command {
+    let mut cmd = std::process::Command::new("ps");
+    cmd.env("LC_ALL", "C")
+        .args(["-o", "pgid=,lstart=,command=", "-p", &pid.to_string()]);
+    cmd
 }
 
 /// Ask the OS about a pid via `ps`.
@@ -365,29 +569,36 @@ pub fn process_exists(pid: u32) -> bool {
 /// orchestrated subprocess, it is a probe — the same category as `osascript`
 /// inside a notify driver.
 #[cfg(unix)]
-pub fn process_facts(pid: u32) -> Option<ProcessFacts> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "pgid=,lstart=,command=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+pub fn probe_process(pid: u32) -> Probed {
+    let Ok(out) = ps_command(pid).output() else {
+        // We could not even run `ps`. That is not evidence the pid is free.
+        warn!(pid, "could not run ps — treating the pid as unreadable");
+        return Probed::Unreadable;
+    };
     if !out.status.success() {
-        return None;
+        return Probed::Gone;
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    parse_ps_line(text.lines().next()?)
+    match text.lines().next().and_then(parse_ps_line) {
+        Some(facts) => Probed::Facts(facts),
+        None => {
+            warn!(pid, "ps found the pid but its output did not parse");
+            Probed::Unreadable
+        }
+    }
 }
 
 #[cfg(not(unix))]
-pub fn process_facts(_pid: u32) -> Option<ProcessFacts> {
-    None
+pub fn probe_process(_pid: u32) -> Probed {
+    Probed::Unreadable
 }
 
 /// Parse one `ps -o pgid=,lstart=,command=` line.
 ///
-/// `lstart` is five whitespace-separated tokens on both macOS and Linux
-/// (`Fri Aug  7 05:30:03 2026`). The weekday is dropped rather than parsed —
-/// it carries no information the rest of the stamp does not, and skipping it
-/// sidesteps locale.
+/// `lstart` is five whitespace-separated tokens (`Fri Aug  7 05:30:03 2026`)
+/// once the locale is pinned to `C` — see [`ps_command`]. The weekday is
+/// dropped rather than parsed: it carries no information the rest of the stamp
+/// does not.
 pub(crate) fn parse_ps_line(line: &str) -> Option<ProcessFacts> {
     let mut it = line.split_whitespace();
     let pgid: i32 = it.next()?.parse().ok()?;
@@ -414,6 +625,7 @@ mod tests {
     use super::*;
     use crate::{ProcessKind, ProcessOwner};
     use chrono::TimeZone;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn at(secs: i64) -> DateTime<Local> {
         Local.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
@@ -453,7 +665,7 @@ mod tests {
         let rec = record(2115, at(0));
         let f = facts(2115, at(0), "fish /agents/telegram-assistant/agent.fish");
         assert_eq!(
-            classify(&rec, Some(&f), 999, TOL),
+            classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Reap { pgid: 2115 }
         );
     }
@@ -470,7 +682,7 @@ mod tests {
             "fish /agents/telegram-assistant/agent.fish",
         );
         assert_eq!(
-            classify(&rec, Some(&f), 999, TOL),
+            classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Skip(SkipReason::StartTimeMismatch)
         );
     }
@@ -482,9 +694,51 @@ mod tests {
         // gives it away. This is the case pid-recycling-under-load produces.
         let f = facts(2115, at(1), "/usr/bin/postgres -D /var/db");
         assert_eq!(
-            classify(&rec, Some(&f), 999, TOL),
+            classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Skip(SkipReason::CommandMismatch)
         );
+    }
+
+    /// BLOCKER 1 (red before the fix).
+    #[test]
+    fn a_process_that_started_after_the_record_is_never_killed() {
+        let rec = record(2115, at(0));
+        let f = facts(2115, at(3), "fish /agents/telegram-assistant/agent.fish");
+        assert_eq!(
+            classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
+            Verdict::Skip(SkipReason::StartTimeMismatch)
+        );
+    }
+
+    /// BLOCKER 2a (red before the fix).
+    #[test]
+    fn the_login_shell_is_never_killed() {
+        let rec = record(2115, at(0));
+        let f = facts(2115, at(0), "fish");
+        assert_eq!(
+            classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
+            Verdict::Skip(SkipReason::CommandMismatch)
+        );
+    }
+
+    /// BLOCKER 2b (red before the fix).
+    #[test]
+    fn same_interpreter_different_script_is_never_killed() {
+        for (recorded, observed) in [
+            ("fish /agents/a/agent.fish", "fish /agents/b/agent.fish"),
+            ("bash /agents/a/run.sh", "bash /agents/b/run.sh"),
+            ("python3 /agents/a/agent.py", "python3 /agents/b/agent.py"),
+            ("node /agents/a/index.js", "node /agents/b/index.js"),
+        ] {
+            let mut rec = record(2115, at(0));
+            rec.command = recorded.into();
+            let f = facts(2115, at(0), observed);
+            assert_eq!(
+                classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
+                Verdict::Skip(SkipReason::CommandMismatch),
+                "{recorded:?} must not match {observed:?}"
+            );
+        }
     }
 
     #[test]
@@ -493,7 +747,7 @@ mod tests {
         let mut f = facts(2115, at(0), "fish /agents/telegram-assistant/agent.fish");
         f.pgid = 900;
         assert_eq!(
-            classify(&rec, Some(&f), 999, TOL),
+            classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Skip(SkipReason::NotGroupLeader)
         );
     }
@@ -502,7 +756,7 @@ mod tests {
     fn gone_process_is_a_skip_not_an_error() {
         let rec = record(2115, at(0));
         assert_eq!(
-            classify(&rec, None, 999, TOL),
+            classify(&rec, &Probed::Gone, 999, TOL),
             Verdict::Skip(SkipReason::Gone)
         );
     }
@@ -513,14 +767,14 @@ mod tests {
         rec.pgid = None;
         let f = facts(2115, at(0), "fish /agents/telegram-assistant/agent.fish");
         assert_eq!(
-            classify(&rec, Some(&f), 999, TOL),
+            classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Skip(SkipReason::Ambiguous)
         );
 
         let mut rec = record(2115, at(0));
         rec.command = String::new();
         assert_eq!(
-            classify(&rec, Some(&f), 999, TOL),
+            classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Skip(SkipReason::Ambiguous)
         );
     }
@@ -532,7 +786,7 @@ mod tests {
         let mut f = facts(2115, at(0), "fish /agents/telegram-assistant/agent.fish");
         f.pgid = 900;
         assert_eq!(
-            classify(&rec, Some(&f), 999, TOL),
+            classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Skip(SkipReason::Ambiguous)
         );
     }
@@ -554,7 +808,7 @@ mod tests {
         assert_eq!(records[0].command, "");
         let f = facts(2115, records[0].started_at, "fish agent.fish");
         assert_eq!(
-            classify(&records[0], Some(&f), 999, TOL),
+            classify(&records[0], &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Skip(SkipReason::Ambiguous)
         );
     }
@@ -563,11 +817,11 @@ mod tests {
     fn own_pid_and_init_are_never_touched() {
         let f = facts(1, at(0), "fish /agents/telegram-assistant/agent.fish");
         assert_eq!(
-            classify(&record(1, at(0)), Some(&f), 999, TOL),
+            classify(&record(1, at(0)), &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Skip(SkipReason::Unusable)
         );
         assert_eq!(
-            classify(&record(999, at(0)), Some(&f), 999, TOL),
+            classify(&record(999, at(0)), &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Skip(SkipReason::Unusable)
         );
     }
@@ -578,13 +832,13 @@ mod tests {
         rec.command = "/usr/bin/env python3 /agents/x/agent.py".into();
         let f = facts(2115, at(0), "python3 /agents/x/agent.py");
         assert_eq!(
-            classify(&rec, Some(&f), 999, TOL),
+            classify(&rec, &Probed::Facts(f.clone()), 999, TOL),
             Verdict::Reap { pgid: 2115 }
         );
     }
 
     #[test]
-    fn ps_line_parses_on_this_platform() {
+    fn ps_line_parses_the_documented_shape() {
         let f = parse_ps_line("  497   Fri Aug  7 05:30:03 2026 /bin/zsh -c echo hi").unwrap();
         assert_eq!(f.pgid, 497);
         assert_eq!(f.command, "/bin/zsh -c echo hi");
@@ -592,6 +846,40 @@ mod tests {
             f.started_at.format("%Y-%m-%d %H:%M:%S").to_string(),
             "2026-08-07 05:30:03"
         );
+    }
+
+    /// The literal above proves the parser understands a string we wrote. It
+    /// would pass just as happily on a machine whose `ps` prints something
+    /// else entirely. Ask the real `ps` about the one pid we are certain
+    /// exists — our own.
+    #[cfg(unix)]
+    #[test]
+    fn ps_describes_this_very_process_on_this_platform() {
+        let me = std::process::id();
+        assert!(process_exists(me), "our own pid must be visible to ps");
+        match probe_process(me) {
+            Probed::Facts(f) => {
+                assert!(f.pgid > 0, "pgid: {}", f.pgid);
+                assert!(!f.command.is_empty());
+                assert!(
+                    f.started_at <= Local::now(),
+                    "a process cannot start in the future: {}",
+                    f.started_at
+                );
+            }
+            other => panic!("ps could not describe our own pid: {other:?}"),
+        }
+    }
+
+    /// The locale fix is only observable in the command we build — pinning it
+    /// is what keeps `lstart` in the one format [`parse_ps_line`] knows.
+    #[cfg(unix)]
+    #[test]
+    fn the_ps_probe_pins_the_locale() {
+        let has_lc_all = ps_command(1)
+            .get_envs()
+            .any(|(k, v)| k == "LC_ALL" && v == Some("C".as_ref()));
+        assert!(has_lc_all, "ps must run under LC_ALL=C");
     }
 
     #[test]
@@ -610,7 +898,10 @@ mod tests {
         let killed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(i32, i32)>::new()));
         let sink = killed.clone();
         let report = OrphanReaper::new()
-            .with_killer(move |pgid, sig| sink.lock().unwrap().push((pgid, sig)))
+            .with_killer(move |pgid, sig| {
+                sink.lock().unwrap().push((pgid, sig));
+                Ok(())
+            })
             .reap_snapshot_file(&path)
             .await;
 
@@ -650,24 +941,33 @@ mod tests {
 
         let killed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(i32, i32)>::new()));
         let sink = killed.clone();
+        let alive = std::sync::Arc::new(AtomicBool::new(true));
+        let probe_alive = alive.clone();
+        let kill_alive = alive.clone();
+
         let report = OrphanReaper::new()
             .with_grace(Duration::from_millis(1))
-            .with_probe(|pid| match pid {
-                3001 => Some(facts(
+            .with_probe(move |pid| match pid {
+                3001 if probe_alive.load(Ordering::SeqCst) => Probed::Facts(facts(
                     3001,
                     at(0),
                     "fish /agents/telegram-assistant/agent.fish",
                 )),
                 // Same pid the record names, but it is a different process now.
-                3002 => Some(facts(3002, at(50_000), "vim notes.md")),
-                _ => None,
+                3002 => Probed::Facts(facts(3002, at(50_000), "vim notes.md")),
+                _ => Probed::Gone,
             })
-            .with_killer(move |pgid, sig| sink.lock().unwrap().push((pgid, sig)))
+            .with_killer(move |pgid, sig| {
+                kill_alive.store(false, Ordering::SeqCst);
+                sink.lock().unwrap().push((pgid, sig));
+                Ok(())
+            })
             .reap_snapshot_file(&path)
             .await;
 
         assert_eq!(report.reaped.len(), 1);
         assert_eq!(report.reaped[0].info.pid, 3001);
+        assert!(report.survived.is_empty());
         assert_eq!(
             report
                 .skipped
@@ -679,10 +979,132 @@ mod tests {
                 (3003, SkipReason::Gone)
             ]
         );
+        assert_eq!(*killed.lock().unwrap(), vec![(3001, signal::SIGTERM)]);
+    }
+
+    /// BLOCKER 3 (red before the fix): the SIGTERM worked, so by the time the
+    /// grace window ends nothing holds that pid. Sending SIGKILL anyway aims
+    /// at a number the OS is free to have handed to somebody else.
+    #[tokio::test]
+    async fn sigkill_is_not_sent_to_a_pid_the_sigterm_already_freed() {
+        let alive = std::sync::Arc::new(AtomicBool::new(true));
+        let probe_alive = alive.clone();
+        let kill_alive = alive.clone();
+
+        let killed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(i32, i32)>::new()));
+        let sink = killed.clone();
+
+        let report = OrphanReaper::new()
+            .with_grace(Duration::from_millis(1))
+            .with_probe(move |pid| {
+                if probe_alive.load(Ordering::SeqCst) {
+                    Probed::Facts(facts(
+                        pid,
+                        at(0),
+                        "fish /agents/telegram-assistant/agent.fish",
+                    ))
+                } else {
+                    Probed::Gone
+                }
+            })
+            .with_killer(move |pgid, sig| {
+                kill_alive.store(false, Ordering::SeqCst);
+                sink.lock().unwrap().push((pgid, sig));
+                Ok(())
+            })
+            .reap(&[record(3001, at(0))])
+            .await;
+
+        assert_eq!(
+            report.reaped.len(),
+            1,
+            "the orphan is gone — that is a reap"
+        );
         assert_eq!(
             *killed.lock().unwrap(),
-            vec![(3001, signal::SIGTERM), (3001, signal::SIGKILL)]
+            vec![(3001, signal::SIGTERM)],
+            "no SIGKILL may be sent to a pid that is already free"
         );
+    }
+
+    /// BLOCKER 3, the expensive half: the SIGTERM freed the pid and something
+    /// else took it during the grace window. The pre-grace proof still says
+    /// "ours". Only a fresh proof catches this.
+    #[tokio::test]
+    async fn a_pid_reused_during_the_grace_window_is_not_sigkilled() {
+        let terminated = std::sync::Arc::new(AtomicBool::new(false));
+        let probe_flag = terminated.clone();
+        let kill_flag = terminated.clone();
+
+        let killed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(i32, i32)>::new()));
+        let sink = killed.clone();
+
+        let report = OrphanReaper::new()
+            .with_grace(Duration::from_millis(1))
+            .with_probe(move |pid| {
+                if probe_flag.load(Ordering::SeqCst) {
+                    // The orphan died; the OS handed the number to a build.
+                    Probed::Facts(facts(pid, at(9_000), "cargo build --release"))
+                } else {
+                    Probed::Facts(facts(
+                        pid,
+                        at(0),
+                        "fish /agents/telegram-assistant/agent.fish",
+                    ))
+                }
+            })
+            .with_killer(move |pgid, sig| {
+                kill_flag.store(true, Ordering::SeqCst);
+                sink.lock().unwrap().push((pgid, sig));
+                Ok(())
+            })
+            .reap(&[record(3001, at(0))])
+            .await;
+
+        assert_eq!(
+            *killed.lock().unwrap(),
+            vec![(3001, signal::SIGTERM)],
+            "the pid belongs to somebody else now — no SIGKILL"
+        );
+        assert!(
+            report.reaped.is_empty(),
+            "nothing was confirmed dead: {report:?}"
+        );
+        assert_eq!(report.survived.len(), 1);
+    }
+
+    /// A `killpg` that fails is not a reap. The audit log is fed from
+    /// `reaped`, and it is supposed to record what happened.
+    #[tokio::test]
+    async fn a_refused_signal_is_never_reported_as_reaped() {
+        let report = OrphanReaper::new()
+            .with_grace(Duration::from_millis(1))
+            .with_probe(move |pid| {
+                Probed::Facts(facts(
+                    pid,
+                    at(0),
+                    "fish /agents/telegram-assistant/agent.fish",
+                ))
+            })
+            .with_killer(|_, _| Err(std::io::ErrorKind::PermissionDenied.into()))
+            .reap(&[record(3001, at(0))])
+            .await;
+
+        assert!(report.reaped.is_empty(), "EPERM killed nothing");
+        assert_eq!(report.survived.len(), 1);
+        assert!(report.survived[0].1.contains("SIGTERM failed"));
+    }
+
+    /// A live process whose `ps` line did not parse is alive, not gone — and
+    /// must be told apart from a free pid.
+    #[test]
+    fn an_unreadable_process_is_not_the_same_as_a_gone_one() {
+        let rec = record(2115, at(0));
+        assert_eq!(
+            classify(&rec, &Probed::Unreadable, 999, TOL),
+            Verdict::Skip(SkipReason::Unreadable)
+        );
+        assert_ne!(SkipReason::Unreadable, SkipReason::Gone);
     }
 
     /// End to end against the real OS, with a process this test created: spawn

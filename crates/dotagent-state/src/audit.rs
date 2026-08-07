@@ -43,9 +43,15 @@ pub enum AuditError {
     NoHome,
 }
 
-/// Rotate once the live file passes this. Big enough that a normal install
-/// (~110 entries/day, ~1KB each) never reaches it, small enough that a
-/// runaway agent cannot leave a single file nobody can open.
+/// Rotate once the live file passes this.
+///
+/// Sized against a measured install rather than a guess: 38,710 entries over
+/// 80 days is 484/day, averaging 268B. Ticks were 64% of that and are no longer
+/// written, leaving ~174 entries/day at ~344B — about 60KB a day, so a live
+/// file reaches 32MB in roughly a year. Rotation is therefore an annual event,
+/// not a never one: the seam path is code that runs on real installs, and the
+/// crash window around it is worth healing. Small enough, still, that a runaway
+/// agent cannot leave behind a single file nobody can open.
 pub const DEFAULT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Filesystem-backed append-only audit log.
@@ -95,10 +101,21 @@ impl AuditLog {
         lock.lock_exclusive()?;
 
         let mut tail = self.tail_locked()?;
+        // A crash between the rename and the seam write — or an operator who
+        // removed the live file by hand — leaves segments on disk with nothing
+        // pointing at them. Chaining onto GENESIS here would make
+        // `verify_chain_status` report the *strongest* verdict it has about a
+        // log whose entire history is disconnected, which is the one answer the
+        // four states exist to prevent. Re-emit the seam instead.
+        if tail.last_line.is_none() {
+            if let Some(segment) = self.newest_segment()? {
+                tail = self.write_seam_locked(&segment)?;
+            }
+        }
         // Rotation happens under the same lock as the append that tripped it,
         // so no writer can observe the file between the rename and the seam.
         if tail.len >= self.max_bytes && tail.last_line.is_some() {
-            tail = self.rotate_locked(&tail)?;
+            tail = self.rotate_locked()?;
         }
         let prev_hash = match &tail.last_line {
             Some(line) => hash_line(line),
@@ -137,9 +154,23 @@ impl AuditLog {
     }
 
     /// Walk every entry in the **current segment**. Useful for
-    /// `dotagent status --audit`.
+    /// `dotagent audit verify`.
+    ///
+    /// Errors on a line that does not parse — a caller asking for *the entries*
+    /// cannot be handed a silently short list. Verification is the caller that
+    /// wants to keep going past one; it uses [`Self::verify_chain_status`],
+    /// which reports the bad line as a break instead.
     pub fn iter_entries(&self) -> Result<Vec<AuditEntry>> {
-        read_entries(&self.path)
+        match read_entries(&self.path)? {
+            FileEntries::Ok(entries) => Ok(entries),
+            FileEntries::Invalid { position } => Err(AuditError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: line {position} is not a valid audit entry",
+                    self.path.display()
+                ),
+            ))),
+        }
     }
 
     /// Rotated segments still on disk, oldest first.
@@ -198,16 +229,33 @@ impl AuditLog {
     /// the only one that changes, which is why the daemon uses it at boot.
     /// `Full` walks the seams backwards through every segment still present.
     pub fn verify_chain_status(&self, scope: VerifyScope) -> Result<ChainStatus> {
+        // Shared lock for the whole walk. A reader that landed between the
+        // rename and the seam write would otherwise see an empty live file and
+        // report `IntactFromGenesis` about a log whose history had just moved.
+        let _reading = self.read_lock();
         let mut file = self.path.clone();
-        let mut entries = read_entries(&file)?;
         let mut seen: HashSet<PathBuf> = HashSet::new();
 
         loop {
-            let label = (file != self.path).then(|| {
-                file.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_default()
-            });
+            let label: Option<String> = (file != self.path)
+                .then(|| file.file_name().and_then(|s| s.to_str()).map(String::from))
+                .flatten();
+            let label = label.as_deref();
+            let entries = match read_entries(&file)? {
+                FileEntries::Ok(entries) => entries,
+                // A line nobody can parse is the shape of tampering that
+                // otherwise produces *no* output at all: verification used to
+                // return `Err` here, and the daemon's `if let Ok(..)` dropped
+                // it on the floor. Say it in the vocabulary the caller reads.
+                FileEntries::Invalid { position } => {
+                    return Ok(ChainStatus::Broken(ChainBreak {
+                        position,
+                        expected: "a parseable audit entry".into(),
+                        actual: "unparseable line".into(),
+                        segment: label.map(String::from),
+                    }))
+                }
+            };
             if let Some(brk) = verify_links(&entries, label)? {
                 return Ok(ChainStatus::Broken(brk));
             }
@@ -238,18 +286,26 @@ impl AuditLog {
 
             let segment_path = self.path.with_file_name(&seam.segment);
             let segment_present = segment_path.exists();
-            let stop = matches!(scope, VerifyScope::CurrentSegment)
-                || !segment_present
-                // A seam pointing at a segment already walked is a cycle
-                // somebody forged; refuse to follow it rather than spin.
-                || !seen.insert(segment_path.clone());
-            if stop {
+            if matches!(scope, VerifyScope::CurrentSegment) || !segment_present {
                 return Ok(ChainStatus::IntactSinceRotation {
                     since_ts: head.ts.clone(),
                     segment: seam.segment,
                     entries_before: seam.entries,
                     segment_present,
                 });
+            }
+            // A seam pointing at a segment already walked cannot be history:
+            // rotation only ever writes seams forward, so a cycle is something
+            // somebody assembled. Refusing to follow it is not enough — calling
+            // it "intact since rotation" would hand a clean verdict to the
+            // evidence itself.
+            if !seen.insert(segment_path.clone()) {
+                return Ok(ChainStatus::Broken(ChainBreak {
+                    position: 0,
+                    expected: "a segment not already walked".into(),
+                    actual: format!("{} (seam cycle)", seam.segment),
+                    segment: Some(seam.segment),
+                }));
             }
 
             // The seam claims the segment ends on `tail_hash`. That claim is
@@ -268,29 +324,39 @@ impl AuditLog {
                 }));
             }
 
-            entries = read_entries(&segment_path)?;
             file = segment_path;
         }
     }
 
     /// Rename the live file to a segment and open a fresh one whose first line
-    /// is the seam. Caller holds the append lock.
-    fn rotate_locked(&self, tail: &Tail) -> Result<Tail> {
-        let last_line = tail
-            .last_line
-            .as_ref()
-            .expect("caller checked the log is non-empty");
-        let tail_hash = hash_line(last_line);
-        let (entries, first_ts) = summarize_segment(&self.path)?;
-
+    /// is the seam. Caller holds the append lock and has checked the log is
+    /// non-empty.
+    fn rotate_locked(&self) -> Result<Tail> {
         let segment = self.next_segment_name()?;
         std::fs::rename(&self.path, self.path.with_file_name(&segment))?;
+        self.write_seam_locked(&segment)
+    }
+
+    /// Open a fresh live file whose only line is the seam for `segment`.
+    /// Caller holds the append lock.
+    ///
+    /// Reached from two directions: the rotation that just renamed the file,
+    /// and an append that found no live file to chain onto while segments sit
+    /// on disk. They want byte-identical output — the second one is repairing
+    /// the first one's interrupted half — so they share this.
+    fn write_seam_locked(&self, segment: &str) -> Result<Tail> {
+        let segment_path = self.path.with_file_name(segment);
+        let tail_hash = match read_tail(&segment_path)?.last_line {
+            Some(line) => hash_line(&line),
+            None => GENESIS_HASH.to_string(),
+        };
+        let (entries, first_ts) = summarize_segment(&segment_path)?;
 
         let seam = AuditEntry {
             ts: Local::now().format("%Y-%m-%dT%H:%M:%S%z").to_string(),
             severity: Severity::Notice,
             event: AuditEvent::AuditLogRotated {
-                rotated_to: segment,
+                rotated_to: segment.to_string(),
                 entries,
                 first_ts,
                 tail_hash: tail_hash.clone(),
@@ -313,6 +379,36 @@ impl AuditLog {
             ends_with_newline: true,
             bytes_read: 0,
         })
+    }
+
+    /// Most recent rotated segment still on disk, by name. `None` when the log
+    /// has never rotated (or every segment was pruned).
+    fn newest_segment(&self) -> Result<Option<String>> {
+        let mut segments = self.segments()?;
+        Ok(segments
+            .pop()
+            .and_then(|p| p.file_name().and_then(|s| s.to_str()).map(String::from)))
+    }
+
+    /// Take the append lock in shared mode for the duration of a read.
+    ///
+    /// Best effort on purpose: a lock we cannot open is not a reason to refuse
+    /// to verify a log. Returns the handle so the caller can hold it — dropping
+    /// the `File` is what releases the lock.
+    fn read_lock(&self) -> Option<File> {
+        let f = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(self.path.with_extension("log.lock"))
+            .ok()?;
+        // Through the trait, explicitly: `File::lock_shared` is inherent since
+        // 1.89 and would win method resolution, well past this crate's MSRV.
+        // `lock_exclusive` has no inherent twin, which is why the append path
+        // never had to say this.
+        FileExt::lock_shared(&f).ok()?;
+        Some(f)
     }
 
     /// `audit.log.<YYYYMMDDTHHMMSS>`, with `-N` appended if a rotation already
@@ -405,29 +501,56 @@ fn read_tail(path: &Path) -> Result<Tail> {
     // Prime with the final chunk first, so `ends_with_newline` sees the real
     // last byte rather than whatever the line loop leaves behind.
     read_back(&mut f, &mut pos, &mut pending, &mut bytes_read)?;
-    let ends_with_newline = pending.last() == Some(&b'\n');
+    let mut ends_with_newline = pending.last() == Some(&b'\n');
 
     loop {
         while let Some(nl) = pending.iter().rposition(|&b| b == b'\n') {
-            let line = decode_line(&pending[nl + 1..])?;
-            if !line.trim().is_empty() {
-                return Ok(Tail {
-                    last_line: Some(line),
-                    ends_with_newline,
-                    len,
-                    bytes_read,
-                });
+            match decode_line(&pending[nl + 1..]) {
+                Some(line) if !line.trim().is_empty() => {
+                    return Ok(Tail {
+                        last_line: Some(line),
+                        ends_with_newline,
+                        len,
+                        bytes_read,
+                    })
+                }
+                // Blank line: keep walking left.
+                Some(_) => {}
+                // Undecodable bytes, and because we walk backwards they are
+                // necessarily at the *end* of the file — a write that stopped
+                // mid-character, the same death that leaves a line with no
+                // newline. Treat it as trailing garbage: step over it and force
+                // a `\n` before the next append so the two never fuse. The
+                // garbage stays on disk and `verify_chain_status` reports it as
+                // a break, loudly — which is what should happen. Failing here
+                // instead would make every future append error out, and the
+                // daemon takes that error at boot: one interrupted write would
+                // stop the daemon from ever starting again.
+                None => ends_with_newline = false,
             }
             pending.truncate(nl);
         }
         if pos == 0 {
             // No newline left to the left: `pending` is the file's first line.
-            let line = decode_line(&pending)?;
-            return Ok(Tail {
-                last_line: (!line.trim().is_empty()).then_some(line),
-                ends_with_newline,
-                len,
-                bytes_read,
+            return Ok(match decode_line(&pending) {
+                Some(line) if !line.trim().is_empty() => Tail {
+                    last_line: Some(line),
+                    ends_with_newline,
+                    len,
+                    bytes_read,
+                },
+                Some(_) => Tail {
+                    last_line: None,
+                    ends_with_newline,
+                    len,
+                    bytes_read,
+                },
+                None => Tail {
+                    last_line: None,
+                    ends_with_newline: false,
+                    len,
+                    bytes_read,
+                },
             });
         }
         read_back(&mut f, &mut pos, &mut pending, &mut bytes_read)?;
@@ -453,18 +576,19 @@ fn read_back(
     Ok(())
 }
 
-/// Chunk boundaries never split a line — a line is only decoded once both of
-/// its delimiters are in hand — so this never sees a truncated UTF-8 sequence.
-/// Invalid bytes therefore mean a corrupt log, and chaining onto an older line
-/// would silently fork the chain. Fail instead.
-fn decode_line(bytes: &[u8]) -> Result<String> {
+/// Decode one line the way `BufRead::lines()` would (trailing `\r` dropped).
+///
+/// `None` means the bytes are not UTF-8. Chunk boundaries never split a line —
+/// a line is only decoded once both of its delimiters are in hand — so the only
+/// way to get here is a writer that died mid-character. The caller walks
+/// backwards, so such a line is always at the end of the file, and stepping
+/// over it is safe; see [`read_tail`] for why stepping over beats failing.
+fn decode_line(bytes: &[u8]) -> Option<String> {
     let bytes = match bytes.last() {
         Some(b'\r') => &bytes[..bytes.len() - 1],
         _ => bytes,
     };
-    std::str::from_utf8(bytes)
-        .map(str::to_string)
-        .map_err(|e| AuditError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))
+    std::str::from_utf8(bytes).ok().map(str::to_string)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -588,22 +712,55 @@ fn is_segment_name(stem: &str, name: &str) -> bool {
             .all(|(i, b)| i == 8 || b.is_ascii_digit())
 }
 
+/// What one file's contents turned out to be.
+enum FileEntries {
+    Ok(Vec<AuditEntry>),
+    /// Position of the first line that is not a valid entry, counted the same
+    /// way [`verify_links`] counts positions: non-blank lines, from 0.
+    Invalid {
+        position: usize,
+    },
+}
+
 /// Parse every entry of one file. Blank lines are skipped, the same way the
 /// tail read skips them.
-fn read_entries(path: &Path) -> Result<Vec<AuditEntry>> {
+///
+/// A line that will not parse stops the read and is reported as a *position*
+/// rather than an error. `summarize_segment` has always shrugged one off; this
+/// is the same tolerance with the difference that matters — the caller finds
+/// out where. Returning `Err` here is what let a single corrupt line produce
+/// zero operator-visible output, because the only caller discards errors.
+fn read_entries(path: &Path) -> Result<FileEntries> {
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(FileEntries::Ok(Vec::new()));
     }
     let reader = BufReader::new(File::open(path)?);
     let mut out = Vec::new();
     for line in reader.lines() {
-        let line = line?;
+        let line = match line {
+            Ok(line) => line,
+            // Not UTF-8 is as unparseable as not JSON, and for the same reason
+            // the operator cares about. A real IO failure is not.
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(FileEntries::Invalid {
+                    position: out.len(),
+                })
+            }
+            Err(e) => return Err(e.into()),
+        };
         if line.trim().is_empty() {
             continue;
         }
-        out.push(serde_json::from_str(&line)?);
+        match serde_json::from_str(&line) {
+            Ok(entry) => out.push(entry),
+            Err(_) => {
+                return Ok(FileEntries::Invalid {
+                    position: out.len(),
+                })
+            }
+        }
     }
-    Ok(out)
+    Ok(FileEntries::Ok(out))
 }
 
 /// Check that consecutive entries link. Says nothing about where the file
@@ -676,6 +833,15 @@ pub fn is_critical(sev: Severity) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    /// Entries of a file, insisting they all parse. Tests that care about the
+    /// unparseable case match on [`FileEntries`] directly.
+    fn entries_of(path: &Path) -> Vec<AuditEntry> {
+        match read_entries(path).unwrap() {
+            FileEntries::Ok(entries) => entries,
+            FileEntries::Invalid { position } => panic!("line {position} did not parse"),
+        }
+    }
 
     #[test]
     fn append_chains_hashes() {
@@ -829,11 +995,26 @@ mod tests {
     }
 
     #[test]
-    fn tail_rejects_a_line_that_is_not_utf8() {
+    fn tail_steps_over_trailing_bytes_that_are_not_utf8() {
+        // Undecodable bytes at the end are a writer that died mid-character.
+        // The chain continues from the last line that *is* decodable, and the
+        // next append is told to write a separator first so the two never fuse.
         let dir = tempdir().unwrap();
         let path = dir.path().join("audit.log");
         std::fs::write(&path, b"ok\n\xff\xfe\n").unwrap();
-        assert!(read_tail(&path).is_err());
+        let t = read_tail(&path).unwrap();
+        assert_eq!(t.last_line.as_deref(), Some("ok"));
+        assert!(!t.ends_with_newline, "the next append must separate itself");
+    }
+
+    #[test]
+    fn a_file_of_nothing_but_undecodable_bytes_has_no_tail() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        std::fs::write(&path, b"\xf0\x9f").unwrap();
+        let t = read_tail(&path).unwrap();
+        assert!(t.last_line.is_none());
+        assert!(!t.ends_with_newline);
     }
 
     #[test]
@@ -929,6 +1110,94 @@ mod tests {
         let entries = log.iter_entries().unwrap();
         assert_eq!(entries.len(), 2, "the two entries must stay two lines");
         assert!(log.verify_chain().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_write_torn_inside_a_character_does_not_wedge_the_log_shut() {
+        // The blocker. `daemon::run` appends `DaemonStarted` at boot and
+        // propagates the error, so an append that always fails is a daemon that
+        // never starts — every boot, the same bare `invalid utf-8 sequence`,
+        // until somebody edits the file by hand. A write interrupted between
+        // two bytes of one character is exactly as plausible as one interrupted
+        // between the JSON and its newline, which this file already heals.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_path(path.clone());
+
+        log.append(AuditEvent::DaemonStarted {
+            version: "0.0.1".into(),
+            pid: 1,
+        })
+        .unwrap();
+        let intact = std::fs::read(&path).unwrap();
+
+        // Second entry carries multibyte text; cut the file at the first offset
+        // that lands inside one of those characters.
+        log.append(AuditEvent::DaemonStopped {
+            reason: "conexão interrompida — ✂".into(),
+        })
+        .unwrap();
+        let raw = std::fs::read(&path).unwrap();
+        let cut = (intact.len()..raw.len())
+            .find(|&i| std::str::from_utf8(&raw[..i]).is_err())
+            .expect("the payload must contain a multibyte character");
+        std::fs::write(&path, &raw[..cut]).unwrap();
+
+        // The append that used to fail forever.
+        let entry = log
+            .append(AuditEvent::TickStarted { agents_scanned: 7 })
+            .unwrap();
+        let first_line = String::from_utf8(intact).unwrap();
+        assert_eq!(
+            entry.prev_hash,
+            hash_line(first_line.trim_end_matches('\n')),
+            "the new entry chains onto the last line that survived"
+        );
+
+        // The torn bytes stay on disk, on their own line, and verification says
+        // so out loud instead of the daemon dying on a bare io error.
+        let after = std::fs::read(&path).unwrap();
+        assert!(after.starts_with(&raw[..cut]), "nothing was rewritten");
+        assert!(
+            matches!(
+                log.verify_chain_status(VerifyScope::CurrentSegment)
+                    .unwrap(),
+                ChainStatus::Broken(_)
+            ),
+            "the corruption must be reported, not hidden"
+        );
+
+        // And it stays survivable: a daemon restarting in a loop keeps booting.
+        log.append(AuditEvent::TickStarted { agents_scanned: 8 })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_torn_write_never_fuses_with_the_entry_that_follows_it() {
+        // Same failure with the tear landing after a complete line: the healed
+        // append must not glue its JSON onto the garbage and produce one
+        // unparseable record where there should be two.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_path(path.clone());
+        log.append(AuditEvent::TickStarted { agents_scanned: 1 })
+            .unwrap();
+
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(b"{\"ts\":\"2026-08-06T10:00:00-0300\",\"r\":\"ca\xc3");
+        std::fs::write(&path, &raw).unwrap();
+
+        log.append(AuditEvent::TickStarted { agents_scanned: 2 })
+            .unwrap();
+
+        let after = std::fs::read(&path).unwrap();
+        let lines: Vec<&[u8]> = after
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .collect();
+        assert_eq!(lines.len(), 3, "entry, garbage, entry — not two fused");
+        let last = std::str::from_utf8(lines[2]).expect("the new entry must be intact");
+        serde_json::from_str::<AuditEntry>(last).expect("and must still be exactly one entry");
     }
 
     #[test]
@@ -1032,7 +1301,7 @@ mod tests {
             hash_line(&read_tail(&segments[0]).unwrap().last_line.unwrap()),
             tail_hash
         );
-        assert_eq!(read_entries(&segments[0]).unwrap().len(), entries);
+        assert_eq!(entries_of(&segments[0]).len(), entries);
         assert_eq!(head.severity, Severity::Notice);
 
         assert!(log.verify_chain().unwrap().is_none());
@@ -1197,6 +1466,142 @@ mod tests {
             log.verify_chain_status(VerifyScope::Full).unwrap(),
             ChainStatus::Broken(_)
         ));
+    }
+
+    #[test]
+    fn a_rotation_that_died_before_the_seam_does_not_restart_at_genesis() {
+        // Rename and seam-write are two syscalls; a crash (or a power cut —
+        // there is no directory fsync here) can land between them. What is left
+        // is a segment nothing points at. Chaining onto GENESIS would then make
+        // `verify_chain_status` give its *strongest* verdict to a log whose
+        // whole history is disconnected: not a truncation warning, a false
+        // all-clear. Re-emit the seam instead.
+        for crash in ["removed", "emptied"] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("audit.log");
+            let log = rotated_log(dir.path(), 1);
+            let segment = log.segments().unwrap().remove(0);
+            let segment_name = segment.file_name().unwrap().to_str().unwrap().to_string();
+            let segment_tail = hash_line(&read_tail(&segment).unwrap().last_line.unwrap());
+
+            // Rewind to the instant after `rename`, before the seam was written.
+            match crash {
+                "removed" => std::fs::remove_file(&path).unwrap(),
+                _ => std::fs::write(&path, b"").unwrap(),
+            }
+
+            let entry = log
+                .append(AuditEvent::TickStarted { agents_scanned: 1 })
+                .unwrap();
+            assert_ne!(
+                entry.prev_hash, GENESIS_HASH,
+                "{crash}: a disconnected history must not read as a fresh log"
+            );
+
+            match &log.iter_entries().unwrap()[0].event {
+                AuditEvent::AuditLogRotated {
+                    rotated_to,
+                    tail_hash,
+                    ..
+                } => {
+                    assert_eq!(rotated_to, &segment_name, "{crash}");
+                    assert_eq!(tail_hash, &segment_tail, "{crash}");
+                }
+                other => panic!("{crash}: expected a re-emitted seam, got {other:?}"),
+            }
+            assert_eq!(
+                log.verify_chain_status(VerifyScope::Full).unwrap(),
+                ChainStatus::IntactFromGenesis,
+                "{crash}: the repaired seam must reconnect the history"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unparseable_line_is_a_break_not_a_swallowed_error() {
+        // The tampering shape that used to produce *zero* output: `read_entries`
+        // returned `Err`, `verify_chain` propagated it, and the daemon's
+        // `if let Ok(Some(brk))` dropped it on the floor.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let log = AuditLog::with_path(path.clone());
+        for i in 0..3 {
+            log.append(AuditEvent::TickStarted { agents_scanned: i })
+                .unwrap();
+        }
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = raw.lines().map(String::from).collect();
+        lines[1] = "{ not an audit entry".into();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        match log
+            .verify_chain_status(VerifyScope::CurrentSegment)
+            .unwrap()
+        {
+            ChainStatus::Broken(brk) => assert_eq!(brk.position, 1),
+            other => panic!("expected Broken, got {other:?}"),
+        }
+        assert!(
+            log.verify_chain().unwrap().is_some(),
+            "the daemon's yes/no call must fire"
+        );
+        // `iter_entries` keeps the opposite policy on purpose: a caller asking
+        // for the entries must not be handed a silently short list.
+        assert!(log.iter_entries().is_err());
+    }
+
+    #[test]
+    fn a_seam_cycle_is_evidence_not_integrity() {
+        // A segment whose head is a seam naming itself. Following it forever is
+        // one bug; calling it "intact since rotation" — a *clean* verdict — is
+        // the worse one, because a forged seam graph is the thing the four
+        // states exist to expose.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let name = "audit.log.20260806T101500";
+
+        let self_seam = AuditEntry {
+            ts: "2026-08-06T10:15:00-0300".into(),
+            severity: Severity::Notice,
+            event: AuditEvent::AuditLogRotated {
+                rotated_to: name.into(),
+                entries: 1,
+                first_ts: "2026-08-01T00:00:00-0300".into(),
+                tail_hash: "dead".into(),
+            },
+            prev_hash: "dead".into(),
+        };
+        let l0 = serde_json::to_string(&self_seam).unwrap();
+        let l1 = serde_json::to_string(&AuditEntry {
+            ts: "2026-08-06T10:16:00-0300".into(),
+            severity: Severity::Info,
+            event: AuditEvent::TickStarted { agents_scanned: 1 },
+            prev_hash: hash_line(&l0),
+        })
+        .unwrap();
+        std::fs::write(dir.path().join(name), format!("{l0}\n{l1}\n")).unwrap();
+
+        // A live file whose seam legitimately points at that segment.
+        let live_seam = serde_json::to_string(&AuditEntry {
+            ts: "2026-08-06T10:17:00-0300".into(),
+            severity: Severity::Notice,
+            event: AuditEvent::AuditLogRotated {
+                rotated_to: name.into(),
+                entries: 2,
+                first_ts: "2026-08-06T10:15:00-0300".into(),
+                tail_hash: hash_line(&l1),
+            },
+            prev_hash: hash_line(&l1),
+        })
+        .unwrap();
+        std::fs::write(&path, format!("{live_seam}\n")).unwrap();
+
+        let log = AuditLog::with_path(path);
+        match log.verify_chain_status(VerifyScope::Full).unwrap() {
+            ChainStatus::Broken(brk) => assert!(brk.actual.contains("seam cycle")),
+            other => panic!("expected Broken, got {other:?}"),
+        }
     }
 
     #[test]

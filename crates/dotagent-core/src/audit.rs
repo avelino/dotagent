@@ -160,7 +160,7 @@ pub enum AuditEvent {
     /// already rotates.
     ///
     /// **Kept so old logs stay readable.** Deleting the variants would make
-    /// `dotagent status --audit` and `verify_chain` fail on every existing
+    /// `dotagent audit verify` and `verify_chain` fail on every existing
     /// install the moment they reach a historic tick entry — and a hash chain
     /// you can no longer verify is worse than one carrying dead weight.
     TickCompleted {
@@ -373,7 +373,7 @@ mod tests {
 
     /// Verbatim lines from a real `audit.log`, written before the daemon
     /// stopped emitting ticks. Tens of thousands of these exist on installs in
-    /// the wild; `dotagent status --audit` and `verify_chain` walk every one of
+    /// the wild; `dotagent audit verify` and `verify_chain` walk every one of
     /// them, so the day they stop parsing is the day the chain stops being
     /// verifiable.
     const HISTORIC_TICK_STARTED: &str = r#"{"ts":"2026-05-19T08:31:07-0300","severity":"info","event":{"event_type":"tick_started","agents_scanned":0},"prev_hash":"2c94629858b453eef01ea41eca0783054a3b6816adb2b9997e0bdbfce2cb9698"}"#;

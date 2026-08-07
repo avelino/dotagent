@@ -26,8 +26,8 @@ use dotagent_plugin::PluginClient;
 use dotagent_runner::persistent::PersistentPool;
 use dotagent_runner::{run_with_hooks, OrchestratedOutcome, RunContext, RunSpec};
 use dotagent_scheduler::{
-    compute_next_event, expected_at, health_state, is_stale, should_retry, AgentSchedulePair,
-    HealthState, ResolvedPolicy,
+    compute_next_event, expected_at, health_state, is_stale, should_retry, window_key,
+    AgentSchedulePair, HealthState, ResolvedPolicy,
 };
 use dotagent_state::{
     audit::AuditLog,
@@ -131,6 +131,29 @@ const TRIGGER_CHANNEL_DEPTH: usize = 64;
 ///   rather than N concurrent agent processes. The ingress rate limit bounds
 ///   arrivals; this bounds execution, which is the expensive half.
 ///
+/// The price is that it serializes conversations that never needed it: with two
+/// chats live and a 20-minute run, the second chat waits out the first. The
+/// alternative is a worker per conversation — `HashMap<key, Sender>`, each FIFO,
+/// same per-conversation ordering, ceiling equal to the number of live chats.
+/// Not taken yet, for three reasons:
+///
+/// - The blocking that was actually observed was a **scheduled** run holding a
+///   chat, and that one is fixed where it belonged: the persistent pool keys
+///   scheduled and triggered runs apart, so they no longer queue behind one
+///   mutex. Chat-against-chat blocking needs two people talking at once.
+/// - "Conversation" would have to mean the same thing here and in
+///   `[lifecycle] key`. If it does not, two workers land on one instance mutex
+///   and ordering becomes whichever task got there first — the guarantee this
+///   design exists to keep, lost in exchange for the concurrency.
+/// - N workers is N concurrent agent processes for a `oneshot` agent, and N
+///   handles to watch instead of one. The ceiling is not `allowed_user_ids`:
+///   that list is who may speak, not how many may run at once.
+///
+/// Worth revisiting the moment a second concurrent conversation is real. The
+/// change is contained — the channel becomes a map keyed by
+/// `(source, reply_to)` — and by then `[lifecycle] key` says what a
+/// conversation is.
+///
 /// What it does introduce is exactly one new concurrent pair — a triggered run
 /// beside a scheduled one — and that pair is safe on every shared resource
 /// they touch:
@@ -148,6 +171,10 @@ const TRIGGER_CHANNEL_DEPTH: usize = 64;
 ///
 /// The handler is a parameter so tests can drive this loop's real shape
 /// without a filesystem, a manifest, or a subprocess.
+///
+/// The returned handle is **not** optional bookkeeping: [`wait_for_event`]
+/// selects on it, so this task ending — returning or panicking — stops the
+/// daemon instead of leaving a process that ticks forever and answers nobody.
 fn spawn_trigger_worker<H, F>(
     mut rx: tokio::sync::mpsc::Receiver<TriggerRequest>,
     handler: H,
@@ -160,8 +187,78 @@ where
         while let Some(req) = rx.recv().await {
             handler(req).await;
         }
-        debug!("trigger worker stopped — channel closed");
+        // Only reachable once every sender is gone, which for a live daemon
+        // means the loop itself dropped them — worth a line at a level someone
+        // reads, because from here on no trigger will ever be answered.
+        warn!("trigger worker stopped — channel closed");
     })
+}
+
+/// What ended a sleep cycle.
+#[derive(Debug, PartialEq, Eq)]
+enum Wake {
+    /// The sleep elapsed. Run the next tick.
+    Tick,
+    /// SIGHUP: re-read config and restart what it configures.
+    Reload,
+    /// Stop the daemon, with the reason the audit log records.
+    Stop(&'static str),
+}
+
+/// The three signals the daemon reacts to, registered once.
+struct Signals {
+    hangup: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn register() -> Result<Self> {
+        Ok(Self {
+            hangup: signal(SignalKind::hangup()).context("registering SIGHUP")?,
+            terminate: signal(SignalKind::terminate()).context("registering SIGTERM")?,
+            interrupt: signal(SignalKind::interrupt()).context("registering SIGINT")?,
+        })
+    }
+}
+
+/// Sleep until something asks the loop to do its next thing.
+///
+/// The trigger worker is one of those things. It used to be spawned and then
+/// only ever `abort()`ed, which meant its death was invisible: the task ends,
+/// its receiver drops, the channel closes, and the ingress logs one line and
+/// returns. The bot goes permanently deaf while the loop keeps ticking and
+/// `dotagent status` keeps saying the daemon is fine.
+///
+/// Before the worker existed, a trigger ran inline in this `select!`, so a
+/// panic unwound the daemon and launchd restarted it — loud, and self-healing.
+/// Selecting on the handle restores exactly that: the daemon exits through its
+/// normal shutdown path and comes back with a worker that works.
+///
+/// Split out of [`run`] so it is testable — the property is "a dead worker
+/// stops the loop", which cannot be asserted on a `select!` buried in a
+/// function that needs a state store, a supervisor and a signal disposition.
+async fn wait_for_event(
+    sleep_for: Duration,
+    signals: &mut Signals,
+    trigger_worker: &mut tokio::task::JoinHandle<()>,
+) -> Wake {
+    tokio::select! {
+        _ = tokio::time::sleep(sleep_for) => Wake::Tick,
+        _ = signals.hangup.recv() => Wake::Reload,
+        _ = signals.terminate.recv() => Wake::Stop("SIGTERM"),
+        _ = signals.interrupt.recv() => Wake::Stop("SIGINT"),
+        outcome = &mut *trigger_worker => {
+            match outcome {
+                Ok(()) => warn!("trigger worker returned — no trigger can be answered anymore"),
+                Err(e) if e.is_panic() => {
+                    warn!(error = %e, "trigger worker panicked — no trigger can be answered anymore")
+                }
+                Err(e) => warn!(error = %e, "trigger worker ended unexpectedly"),
+            }
+            Wake::Stop("trigger worker died")
+        }
+    }
 }
 
 /// Run an agent because something asked, not because a window came due.
@@ -704,9 +801,43 @@ fn trigger_env(req: &TriggerRequest) -> Vec<(String, String)> {
     env
 }
 
+/// Retire every persistent instance for a reload, off the loop's clock.
+///
+/// `PersistentPool::reload` drains the pool by taking each slot's mutex, and a
+/// slot held by an in-flight request stays held for that request's whole
+/// deadline — up to `agent.timeout_seconds`. Awaiting that inline is a scheduler
+/// that stops ticking, dispatching and summarizing for as long as the busiest
+/// agent takes; a 1200-second run turned `dotagent reload` into a 20-minute
+/// freeze. The shutdown path avoids this by aborting the trigger worker first;
+/// a reload has no equivalent, because the worker keeps running.
+///
+/// Detached rather than time-boxed: a `timeout` here would drop the drain
+/// mid-way, and the instances it had already pulled out of the map would be
+/// terminated by their `Drop` with nothing written down about why. Letting it
+/// finish on its own task keeps every recycle audited. Overlapping reloads are
+/// safe — `drain` empties the map under its lock, so a second one finds only
+/// what the first had not claimed yet.
+fn spawn_pool_reload(
+    pool: &std::sync::Arc<PersistentPool>,
+    audit: &AuditLog,
+) -> tokio::task::JoinHandle<()> {
+    let (pool, audit) = (pool.clone(), audit.clone());
+    tokio::spawn(async move {
+        pool.reload(Some(&audit)).await;
+        debug!("persistent instances retired for reload");
+    })
+}
+
 pub async fn run() -> Result<()> {
     let state = StateStore::from_home().context("opening state store")?;
     let audit = AuditLog::from_home().context("opening audit log")?;
+    // Claim the pidfile first. `reap_boot_orphans` decides what it may signal
+    // by asking whether another daemon is alive, and that answer is read from
+    // the pidfile — so publishing ours after the reap leaves a window (the
+    // whole scan, including its kill grace) in which a second daemon starting
+    // up sees nobody home and reaps the same snapshot we are reaping.
+    write_pidfile()?;
+    let _pid_guard = PidGuard;
     // Before anything of ours exists: collect what a previous daemon left
     // behind. Must run before `start_snapshot_writer`, whose first tick would
     // otherwise overwrite the only record of those processes.
@@ -736,29 +867,38 @@ pub async fn run() -> Result<()> {
     let pool = std::sync::Arc::new(PersistentPool::new(supervisor.clone()));
     let cache = ManifestCache::from_home().context("opening manifest cache")?;
 
-    // Write our PID so `dotagent reload` / `dotagent status` can find us.
-    write_pidfile()?;
-    let _pid_guard = PidGuard;
-
-    audit.append(AuditEvent::DaemonStarted {
-        version: env!("CARGO_PKG_VERSION").into(),
-        pid: std::process::id(),
-    })?;
+    audit
+        .append(AuditEvent::DaemonStarted {
+            version: env!("CARGO_PKG_VERSION").into(),
+            pid: std::process::id(),
+        })
+        .with_context(|| format!("appending daemon_started to {}", audit.path().display()))?;
 
     // Verify the existing chain at startup; emit `AuditChainBroken` (which
     // itself becomes a chained entry) if tampered.
-    if let Ok(Some(brk)) = audit.verify_chain() {
-        warn!(position = brk.position, "audit chain broken");
-        let _ = audit.append(AuditEvent::AuditChainBroken {
-            position: brk.position,
-            expected_prev_hash: brk.expected,
-            actual_prev_hash: brk.actual,
-        });
+    //
+    // The `Err` arm is not the same as a clean chain: it means the log could
+    // not be read at all, and refusing to say so would turn "I could not
+    // check" into "I checked and it is fine" — the exact substitution this
+    // release exists to stop making.
+    match audit.verify_chain() {
+        Ok(Some(brk)) => {
+            warn!(position = brk.position, "audit chain broken");
+            let _ = audit.append(AuditEvent::AuditChainBroken {
+                position: brk.position,
+                expected_prev_hash: brk.expected,
+                actual_prev_hash: brk.actual,
+            });
+        }
+        Ok(None) => {}
+        Err(e) => warn!(
+            error = %e,
+            path = %audit.path().display(),
+            "could not verify the audit chain"
+        ),
     }
 
-    let mut sighup = signal(SignalKind::hangup()).context("registering SIGHUP")?;
-    let mut sigterm = signal(SignalKind::terminate()).context("registering SIGTERM")?;
-    let mut sigint = signal(SignalKind::interrupt()).context("registering SIGINT")?;
+    let mut signals = Signals::register()?;
 
     info!("daemon started");
     let mut app_config =
@@ -779,7 +919,7 @@ pub async fn run() -> Result<()> {
     // running it beside the tick is safe.
     let (trigger_tx, trigger_rx) =
         tokio::sync::mpsc::channel::<TriggerRequest>(TRIGGER_CHANNEL_DEPTH);
-    let trigger_worker = {
+    let mut trigger_worker = {
         let state = state.clone();
         let audit = audit.clone();
         let plugins = plugins.clone();
@@ -854,6 +994,7 @@ pub async fn run() -> Result<()> {
             cycle_start,
             next_event,
             next_summary_at(cycle_start, &app_config.daily_summary),
+            next_retention_at(cycle_start),
         );
         let sleep_for = (sleep_target - Local::now())
             .to_std()
@@ -864,17 +1005,23 @@ pub async fn run() -> Result<()> {
             sleep_for.as_secs()
         );
 
-        tokio::select! {
-            _ = tokio::time::sleep(sleep_for) => { continue; }
-            _ = sighup.recv() => {
+        match wait_for_event(sleep_for, &mut signals, &mut trigger_worker).await {
+            Wake::Tick => continue,
+            Wake::Stop(reason) => break reason,
+            Wake::Reload => {
                 info!("SIGHUP — reloading on next tick");
-                let _ = audit.append(AuditEvent::ConfigReloaded { reason: "SIGHUP".into() });
+                let _ = audit.append(AuditEvent::ConfigReloaded {
+                    reason: "SIGHUP".into(),
+                });
                 // Re-read secrets so operators can rotate without a full
                 // daemon restart (the issue explicitly calls out SIGHUP /
                 // restart as the supported refresh mechanism).
                 let reloaded = dotagent_core::Config::load(dotagent_state::paths::config_file())
                     .unwrap_or_default();
                 load_secrets_at_startup(&reloaded, &audit);
+                // Config can turn memory on, or move the workspace. Left out,
+                // this was the last thing still pinned to whatever boot read.
+                ensure_memory_workspace(&reloaded);
                 // Restart the ingress against the new config. Without this a
                 // reload would leave the old allowlist live: removing a user
                 // id and reloading would look like it took effect while the
@@ -893,11 +1040,9 @@ pub async fn run() -> Result<()> {
                 // instance was spawned from the manifest as it read then, and
                 // leaving it up would make the reload look applied while the
                 // behavior stayed put.
-                pool.reload(Some(&audit)).await;
+                spawn_pool_reload(&pool, &audit);
                 continue;
             }
-            _ = sigterm.recv() => break "SIGTERM",
-            _ = sigint.recv()  => break "SIGINT",
         }
     };
 
@@ -979,10 +1124,17 @@ async fn reap_boot_orphans(audit: &AuditLog) {
         .await;
 
     if let Some(err) = &report.snapshot_error {
-        // Nothing was signalled. Leave the file alone too: it is evidence.
+        // Nothing was signalled, and the file is the only evidence of what was
+        // running — but leaving it in place would not preserve it: the snapshot
+        // writer starts two seconds later and overwrites it. Move it aside so
+        // it survives long enough to be read.
+        let kept = std::path::PathBuf::from(format!("{}.corrupt", snapshot.display()));
+        let preserved = std::fs::rename(&snapshot, &kept).is_ok();
         warn!(
             path = %snapshot.display(),
             error = %err,
+            kept = %kept.display(),
+            preserved,
             "supervisor snapshot is unreadable — no orphan was reaped"
         );
         return;
@@ -1259,10 +1411,15 @@ pub async fn tick_dry_run(state: &StateStore, now: DateTime<Local>) -> TickResul
     }
 }
 
+/// When the retention sweep's daily window opens.
+const RETENTION_HOUR: u32 = 3;
+/// How long it stays open. A tick that starts inside this runs the sweep.
+const RETENTION_WINDOW_MINUTES: u32 = 30;
+
 /// Log retention runs once per day at 03:00 ± 30min.
 fn should_run_retention(now: DateTime<Local>, last_date: Option<chrono::NaiveDate>) -> bool {
     use chrono::Timelike;
-    let in_window = now.hour() == 3 && now.minute() < 30;
+    let in_window = now.hour() == RETENTION_HOUR && now.minute() < RETENTION_WINDOW_MINUTES;
     if !in_window {
         return false;
     }
@@ -1270,6 +1427,25 @@ fn should_run_retention(now: DateTime<Local>, last_date: Option<chrono::NaiveDat
         Some(d) => d != now.date_naive(),
         None => true,
     }
+}
+
+/// When the daemon has to be awake next to run the retention sweep.
+///
+/// Same reasoning as [`next_summary_at`], and the same bug: the loop only ever
+/// landed inside `[03:00, 03:30)` because `MAX_SLEEP_MINUTES` happens to equal
+/// the window's width — a coincidence no code states. A tick that overruns its
+/// own sleep budget (a 1200-second run is on record) leaves the next sleep at
+/// the `unwrap_or(60s)` fallback and puts the following `cycle_start` past
+/// 03:30. `last_retention_date` only advances on a sweep that ran, so the day
+/// is skipped with nothing logged.
+fn next_retention_at(now: DateTime<Local>) -> Option<DateTime<Local>> {
+    let time = chrono::NaiveTime::from_hms_opt(RETENTION_HOUR, 0, 0)?;
+    let today = now.date_naive();
+    [Some(today), today.succ_opt()]
+        .into_iter()
+        .flatten()
+        .filter_map(|date| local_at(now, date, time))
+        .find(|t| *t > now)
 }
 
 /// Resolve a local wall-clock time on `date` against `reference`'s timezone.
@@ -1356,15 +1532,20 @@ fn next_summary_at(
 
 /// Returns the earliest pending wake-up, capped at `now + MAX_SLEEP`.
 ///
-/// The daily summary is a wake-up reason in its own right: it is the one
-/// scheduled thing the daemon does that no agent schedule accounts for.
+/// The daily summary and the retention sweep are wake-up reasons in their own
+/// right: they are the scheduled things the daemon does that no agent schedule
+/// accounts for. Anything time-triggered the loop grows from here belongs in
+/// this list too — a window the loop only reaches because the safety cap
+/// happens to be as wide as the window is a window that gets skipped the first
+/// time a tick runs long.
 fn compute_sleep_target(
     now: DateTime<Local>,
     next_event: Option<DateTime<Local>>,
     next_summary: Option<DateTime<Local>>,
+    next_retention: Option<DateTime<Local>>,
 ) -> DateTime<Local> {
     let safety_cap = now + chrono::Duration::minutes(MAX_SLEEP_MINUTES);
-    [next_event, next_summary]
+    [next_event, next_summary, next_retention]
         .into_iter()
         .flatten()
         .filter(|t| *t > now && *t < safety_cap)
@@ -1875,7 +2056,13 @@ async fn sweep_health_notifications(
                 .and_then(|h| h.last_success_at)
                 .and_then(|s| Local.timestamp_opt(s, 0).single());
             let expected = expected_at(sched, now, last_success);
-            let window = expected.and_then(|e| state.read_window(name, &slug, e).ok().flatten());
+            // Same key `status` and the daily summary read. For interval it is
+            // not derivable from the schedule, because a success re-phases the
+            // tick sequence — deriving it here would leave the alert path blind
+            // to exactly the recoveries the dashboard now sees.
+            let dispatched = super::status::last_dispatched_window(state, name, &slug, now);
+            let window = window_key(sched, hb.as_ref(), dispatched, now)
+                .and_then(|key| state.read_window(name, &slug, key).ok().flatten());
             let (health, _) = health_state(sched, &policy, hb.as_ref(), window.as_ref(), now);
 
             let event = match alert_verdict(health, expected, last_success, window.as_ref()) {
@@ -1942,11 +2129,13 @@ async fn sweep_health_notifications(
 /// Ask the ladder whether this alert may speak right now, recording it when the
 /// answer is yes. `None` means stay quiet.
 ///
-/// One policy, two callers: [`give_up`], which alerts the instant the last
-/// retry burns, and the tick sweep, which alerts on a condition nobody else
-/// reports. Sharing the table is what stops the same failure being announced
-/// twice inside a second, and what makes a still-broken agent keep asking on
-/// one cadence regardless of which path noticed.
+/// Called by [`give_up`], which alerts the instant the last retry burns. The
+/// tick sweep applies the same policy against the same table, but inline: it
+/// walks every (agent, schedule) pair in one pass and loads and saves the store
+/// once for the batch rather than once per alert. Same ladder either way — which
+/// is what stops one failure being announced twice inside a second, and what
+/// makes a still-broken agent keep asking on one cadence regardless of which
+/// path noticed.
 fn claim_alert(agent: &str, schedule: &str, event: &str, now: i64) -> Option<AlertEpisode> {
     let store = NotifyDedupStore::from_home();
     let mut table = store.load();
@@ -2145,6 +2334,68 @@ mod trigger_worker_tests {
             .expect("worker should finish")
             .expect("worker should not panic");
     }
+
+    // --- the worker has to be watched by somebody ---
+    //
+    // Moving trigger handling off the `select!` moved it out of anyone's sight:
+    // the handle was spawned and only ever `abort()`ed. A panicking handler
+    // therefore killed the worker, closed the channel, and the ingress logged
+    // one line and returned — a bot that never answers again, on a daemon that
+    // keeps ticking and reports itself healthy. Before the worker existed the
+    // same panic unwound `run()` and launchd restarted the process.
+
+    /// A worker that panics must stop the daemon, not silence it.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicking_trigger_worker_stops_the_daemon() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(TRIGGER_CHANNEL_DEPTH);
+        let mut worker = spawn_trigger_worker(rx, |_req| async { panic!("handler blew up") });
+        tx.send(req("telegram-assistant")).await.unwrap();
+
+        let mut signals = Signals::register().expect("signals must register");
+        // A full safety-cap sleep: nothing but the dead worker can end this.
+        let wake = wait_for_event(
+            Duration::from_secs(MAX_SLEEP_MINUTES as u64 * 60),
+            &mut signals,
+            &mut worker,
+        )
+        .await;
+
+        assert_eq!(wake, Wake::Stop("trigger worker died"));
+    }
+
+    /// Same for a worker that ends without panicking — the channel is closed
+    /// either way, and a daemon that cannot hear is a daemon that should exit.
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_returns_also_stops_the_daemon() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(4);
+        let mut worker = spawn_trigger_worker(rx, |_req| async {});
+        drop(tx);
+
+        let mut signals = Signals::register().expect("signals must register");
+        let wake = wait_for_event(
+            Duration::from_secs(MAX_SLEEP_MINUTES as u64 * 60),
+            &mut signals,
+            &mut worker,
+        )
+        .await;
+
+        assert_eq!(wake, Wake::Stop("trigger worker died"));
+    }
+
+    /// And a live worker must not be mistaken for a dead one: an ordinary sleep
+    /// still ends in a tick.
+    #[tokio::test(start_paused = true)]
+    async fn a_live_worker_lets_the_loop_tick() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(4);
+        let mut worker = spawn_trigger_worker(rx, |_req| async {});
+
+        let mut signals = Signals::register().expect("signals must register");
+        let wake = wait_for_event(Duration::from_secs(600), &mut signals, &mut worker).await;
+
+        assert_eq!(wake, Wake::Tick);
+        drop(tx);
+        worker.abort();
+    }
 }
 
 #[cfg(test)]
@@ -2280,7 +2531,7 @@ mod tests {
         let cfg = summary_cfg("22:45", 30);
         let now = dt(2026, 8, 6, 22, 30);
         assert_eq!(
-            compute_sleep_target(now, None, next_summary_at(now, &cfg)),
+            compute_sleep_target(now, None, next_summary_at(now, &cfg), None),
             dt(2026, 8, 6, 22, 45)
         );
     }
@@ -2290,7 +2541,7 @@ mod tests {
         // A one-minute grace is unreachable by a 30-minute sleep cap alone.
         let cfg = summary_cfg("22:45", 1);
         let now = dt(2026, 8, 6, 22, 20);
-        let target = compute_sleep_target(now, None, next_summary_at(now, &cfg));
+        let target = compute_sleep_target(now, None, next_summary_at(now, &cfg), None);
         assert_eq!(target, dt(2026, 8, 6, 22, 45));
         assert!(should_run_daily_summary(target, None, &cfg).is_some());
     }
@@ -2301,12 +2552,12 @@ mod tests {
         let now = dt(2026, 8, 6, 22, 30);
         let agent_event = dt(2026, 8, 6, 22, 35);
         assert_eq!(
-            compute_sleep_target(now, Some(agent_event), next_summary_at(now, &cfg)),
+            compute_sleep_target(now, Some(agent_event), next_summary_at(now, &cfg), None),
             agent_event
         );
         let later_event = dt(2026, 8, 6, 22, 50);
         assert_eq!(
-            compute_sleep_target(now, Some(later_event), next_summary_at(now, &cfg)),
+            compute_sleep_target(now, Some(later_event), next_summary_at(now, &cfg), None),
             dt(2026, 8, 6, 22, 45)
         );
     }
@@ -2318,7 +2569,7 @@ mod tests {
         let cfg = summary_cfg("22:45", 30);
         let now = dt(2026, 8, 6, 14, 0);
         assert_eq!(
-            compute_sleep_target(now, None, next_summary_at(now, &cfg)),
+            compute_sleep_target(now, None, next_summary_at(now, &cfg), None),
             now + chrono::Duration::minutes(MAX_SLEEP_MINUTES)
         );
     }
@@ -2334,6 +2585,76 @@ mod tests {
         assert_eq!(
             next_summary_at(dt(2026, 8, 6, 23, 59), &cfg),
             Some(dt(2026, 8, 7, 22, 45))
+        );
+    }
+
+    // --- retention scheduling ---
+    //
+    // The sweep had exactly the bug `next_summary_at` was written to fix: a
+    // 30-minute window reached only because `MAX_SLEEP_MINUTES` is also 30.
+
+    #[test]
+    fn the_daemon_schedules_a_wake_up_for_the_retention_sweep() {
+        let now = dt(2026, 8, 6, 2, 50);
+        let target = compute_sleep_target(now, None, None, next_retention_at(now));
+        assert_eq!(target, dt(2026, 8, 6, 3, 0));
+        assert!(
+            should_run_retention(target, None),
+            "waking at 03:00 has to land inside the sweep's own window"
+        );
+    }
+
+    #[test]
+    fn the_next_retention_wake_up_rolls_to_tomorrow_once_today_passed() {
+        assert_eq!(
+            next_retention_at(dt(2026, 8, 6, 3, 0)),
+            Some(dt(2026, 8, 7, 3, 0)),
+            "exactly at the hour, the next one is tomorrow's"
+        );
+        assert_eq!(
+            next_retention_at(dt(2026, 8, 6, 3, 29)),
+            Some(dt(2026, 8, 7, 3, 0))
+        );
+        assert_eq!(
+            next_retention_at(dt(2026, 8, 6, 23, 59)),
+            Some(dt(2026, 8, 7, 3, 0))
+        );
+    }
+
+    #[test]
+    fn retention_never_extends_a_sleep_past_the_safety_cap() {
+        // 03:00 is 9 hours out from here; the cap on manifest staleness wins.
+        let now = dt(2026, 8, 5, 18, 0);
+        assert_eq!(
+            compute_sleep_target(now, None, None, next_retention_at(now)),
+            now + chrono::Duration::minutes(MAX_SLEEP_MINUTES)
+        );
+    }
+
+    #[test]
+    fn the_earliest_of_the_three_wake_ups_wins() {
+        let cfg = summary_cfg("03:10", 30);
+        let now = dt(2026, 8, 6, 2, 50);
+        let agent_event = dt(2026, 8, 6, 2, 55);
+        // Agent event, then retention (03:00), then summary (03:10).
+        assert_eq!(
+            compute_sleep_target(
+                now,
+                Some(agent_event),
+                next_summary_at(now, &cfg),
+                next_retention_at(now)
+            ),
+            agent_event
+        );
+        assert_eq!(
+            compute_sleep_target(
+                now,
+                None,
+                next_summary_at(now, &cfg),
+                next_retention_at(now)
+            ),
+            dt(2026, 8, 6, 3, 0),
+            "retention is earlier than the summary here"
         );
     }
 

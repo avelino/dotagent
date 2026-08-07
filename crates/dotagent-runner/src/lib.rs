@@ -545,13 +545,19 @@ fn apply_env_for(
     if !inherit {
         cmd.env_clear();
     }
-    // Before `[env.extra]`, so a manifest that names a locale still wins.
-    if let Some(lang) = default_locale(
-        inherit,
-        std::env::var_os("LANG"),
-        std::env::var_os("LC_ALL"),
-    ) {
-        cmd.env("LANG", lang);
+    // Skipped entirely when the manifest names any locale variable: `LC_CTYPE`
+    // outranks `LANG`, so merely writing this first would not let a manifest
+    // that says `LANG = "pt_BR.UTF-8"` win — it would silently lose the one
+    // category that matters.
+    if !names_locale(env_cfg) {
+        if let Some(locale) = default_locale(
+            inherit,
+            std::env::var_os("LANG"),
+            std::env::var_os("LC_CTYPE"),
+            std::env::var_os("LC_ALL"),
+        ) {
+            cmd.env("LC_CTYPE", locale);
+        }
     }
     if let Some(cfg) = env_cfg {
         for (k, v) in &cfg.extra {
@@ -595,10 +601,24 @@ const FALLBACK_LOCALE: &str = "en_US.UTF-8";
 #[cfg(not(target_os = "macos"))]
 const FALLBACK_LOCALE: &str = "C.UTF-8";
 
-/// Pick a `LANG` for the agent, or `None` when the parent already named one.
+/// Whether the manifest already names the locale itself.
 ///
-/// launchd and systemd start a daemon with no `LANG` and no `LC_ALL`, and
-/// every agent inherits that gap. A process in the resulting `C` locale has
+/// Any of the three counts. `[env.extra]` is applied after this block, so a
+/// manifest naming `LANG` would still be beaten by an injected `LC_CTYPE`;
+/// standing down entirely is what makes "the manifest wins" true.
+fn names_locale(env_cfg: Option<&dotagent_core::EnvConfig>) -> bool {
+    env_cfg.is_some_and(|cfg| {
+        cfg.extra
+            .keys()
+            .any(|k| matches!(k.as_str(), "LANG" | "LC_ALL" | "LC_CTYPE"))
+    })
+}
+
+/// Pick an `LC_CTYPE` for the agent, or `None` when the parent already named
+/// the character-type locale.
+///
+/// launchd and systemd start a daemon with no locale at all, and every agent
+/// inherits that gap. A process in the resulting `C` locale has
 /// `MB_CUR_MAX == 1`, so it reads each **byte** of an environment variable as
 /// one character — Latin-1 — and writes it back out as UTF-8. The UTF-8 "é" a
 /// Telegram message puts in `AGENT_TRIGGER_PAYLOAD` reaches the agent as "Ã©",
@@ -610,16 +630,32 @@ const FALLBACK_LOCALE: &str = "C.UTF-8";
 /// *not* affected, which is why the same run logged a mangled prompt beside a
 /// clean answer for two months without anyone being able to place the bug.
 ///
+/// **`LC_CTYPE`, not `LANG`.** `MB_CUR_MAX` is the character-type category and
+/// nothing else, while `LANG` is the fallback for *every* category. Naming
+/// `LANG` would also move `LC_COLLATE` — on macOS from byte order to ICU
+/// collation, which silently changes `sort`, `[[ a < b ]]` and `[a-z]` ranges
+/// in `grep`/`tr` for every shell agent, and only on macOS, since `C.UTF-8`
+/// keeps byte order. Fixing mojibake is no reason to reorder somebody's output.
+///
+/// All three parent variables are consulted because POSIX precedence is
+/// `LC_ALL` > `LC_CTYPE` > `LANG`: an inherited `LC_CTYPE` (ssh forwards one
+/// from macOS via `SendEnv`, often without a `LANG` beside it) is the operator
+/// having chosen this exact category, and overriding it here would be the same
+/// class of surprise as moving `LC_COLLATE`. This function only ever fills a
+/// gap; it never overrules.
+///
 /// Kept pure so the decision is testable without mutating the process
 /// environment, which every other test in this file would then race against.
 fn default_locale(
     inherit: bool,
     parent_lang: Option<std::ffi::OsString>,
+    parent_lc_ctype: Option<std::ffi::OsString>,
     parent_lc_all: Option<std::ffi::OsString>,
 ) -> Option<&'static str> {
     // `env_clear()` drops whatever the parent had, so an inherited locale only
     // counts when the agent is actually inheriting.
-    let inherited = inherit && (parent_lang.is_some() || parent_lc_all.is_some());
+    let inherited =
+        inherit && (parent_lang.is_some() || parent_lc_ctype.is_some() || parent_lc_all.is_some());
     if inherited {
         return None;
     }
@@ -699,7 +735,36 @@ command = "true"
     #[test]
     fn locale_is_named_when_the_parent_named_none() {
         // launchd and systemd both start a daemon this way.
-        assert_eq!(default_locale(true, None, None), Some(FALLBACK_LOCALE));
+        assert_eq!(
+            default_locale(true, None, None, None),
+            Some(FALLBACK_LOCALE)
+        );
+    }
+
+    #[test]
+    fn the_locale_is_named_on_lc_ctype_not_lang() {
+        // `MB_CUR_MAX` is the ctype category alone. `LANG` also carries
+        // `LC_COLLATE`, and on macOS `en_US.UTF-8` swaps byte order for ICU
+        // collation — every shell agent that sorts would start ordering
+        // differently, on macOS only. That is not a fix, it is a second bug.
+        let m = minimal();
+        let args: Vec<String> = vec![];
+        let spec = spec_with(&m, &args, None, &[]);
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "x",
+            "default",
+            &Local::now(),
+            Path::new("/tmp"),
+            Path::new("/tmp/hb.json"),
+        );
+        assert_eq!(
+            lookup(&cmd, "LANG"),
+            None,
+            "naming LANG would move LC_COLLATE too"
+        );
     }
 
     #[test]
@@ -714,14 +779,23 @@ command = "true"
 
     #[test]
     fn an_inherited_lang_is_left_alone() {
-        assert_eq!(default_locale(true, os("pt_BR.UTF-8"), None), None);
+        assert_eq!(default_locale(true, os("pt_BR.UTF-8"), None, None), None);
     }
 
     #[test]
     fn an_inherited_lc_all_is_left_alone() {
-        // LC_ALL outranks LANG, so naming LANG under it would be a no-op that
-        // reads like a fix.
-        assert_eq!(default_locale(true, None, os("pt_BR.UTF-8")), None);
+        // LC_ALL outranks everything, so naming anything under it would be a
+        // no-op that reads like a fix.
+        assert_eq!(default_locale(true, None, None, os("pt_BR.UTF-8")), None);
+    }
+
+    #[test]
+    fn an_inherited_lc_ctype_is_left_alone() {
+        // Precedence is LC_ALL > LC_CTYPE > LANG. An `ssh` session from macOS
+        // forwards `LC_CTYPE` through `SendEnv` with no `LANG` beside it, so
+        // this is the one that arrives alone in practice — and it is the
+        // operator having named this exact category.
+        assert_eq!(default_locale(true, None, os("UTF-8"), None), None);
     }
 
     #[test]
@@ -729,7 +803,12 @@ command = "true"
         // `inherit = false` calls `env_clear()`, so whatever the parent had is
         // gone and the agent is back in `C` — the case that needs it most.
         assert_eq!(
-            default_locale(false, os("pt_BR.UTF-8"), os("pt_BR.UTF-8")),
+            default_locale(
+                false,
+                os("pt_BR.UTF-8"),
+                os("pt_BR.UTF-8"),
+                os("pt_BR.UTF-8")
+            ),
             Some(FALLBACK_LOCALE)
         );
     }
@@ -759,6 +838,50 @@ LANG = "pt_BR.UTF-8"
             Path::new("/tmp/hb.json"),
         );
         assert_eq!(lookup(&cmd, "LANG").as_deref(), Some("pt_BR.UTF-8"));
+        // And nothing of ours outranks it. `LC_CTYPE` beats `LANG`, so
+        // injecting one here would quietly ignore what the manifest asked for.
+        assert_eq!(
+            lookup(&cmd, "LC_CTYPE"),
+            None,
+            "a manifest that names a locale must not be overruled by LC_CTYPE"
+        );
+    }
+
+    #[test]
+    fn a_manifest_locale_wins_even_when_nothing_is_inherited() {
+        // `inherit = false` is the case where the fallback definitely applies,
+        // so this is the one that proves the manifest is not overruled rather
+        // than merely happening to agree with the parent environment.
+        let m = manifest(
+            r#"
+[agent]
+name = "x"
+[run]
+command = "true"
+[env]
+inherit = false
+[env.extra]
+LANG = "pt_BR.UTF-8"
+"#,
+        );
+        let args: Vec<String> = vec![];
+        let spec = spec_with(&m, &args, None, &[]);
+        let mut cmd = Command::new("true");
+        apply_env(
+            &mut cmd,
+            &spec,
+            "x",
+            "default",
+            &Local::now(),
+            Path::new("/tmp"),
+            Path::new("/tmp/hb.json"),
+        );
+        assert_eq!(lookup(&cmd, "LANG").as_deref(), Some("pt_BR.UTF-8"));
+        assert_eq!(
+            lookup(&cmd, "LC_CTYPE"),
+            None,
+            "LC_CTYPE outranks LANG — injecting one would discard the manifest's choice"
+        );
     }
 
     #[test]
@@ -787,8 +910,9 @@ LANG = "pt_BR.UTF-8"
         // its environment. (`cargo test` inherits a locale, so the second arm
         // is the one that fires locally; under launchd it is the first.)
         assert!(
-            lookup(&cmd, "LANG").is_some()
+            lookup(&cmd, "LC_CTYPE").is_some()
                 || std::env::var_os("LANG").is_some()
+                || std::env::var_os("LC_CTYPE").is_some()
                 || std::env::var_os("LC_ALL").is_some(),
             "a payload with non-ASCII needs a locale that can read it"
         );
