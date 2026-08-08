@@ -26,6 +26,21 @@ fn spec(label: &str, deadline_ms: u64) -> SpawnSpec {
     }
 }
 
+/// Polls `cond` until it holds or the timeout expires. Background tasks land
+/// their writes on the runtime's schedule, not on a stopwatch, so a fixed
+/// `sleep` long enough to be reliable on a loaded CI box is also a fixed tax
+/// on every local run. This is fast in the common case and still deterministic.
+async fn until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    cond()
+}
+
 fn sh(script: &str) -> Command {
     let mut cmd = Command::new("sh");
     cmd.arg("-c").arg(script);
@@ -485,10 +500,11 @@ async fn idle_snapshot_writer_stops_rewriting_the_file() {
     let _writer = sup.start_snapshot_writer(path.clone(), Duration::from_millis(20));
 
     // The empty snapshot still has to land once — `status` reads this file.
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert_eq!(
-        std::fs::read_to_string(&path).expect("written"),
-        "[]",
+    assert!(
+        until(Duration::from_secs(5), || {
+            std::fs::read_to_string(&path).is_ok_and(|b| b == "[]")
+        })
+        .await,
         "empty snapshot is published once"
     );
     let settled = std::fs::metadata(&path).expect("meta").modified().unwrap();
@@ -507,19 +523,28 @@ async fn a_spawn_wakes_the_parked_snapshot_writer() {
 
     let sup = Supervisor::new();
     let _writer = sup.start_snapshot_writer(path.clone(), Duration::from_millis(20));
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    assert_eq!(std::fs::read_to_string(&path).expect("written"), "[]");
+    assert!(
+        until(Duration::from_secs(5), || {
+            std::fs::read_to_string(&path).is_ok_and(|b| b == "[]")
+        })
+        .await,
+        "writer parks only after publishing the empty snapshot"
+    );
 
     let _handle = sup
         .spawn_supervised(sh("sleep 1"), spec("woken", 30_000))
         .await
         .expect("spawn");
 
-    tokio::time::sleep(Duration::from_millis(120)).await;
-    let body = std::fs::read_to_string(&path).expect("written");
     assert!(
-        body.contains("\"label\": \"woken\""),
-        "parked writer woke on spawn, got: {body}"
+        until(Duration::from_secs(5), || {
+            std::fs::read_to_string(&path)
+                .map(|b| b.contains("\"label\": \"woken\""))
+                .unwrap_or(false)
+        })
+        .await,
+        "parked writer woke on spawn, file was: {:?}",
+        std::fs::read_to_string(&path)
     );
 }
 

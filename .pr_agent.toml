@@ -1,0 +1,117 @@
+# Qodo Merge configuration for dotagent.
+#
+# Repo-level config. The rules below are not preferences invented here: they
+# restate constraints already written in `CLAUDE.md` and
+# `.github/copilot-instructions.md`, so a reviewer without that context does
+# not flag deliberate decisions as violations, and does not miss the ones that
+# matter.
+
+[review_agent]
+
+# Findings worth a line comment. The default (3) shows only "action required",
+# which on this repo's first review would have hidden the two most useful
+# findings: a health sweep that alerts on runs the operator asked to skip, and
+# a supervisor timer left armed after the registry drained. Both were
+# "review recommended".
+inline_comments_severity_threshold = 2
+comments_location_policy = "both"
+
+# ---------------------------------------------------------------------------
+# Compliance agent: repo rules, and the exceptions to them.
+# ---------------------------------------------------------------------------
+compliance_user_guidelines = """
+LANGUAGE. Do not flag Portuguese prose as a violation without checking the
+path first. This repo is deliberately bilingual:
+- English: `docs/**`, `README.md`, `CHANGELOG.md`, code comments, commit
+  messages, and every user-facing CLI string. Flag Portuguese here.
+- Portuguese (pt-BR) BY DESIGN, never flag: `CLAUDE.md`, `.claude/**`
+  (skills, agents, commands), and `.github/copilot-instructions.md`. These are
+  internal guides written for the maintainer and for LLM agents, not project
+  documentation. `CLAUDE.md` has been pt-BR since the repo was created.
+
+ARCHITECTURE. Layering rules, in the order they override each other:
+- `dotagent-scheduler` must contain NO IO and NO clock reads. No `std::fs`,
+  `std::env`, `tokio::fs`, `tokio::time::sleep`, or `chrono::Local::now()`
+  outside tests. Every function takes `now: DateTime<Local>` as a parameter.
+  This is a hard rule; flag any violation.
+- `dotagent-core` is the schema crate and stays free of side effects. Types,
+  parsing and validation only.
+- `crates/dotagent` (the binary) should stay thin: parse args, wire up,
+  dispatch. Substantial platform or business logic belongs in a library
+  crate. Flag it, and say which crate it should move to.
+- Built-in notifier drivers live in `dotagent-notify/src/drivers/`, never in
+  `plugins/`. Notify is the hot path on failure and is in-process on purpose.
+- Every ORCHESTRATED subprocess (agent, plugin, hook) goes through
+  `dotagent-supervisor` so it is visible to `status` and reapable on
+  shutdown. Ad-hoc helpers that are not orchestrated (`osascript` in the
+  desktop notifier, `pmset` for the power probe) are exempt.
+
+PUBLIC CONTRACTS. Changing any of these requires a CHANGELOG entry that says
+so explicitly; flag the change when the entry is missing:
+- `agent.toml` schema (`dotagent-core/src/manifest.rs`)
+- the plugin protocol (`info`/`validate`/`invoke` over JSON stdio)
+- the heartbeat file shape, which is intentionally wire-compatible with the
+  legacy Fish framework so both can read the same file during migration.
+  Additive optional fields are fine; renaming or removing one is not.
+
+OUTPUT. `println!`/`eprintln!` reaching a user's terminal must never render an
+internal struct or enum with `{:?}`. It leaks Rust types, escapes newlines as
+literals, and has no color or hierarchy. Run outcomes go through
+`crates/dotagent/src/commands/output.rs::render_outcome`.
+
+DIAGRAMS. Diagrams in markdown must be Mermaid. ASCII box-drawing is not
+accepted anywhere in this repo.
+
+DEFAULTS. A feature must work with no configuration. Config files exist to
+customize, never to enable basic functionality. Flag any new required field
+that could have had a sensible default.
+"""
+
+# ---------------------------------------------------------------------------
+# Issue agent: the failure modes this codebase actually has.
+# ---------------------------------------------------------------------------
+issues_user_guidelines = """
+This is a scheduler and process supervisor that runs unattended on a laptop.
+Weight findings by what actually breaks here.
+
+FAIL-OPEN ON ENVIRONMENT PROBES. Any probe of the host (power source,
+filesystem, network) must treat "could not read" as permission to proceed,
+never as a negative reading. An unreadable probe that silently disables the
+scheduler is worse than one that runs when it should not have. Flag any code
+path that collapses an error or a malformed value into a meaningful `false`.
+This class of bug has shipped here before.
+
+CREDENTIALS IN LOGS. A `reqwest::Error` renders the request URL in its
+`Display`, and for a Slack webhook or a Telegram bot the URL *is* the
+credential. Flag any error carrying a URL, token, or webhook that can reach a
+log macro, a notification body, or an audit entry. `NotifyError` has no
+`From<reqwest::Error>` on purpose; flag anything that reintroduces one.
+
+SILENT FAILURE. This project's whole reason to exist is noticing that a
+scheduled thing stopped happening. Flag any path where a failure is swallowed
+without an audit entry, a log line, or a health-state change: a dropped
+`Result`, a `let _ =` on something that can fail meaningfully, a spawned task
+whose panic nobody observes, a retry that gives up without recording it.
+
+BATTERY AND WAKE-UPS. The daemon is expected to hold no timers while it
+supervises nothing. Flag new fixed-interval polling (`tokio::time::interval`,
+a loop with a constant sleep) that runs regardless of whether there is work,
+and flag periodic filesystem writes whose payload is usually unchanged.
+Prefer deadline-driven sleeps and parking on a signal.
+
+CONCURRENCY. The supervisor parks background tasks on a `watch` channel and
+wakes them on registry changes. Flag: a registry mutation that does not signal
+the wake, a waiter that reads state before subscribing (lost wake-up), a
+signal sent while a lock is held, and any loop that can spin when a deadline
+has already passed.
+
+STATE ON DISK. Window state, heartbeats and the audit log are read by separate
+processes. Flag non-atomic writes (write without a temp file plus rename),
+missing lock handling, and any change to a path without the corresponding doc
+update in `docs/reference/paths.md`.
+
+TESTS. Flag tests that assert on a background task after a fixed `sleep`;
+under CI load they are flaky. Poll for the condition with a timeout instead.
+Also flag a test that appears to cover a behavior but injects past the code
+under test, so it would stay green if that code broke.
+"""

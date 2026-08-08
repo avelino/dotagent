@@ -1345,7 +1345,7 @@ pub async fn tick_once(
 
     // Alerting on conditions the run loop cannot see: an agent that stopped
     // being scheduled never reaches `dispatch_one`, so it never fires anything.
-    sweep_health_notifications(&agents, state, audit, plugins, now).await;
+    sweep_health_notifications(&agents, state, audit, plugins, power, now).await;
 
     let next_event = compute_next_event_from_agents(&agents, state, now);
 
@@ -1367,8 +1367,16 @@ pub async fn tick_once(
 
 /// Dry-run variant: reports what `tick_once` *would* do without dispatching
 /// or writing to the audit log.
-pub async fn tick_dry_run(state: &StateStore, now: DateTime<Local>) -> TickResult {
+pub async fn tick_dry_run(
+    state: &StateStore,
+    power_config: &dotagent_core::PowerConfig,
+    now: DateTime<Local>,
+) -> TickResult {
     let agents = discovery::discover_all().unwrap_or_default();
+    let power = PowerGate::detect(
+        power_config,
+        agents.iter().flat_map(|a| a.manifest.schedules.iter()),
+    );
     let mut would_dispatch = 0u32;
 
     for agent in &agents {
@@ -1388,6 +1396,12 @@ pub async fn tick_dry_run(state: &StateStore, now: DateTime<Local>) -> TickResul
             }
             let policy = ResolvedPolicy::resolve(&agent.manifest, sched);
             if is_stale(expected, policy.stale_after_minutes, now) {
+                continue;
+            }
+            // Mirrors the gate in `dispatch_one`, in the same position. A
+            // dry run that counted a deferred schedule as dispatchable would
+            // misreport the one thing it exists to predict.
+            if power.defers(sched) {
                 continue;
             }
             let slug = slug_from_args(sched.args());
@@ -2075,6 +2089,7 @@ async fn sweep_health_notifications(
     state: &StateStore,
     audit: &AuditLog,
     plugins: &PluginClient,
+    power: PowerGate,
     now: DateTime<Local>,
 ) {
     let store = NotifyDedupStore::from_home();
@@ -2087,6 +2102,19 @@ async fn sweep_health_notifications(
         }
         let name = &agent.manifest.agent.name;
         for sched in &agent.manifest.schedules {
+            // A schedule the power policy is holding back has not failed; it
+            // was never eligible to run. Its window ages exactly like a broken
+            // one's, though, so without this a weekend spent unplugged turns
+            // every deferred schedule into a `stale` alert for behavior the
+            // operator explicitly asked for.
+            //
+            // `continue` rather than clearing the ladder: an agent already
+            // failing before the charger came out should resume its existing
+            // episode when power returns, not restart the escalation from
+            // scratch.
+            if power.defers(sched) {
+                continue;
+            }
             let policy = ResolvedPolicy::resolve(&agent.manifest, sched);
             let slug = slug_from_args(sched.args());
             let hb = state.read_heartbeat(name, &slug).ok().flatten();

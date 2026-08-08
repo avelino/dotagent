@@ -447,6 +447,9 @@ impl Supervisor {
                 .map(|e| e.started_instant.elapsed())
                 .unwrap_or_default()
         };
+        // Same reason as `SupervisedHandle::deregister`: the reaper is asleep
+        // on a deadline this entry may have owned.
+        self.inner.wake_all();
         self.inner.emit(SupervisorEvent::Finished {
             id,
             owner,
@@ -819,12 +822,20 @@ impl SupervisedHandle {
     }
 
     fn deregister(&self) {
-        let mut reg = self
-            .supervisor
-            .registry
-            .lock()
-            .expect("registry lock poisoned");
-        reg.remove(&self.id);
+        {
+            let mut reg = self
+                .supervisor
+                .registry
+                .lock()
+                .expect("registry lock poisoned");
+            reg.remove(&self.id);
+        }
+        // Removing an entry can only bring the nearest deadline *closer* or
+        // empty the registry, and the reaper is asleep on the old one either
+        // way. Without this, a process that finishes in a second leaves a
+        // ten-minute timer armed behind it, and "an idle daemon holds no
+        // timers" stays false until that timer fires on nothing.
+        self.supervisor.wake_all();
     }
 
     /// Returns `true` when the reaper has already claimed this entry (set
