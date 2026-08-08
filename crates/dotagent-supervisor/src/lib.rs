@@ -819,12 +819,17 @@ impl SupervisedHandle {
     }
 
     fn deregister(&self) {
-        let mut reg = self
-            .supervisor
-            .registry
-            .lock()
-            .expect("registry lock poisoned");
-        reg.remove(&self.id);
+        {
+            let mut reg = self
+                .supervisor
+                .registry
+                .lock()
+                .expect("registry lock poisoned");
+            reg.remove(&self.id);
+        }
+        // Removing the nearest (or last) entry must interrupt the reaper's
+        // obsolete deadline sleep.
+        self.supervisor.wake_all();
     }
 
     /// Returns `true` when the reaper has already claimed this entry (set
