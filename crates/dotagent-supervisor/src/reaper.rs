@@ -40,16 +40,54 @@ impl Drop for ReaperHandle {
     }
 }
 
-pub(crate) fn start(inner: Arc<Inner>, tick: Duration) -> ReaperHandle {
+pub(crate) fn start(inner: Arc<Inner>) -> ReaperHandle {
     let handle = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tick);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            interval.tick().await;
+            // Subscribed before the registry is read: a spawn that lands
+            // between the read and the park below must not be missed, or the
+            // reaper sleeps through a deadline nearer than the one it sized
+            // its sleep for.
+            let mut wake = inner.wake.subscribe();
+
+            match next_deadline(&inner) {
+                // Nothing the reaper could ever act on. Park — this is where
+                // an idle daemon spends its day, and it costs no wake-ups.
+                None => {
+                    let _ = wake.changed().await;
+                }
+                // Already past due: sweep without going through the timer.
+                Some(d) if d.is_zero() => {}
+                Some(d) => {
+                    tokio::select! {
+                        _ = tokio::time::sleep(d) => {}
+                        // A nearer deadline may have just been registered;
+                        // recompute rather than finish this sleep.
+                        _ = wake.changed() => continue,
+                    }
+                }
+            }
             sweep_once(&inner).await;
         }
     });
     ReaperHandle::wrap(handle)
+}
+
+/// Time until the nearest deadline the reaper is allowed to enforce.
+///
+/// `None` means there is nothing to wait for: either the registry is empty or
+/// every entry is one the reaper will skip anyway. Returning `Some(ZERO)` for
+/// those would spin — `sweep_once` ignores them, so the loop would find the
+/// same entry past due on every pass.
+fn next_deadline(inner: &Inner) -> Option<Duration> {
+    let now = Instant::now();
+    let reg = inner.registry.lock().expect("registry lock poisoned");
+    reg.values()
+        .filter(|e| !e.killed_by_reaper && e.pgid.is_some())
+        .map(|e| {
+            e.deadline
+                .saturating_sub(now.saturating_duration_since(e.started_instant))
+        })
+        .min()
 }
 
 async fn sweep_once(inner: &Inner) {

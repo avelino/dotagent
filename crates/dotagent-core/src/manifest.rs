@@ -173,6 +173,12 @@ pub struct ScheduleOverrides {
     pub max_retries: Option<u32>,
     pub retry_backoff_minutes: Option<Vec<u32>>,
     pub stale_after_minutes: Option<u32>,
+    /// Overrides `[power] on_battery` from `config.toml` for this schedule.
+    ///
+    /// Per-schedule rather than per-agent because the cost is per-schedule: an
+    /// agent can reasonably keep its cheap hourly check on battery while its
+    /// expensive every-15-minutes sync waits for a charger.
+    pub on_battery: Option<crate::power::PowerPolicy>,
 }
 
 /// Reference to a plugin in `preflight` / `on_failure` / `on_success`.

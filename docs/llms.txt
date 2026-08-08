@@ -132,6 +132,8 @@ args = ["--period", "yesterday"]   # appended to [run].args
 max_retries = 20
 retry_backoff_minutes = [30]
 stale_after_minutes = 240
+on_battery = "defer"               # "run" (default) | "defer" — overrides
+                                   # [power] in config.toml for this schedule
 
 [[schedules]]
 id = "every-90"
@@ -193,6 +195,7 @@ env_passthrough = ["PATH", "HOME", "LANG"]
 | `[[schedules]]`| `interval_minutes`     | int             | interval | —                      |
 | `[[schedules]]`| `expression`           | string          | expr     | — (systemd OnCalendar) |
 | `[[schedules]]`| `args`                 | `string[]`      | no       | `[]`                   |
+| `[[schedules]]`| `on_battery`           | `run`/`defer`   | no       | `[power] on_battery`   |
 | `[lifecycle]`  | `mode`                 | `oneshot`/`persistent` | no | `oneshot`           |
 | `[lifecycle]`  | `key`                  | string          | no       | — (single instance)    |
 | `[lifecycle]`  | `idle_timeout_seconds` | int             | no       | `1800`                 |
@@ -650,6 +653,25 @@ chat_id   = "123456789"
 
 The daemon schedules its own wake-up for `time`. `events` inside those
 entries is ignored — the list is already scoped to one event.
+
+Power policy lives in the same file. Defaults change nothing; the probe
+(`pmset` on macOS, `/sys/class/power_supply` on Linux) does not even run
+unless one of the two fields can defer something. An undetectable power
+source reads as mains — a machine whose battery cannot be read must keep
+running its agents.
+
+```toml
+# ~/.config/dotagent/config.toml — all defaults shown
+[power]
+on_battery          = "run"   # "run" | "defer" — defer holds runs until AC
+min_battery_percent = 0       # defer below this charge, whatever the above says
+```
+
+Deferring does not queue: both schedule kinds resolve to the *current*
+window, so an agent deferred across four hours of battery runs once when
+the charger goes in, not sixteen times. A deferred run writes no window
+state and burns no retry. The check is after the staleness check, so a
+window that ages past `stale_after_minutes` while unplugged is dropped.
 
 `stale` and `given_up` fire from a *condition*, not a one-off event, so they
 re-notify on a rising ladder — on entry, then 1h, 6h, daily — until the

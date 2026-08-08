@@ -91,6 +91,8 @@ docs/
 | Spawn de subprocess (plugin) | `dotagent-plugin` (chama `dotagent-supervisor`) |
 | Process-group / kill-tree / deadline | `dotagent-supervisor` (todo subprocess **orquestrado** — agent, plugin, hook — passa por ele; helpers ad-hoc como `osascript` num driver de notify ficam livres) |
 | Reap de processo órfão no boot | `dotagent-supervisor/src/orphan.rs` + chamada em `daemon.rs` antes do snapshot writer + `docs/guides/daemon-lifecycle.md` |
+| Política de energia (decisão, pura) | `dotagent-core/src/power.rs` + `docs/guides/config-reference.md` |
+| Detecção de fonte de energia (IO) | `dotagent/src/power.rs` — **nunca** em `dotagent-core`, que é livre de side effect |
 | Geração de plist/systemd | `dotagent-unit-gen` |
 | Setup de logs / OTel / retention | `dotagent-telemetry` |
 | Novo subcomando CLI | `crates/dotagent/src/commands/` |

@@ -369,6 +369,38 @@ real next wake-up can be earlier than what it prints when the summary
 is closer. See
 [`[daily_summary]`](config-reference.md#daily_summary).
 
+### The background tasks do not add wake-ups
+
+Two supervisor tasks run beside the loop, and neither polls:
+
+| Task            | While something is supervised     | While nothing is        |
+|-----------------|-----------------------------------|-------------------------|
+| reaper          | sleeps until the nearest deadline | parked                  |
+| snapshot writer | rewrites the file every 2s        | parked after one write  |
+
+Both park on the same signal, which a spawn — or a `retime` that pulls a
+deadline in — raises. A daemon supervising nothing therefore holds **no
+timers at all**: it is asleep until its next scheduled event, and nothing
+underneath it is ticking.
+
+This matters on a laptop, where periodic work is charged twice: once for
+the CPU, and again for keeping the machine out of deep idle. The reaper
+formerly swept on a fixed 5-second tick (~17k wake-ups a day) and the
+snapshot writer rewrote a byte-identical `[]` every 2 seconds (~43k
+writes a day) to record that nothing had changed.
+
+The reaper losing its tick also made it *more* precise, not less: it now
+fires on the deadline instead of up to one tick after it.
+
+### Power
+
+Scheduled runs can be held back while the machine is on battery — see
+[`[power]`](config-reference.md#power). The check happens per dispatch,
+not per wake-up: the daemon still wakes on schedule, decides nothing is
+to be dispatched, and goes back to sleep. Deferred runs leave no trace,
+so plugging the charger back in dispatches the current window as if it
+had just come due.
+
 ---
 
 ## Uninstall

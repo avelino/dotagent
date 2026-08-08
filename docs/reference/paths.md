@@ -199,9 +199,14 @@ state/
 ### `state/supervisor.json`
 
 Snapshot of every subprocess the daemon is supervising right now (agents
-+ plugin invocations). The daemon rewrites this file every 2s; out-of-
-process consumers (`dotagent status`, `dotagent doctor`) read it to
-surface live processes with age vs deadline. Cleared on daemon exit.
++ plugin invocations). Out-of-process consumers (`dotagent status`,
+`dotagent doctor`) read it to surface live processes with age vs
+deadline. Cleared on daemon exit.
+
+The daemon refreshes it every 2s *while something is supervised*. Once
+the registry drains it publishes the empty snapshot once and then stops
+writing until the next spawn — so an unchanging mtime is the normal
+resting state, not a sign of trouble.
 
 ```jsonc
 [
@@ -233,9 +238,12 @@ anything. Both are optional on read: a snapshot written by an older
 build has neither, and such a record must deserialize into one that is
 refused rather than fail the whole file.
 
-Missing file ⇒ daemon not running. Stale file (>5s) ⇒ the previous
-daemon did not run its shutdown path (`SIGKILL`, panic, `launchctl
-kickstart -k`), because that path deletes this file. The next daemon
+Missing file ⇒ daemon not running. **File age is not a liveness
+signal**: an idle daemon deliberately stops rewriting it, so an old
+mtime says nothing about whether the daemon is alive. What the file's
+mere *existence* means is that the previous daemon did not run its
+shutdown path (`SIGKILL`, panic, `launchctl kickstart -k`), because
+that path deletes this file. The next daemon
 treats the leftover as a record of possible orphans: it reaps the
 entries whose identity it can confirm, leaves every other entry alone,
 and then removes the file. An unreadable or unparseable snapshot

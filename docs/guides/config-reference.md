@@ -18,6 +18,7 @@ If this file is **missing**, dotagent uses the baked-in defaults
 | **Talk to your agents from Telegram** | [`[telegram]`](#telegram) |
 | **Move or disable long-term memory** | [`[memory]`](#memory) |
 | Retime the daily health summary, or send it somewhere other than the desktop | [`[daily_summary]`](#daily_summary) |
+| **Stop agents from running on battery** | [`[power]`](#power) |
 
 Two of those differ in kind. `[logging]`, `[telemetry]` and `[memory]` tune
 something that already works; `[telegram]` **turns on** a path that does not
@@ -86,6 +87,10 @@ paths = []                           # extra roots, searched before the defaults
 enabled = true                       # default; false removes the menu and tools
 claude_commands = false              # default; opt in to ~/.claude/commands
 paths = []                           # extra roots, searched before the defaults
+
+[power]
+on_battery = "run"                   # default; run | defer
+min_battery_percent = 0              # default; 0 = charge is never consulted
 
 [daily_summary]
 enabled = true                       # default; governs the daemon's fire only
@@ -374,6 +379,90 @@ window_retention_days = 90   # keep a quarter of retry history
 Heartbeats are deliberately not covered: there is exactly one per
 `(agent, schedule)` and it is rewritten in place, so
 `state/agents/` is bounded by how many schedules exist.
+
+---
+
+## `[power]`
+
+Whether a due run happens while the machine is on battery. **Off by
+default** — dotagent dispatches exactly as it always did until you opt
+in, and never probes the power source when the settings can't defer
+anything.
+
+| Field                  | Type   | Default | Valid values                                                        |
+|------------------------|--------|---------|---------------------------------------------------------------------|
+| `on_battery`           | string | `run`   | `run` dispatches regardless. `defer` holds runs until mains power.  |
+| `min_battery_percent`  | uint   | `0`     | Defer below this charge whatever `on_battery` says. `0` disables.   |
+
+The problem it solves is specific to laptops. A daemon that sleeps
+between events costs nothing, but the *agents* it wakes up to run are
+not free: a 15-minute interval agent fires 96 times a day whether the
+machine is plugged in at a desk or in a bag at 12%.
+
+```toml
+[power]
+on_battery = "defer"        # nothing scheduled runs on battery
+min_battery_percent = 20    # ...and never below 20%, even if you set "run"
+```
+
+The two rules are independent. `min_battery_percent` is the common
+case on its own: agents are welcome to run on battery in general, just
+not when there is nearly none left.
+
+```toml
+[power]
+min_battery_percent = 20    # on_battery stays "run"
+```
+
+### Deferring does not queue
+
+A deferred run is not stored and replayed. Both schedule kinds resolve
+to the *current* window rather than a backlog, so an agent deferred
+across four hours of battery runs **once** when the charger goes in —
+not sixteen times. This is the behavior that makes `defer` safe to set
+on an aggressive interval.
+
+The check sits after the staleness check, so a window that ages past
+[`stale_after_minutes`](../reference/agent-spec.md) while on battery is
+dropped rather than run hours late. That is the same call staleness
+always makes; if you want a deferred agent to survive a long unplugged
+stretch, widen its `stale_after_minutes`.
+
+### Per-schedule override
+
+`[power]` is the default. Any schedule can override it, because the
+cost is per-schedule — an agent can keep a cheap hourly check running
+on battery while its expensive every-15-minutes sync waits for a
+charger:
+
+```toml
+[[schedules]]
+id = "every-15min"
+type = "interval"
+interval_minutes = 15
+on_battery = "defer"        # overrides [power] for this schedule only
+```
+
+See [`agent-spec.md`](../reference/agent-spec.md) for the field in
+context. `min_battery_percent` is deliberately **not** overridable: "the
+battery is nearly empty" is a fact about the machine, not about one
+schedule's appetite.
+
+### Detection
+
+| Platform | Probe                                                     |
+|----------|-----------------------------------------------------------|
+| macOS    | `pmset -g batt`                                           |
+| Linux    | `/sys/class/power_supply/*` (`type`, `online`, `capacity`) |
+| Other    | undetectable                                              |
+
+An undetectable power source is treated as mains power: a machine whose
+battery cannot be read must keep running its agents. Failing to run is
+the worse failure.
+
+`dotagent tick` honors these settings too — a tick that dispatched what
+the daemon would have held back would misreport the thing it exists to
+reproduce.
 
 ---
 

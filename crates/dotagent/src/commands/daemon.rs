@@ -35,11 +35,12 @@ use dotagent_state::{
     notify_dedup::{alert_key, AlertEpisode, NotifyDedupStore},
     slug_from_args, StateStore,
 };
-use dotagent_supervisor::{Supervisor, DEFAULT_REAPER_TICK};
+use dotagent_supervisor::{Supervisor, SNAPSHOT_TICK};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, info, warn};
 
 use crate::discovery::{self, DiscoveredAgent};
+use crate::power::PowerGate;
 
 /// Hard upper bound on a single sleep cycle. After this, the daemon
 /// re-discovers manifests even if no event fires — covers the case where a
@@ -847,12 +848,13 @@ pub async fn run() -> Result<()> {
     // so `dotagent status`/`doctor` can see the live subprocess tree and
     // `shutdown` can reap everything on SIGTERM.
     let supervisor = Supervisor::new();
-    let _reaper = supervisor.start_reaper(DEFAULT_REAPER_TICK);
-    // Periodic snapshot dump so `dotagent status` and `dotagent doctor`
-    // (separate processes) can see what the daemon is supervising.
+    let _reaper = supervisor.start_reaper();
+    // Snapshot dump so `dotagent status` and `dotagent doctor` (separate
+    // processes) can see what the daemon is supervising. Both background tasks
+    // park while nothing is supervised, so an idle daemon holds no timers.
     let _snapshot_writer = supervisor.start_snapshot_writer(
         dotagent_state::paths::supervisor_snapshot_file(),
-        Duration::from_secs(2),
+        SNAPSHOT_TICK,
     );
     let plugins = PluginClient::from_environment().with_supervisor(supervisor.clone());
     // Live processes for `[lifecycle] mode = "persistent"` agents. Shares the
@@ -942,8 +944,16 @@ pub async fn run() -> Result<()> {
     let mut last_retention_date: Option<chrono::NaiveDate> = None;
     let exit_reason = loop {
         let cycle_start = Local::now();
-        let TickResult { next_event, .. } =
-            tick_once(&state, &audit, &plugins, &cache, Some(&pool), cycle_start).await;
+        let TickResult { next_event, .. } = tick_once(
+            &state,
+            &audit,
+            &plugins,
+            &cache,
+            Some(&pool),
+            &app_config.power,
+            cycle_start,
+        )
+        .await;
 
         // Collect persistent instances the reaper took while nobody was
         // looking. The reaper kills a process; it does not know the pool
@@ -1295,6 +1305,7 @@ pub async fn tick_once(
     plugins: &PluginClient,
     cache: &ManifestCache,
     pool: Option<&PersistentPool>,
+    power_config: &dotagent_core::PowerConfig,
     now: DateTime<Local>,
 ) -> TickResult {
     let found = discovery::discover();
@@ -1322,7 +1333,15 @@ pub async fn tick_once(
     // rotates. See `docs/guides/observability.md`.
     debug!(agents_scanned = agents.len(), "tick started");
 
-    let runs_dispatched = dispatch_due_runs(&agents, state, audit, plugins, pool, now).await;
+    // Resolved here, not in the run loop, because it needs the manifests: a
+    // gate built from `[power]` alone cannot see a schedule's own
+    // `on_battery` and would silently ignore every per-schedule override.
+    let power = PowerGate::detect(
+        power_config,
+        agents.iter().flat_map(|a| a.manifest.schedules.iter()),
+    );
+
+    let runs_dispatched = dispatch_due_runs(&agents, state, audit, plugins, pool, power, now).await;
 
     // Alerting on conditions the run loop cannot see: an agent that stopped
     // being scheduled never reaches `dispatch_one`, so it never fires anything.
@@ -1592,6 +1611,7 @@ pub(crate) async fn dispatch_due_runs(
     audit: &AuditLog,
     plugins: &PluginClient,
     pool: Option<&PersistentPool>,
+    power: PowerGate,
     now: DateTime<Local>,
 ) -> u32 {
     let mut dispatched = 0u32;
@@ -1600,7 +1620,7 @@ pub(crate) async fn dispatch_due_runs(
             continue;
         }
         for sched in &agent.manifest.schedules {
-            if dispatch_one(agent, sched, state, audit, plugins, pool, now).await {
+            if dispatch_one(agent, sched, state, audit, plugins, pool, power, now).await {
                 dispatched += 1;
             }
         }
@@ -1617,6 +1637,7 @@ async fn dispatch_one(
     audit: &AuditLog,
     plugins: &PluginClient,
     pool: Option<&PersistentPool>,
+    power: PowerGate,
     now: DateTime<Local>,
 ) -> bool {
     let dctx = DaemonCtx {
@@ -1645,6 +1666,24 @@ async fn dispatch_one(
         return false;
     }
 
+    // 2. Power gate. Deliberately before the window is read or written: a
+    //    deferred run must leave no trace, so that plugging the charger back
+    //    in finds the window exactly as it was and dispatches it. Recording an
+    //    attempt here would burn a retry for something that never ran.
+    //
+    //    Note this sits *after* the staleness check: a machine left on battery
+    //    past `stale_after_minutes` drops the window rather than running a
+    //    stale job hours late. That is the same call staleness always makes.
+    if power.defers(sched) {
+        debug!(
+            agent = %agent.manifest.agent.name,
+            schedule = sched.id(),
+            battery_percent = power.battery_percent(),
+            "run deferred: on battery"
+        );
+        return false;
+    }
+
     let slug = slug_from_args(sched.args());
     let mut window = state
         .read_window(&agent.manifest.agent.name, &slug, expected)
@@ -1661,7 +1700,7 @@ async fn dispatch_one(
         return false;
     }
 
-    // 2. Backoff gate. If we've already attempted ≥1 and the wait hasn't
+    // 3. Backoff gate. If we've already attempted ≥1 and the wait hasn't
     //    elapsed yet, skip.
     let last_attempt = window
         .last_attempt_at
@@ -1675,14 +1714,14 @@ async fn dispatch_one(
         return false;
     }
 
-    // 3. max_retries gate. If we've already burned them, mark given_up and
+    // 4. max_retries gate. If we've already burned them, mark given_up and
     //    fire on_failure(given_up).
     if window.attempts >= policy.max_retries {
         give_up(agent, sched, &mut window, &dctx, &slug, expected).await;
         return false;
     }
 
-    // 4. Dispatch.
+    // 5. Dispatch.
     info!(
         agent = %agent.manifest.agent.name,
         schedule = %sched.id(),
@@ -1726,7 +1765,7 @@ async fn dispatch_one(
         }
     };
 
-    // 5. Update window state from outcome.
+    // 6. Update window state from outcome.
     window.attempts += 1;
     window.last_attempt_at = Some(now.timestamp());
 
