@@ -185,6 +185,7 @@ fn detect_linux() -> PowerSource {
     };
 
     let mut saw_mains = false;
+    let mut mains_state_unknown = false;
     let mut on_mains = false;
     let mut percent = None;
 
@@ -194,8 +195,13 @@ fn detect_linux() -> PowerSource {
         match kind.trim() {
             "Mains" => {
                 saw_mains = true;
-                if std::fs::read_to_string(path.join("online")).is_ok_and(|s| s.trim() == "1") {
-                    on_mains = true;
+                match std::fs::read_to_string(path.join("online")) {
+                    Ok(value) => match value.trim() {
+                        "1" => on_mains = true,
+                        "0" => {}
+                        _ => mains_state_unknown = true,
+                    },
+                    Err(_) => mains_state_unknown = true,
                 }
             }
             // `scope = Device` is a peripheral's battery — a wireless mouse,
@@ -215,11 +221,11 @@ fn detect_linux() -> PowerSource {
         }
     }
 
-    match (saw_mains, on_mains) {
-        // No mains supply at all: not a laptop we understand. Don't guess.
-        (false, _) => PowerSource::Unknown,
-        (true, true) => PowerSource::Ac,
-        (true, false) => PowerSource::Battery { percent },
+    match (saw_mains, mains_state_unknown, on_mains) {
+        // No mains supply, or an unreadable/malformed state: don't guess.
+        (false, _, _) | (true, true, _) => PowerSource::Unknown,
+        (true, false, true) => PowerSource::Ac,
+        (true, false, false) => PowerSource::Battery { percent },
     }
 }
 
