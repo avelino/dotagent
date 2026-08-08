@@ -1345,7 +1345,15 @@ pub async fn tick_once(
 
     // Alerting on conditions the run loop cannot see: an agent that stopped
     // being scheduled never reaches `dispatch_one`, so it never fires anything.
-    sweep_health_notifications(&agents, state, audit, plugins, now).await;
+    // A power-deferred schedule is intentionally not eligible; do not let
+    // the timing-only health sweep turn that policy into a stale alert.
+    let power_defers = agents
+        .iter()
+        .flat_map(|a| a.manifest.schedules.iter())
+        .any(|sched| power.defers(sched));
+    if !power_defers {
+        sweep_health_notifications(&agents, state, audit, plugins, now).await;
+    }
 
     let next_event = compute_next_event_from_agents(&agents, state, now);
 
@@ -1367,8 +1375,16 @@ pub async fn tick_once(
 
 /// Dry-run variant: reports what `tick_once` *would* do without dispatching
 /// or writing to the audit log.
-pub async fn tick_dry_run(state: &StateStore, now: DateTime<Local>) -> TickResult {
+pub async fn tick_dry_run(
+    state: &StateStore,
+    power_config: &dotagent_core::config::PowerConfig,
+    now: DateTime<Local>,
+) -> TickResult {
     let agents = discovery::discover_all().unwrap_or_default();
+    let power = PowerGate::detect(
+        power_config,
+        agents.iter().flat_map(|a| a.manifest.schedules.iter()),
+    );
     let mut would_dispatch = 0u32;
 
     for agent in &agents {
@@ -1387,6 +1403,9 @@ pub async fn tick_dry_run(state: &StateStore, now: DateTime<Local>) -> TickResul
                 continue;
             }
             let policy = ResolvedPolicy::resolve(&agent.manifest, sched);
+            if power.defers(sched) {
+                continue;
+            }
             if is_stale(expected, policy.stale_after_minutes, now) {
                 continue;
             }

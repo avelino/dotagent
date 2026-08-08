@@ -122,7 +122,8 @@ pub async fn tick(dry_run: bool, _verbose: bool) -> Result<()> {
     let now = chrono::Local::now();
 
     if dry_run {
-        let r = daemon::tick_dry_run(&state, now).await;
+        let cfg = dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
+        let r = daemon::tick_dry_run(&state, &cfg.power, now).await;
         println!(
             "(dry-run) scanned {} agent(s); would dispatch {}; next event: {}",
             r.agents_scanned,
