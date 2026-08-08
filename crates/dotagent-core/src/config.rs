@@ -72,6 +72,8 @@ pub struct Config {
     pub commands: CommandsConfig,
     #[serde(default)]
     pub daily_summary: DailySummaryConfig,
+    #[serde(default)]
+    pub power: crate::power::PowerConfig,
 }
 
 /// End-of-day health summary — when it goes out, and to whom.

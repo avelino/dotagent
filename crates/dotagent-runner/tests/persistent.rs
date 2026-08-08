@@ -529,7 +529,7 @@ async fn sweep_forgets_instances_the_reaper_took() {
     );
     let state = f.state();
     let supervisor = Supervisor::with_grace(Duration::from_millis(50));
-    let _reaper = supervisor.start_reaper(Duration::from_millis(100));
+    let _reaper = supervisor.start_reaper();
     let pool = PersistentPool::new(supervisor.clone());
 
     let first = run_once(&pool, &f, &state, &[]).await;

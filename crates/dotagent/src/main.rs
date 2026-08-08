@@ -12,6 +12,7 @@ use clap_complete::Shell;
 
 mod commands;
 mod discovery;
+mod power;
 mod skills;
 mod slash;
 

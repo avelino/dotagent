@@ -114,7 +114,7 @@ async fn timeout_reaps_grandchildren_via_process_group() {
 #[tokio::test(flavor = "current_thread")]
 async fn reaper_kills_forgotten_handle_via_deadline() {
     let sup = Supervisor::with_grace(Duration::from_millis(150));
-    let _reaper = sup.start_reaper(Duration::from_millis(100));
+    let _reaper = sup.start_reaper();
 
     let handle = sup
         .spawn_supervised(sh("sleep 30 & wait"), spec("forgotten", 300))
@@ -247,7 +247,7 @@ async fn race_handle_vs_reaper_emits_killed_once() {
             }
         },
     ));
-    let _reaper = sup.start_reaper(Duration::from_millis(50));
+    let _reaper = sup.start_reaper();
     let handle = sup
         .spawn_supervised(sh("sleep 30"), spec("race", 200))
         .await
@@ -341,7 +341,7 @@ fn persistent_spec(label: &str, deadline_ms: u64) -> SpawnSpec {
 #[tokio::test(flavor = "current_thread")]
 async fn retime_postpones_the_reaper() {
     let sup = Supervisor::with_grace(Duration::from_millis(100));
-    let _reaper = sup.start_reaper(Duration::from_millis(50));
+    let _reaper = sup.start_reaper();
 
     let mut handle = sup
         .spawn_supervised(sh("sleep 30 & wait"), persistent_spec("warm", 300))
@@ -369,7 +369,7 @@ async fn retime_postpones_the_reaper() {
 #[tokio::test(flavor = "current_thread")]
 async fn retime_to_a_shorter_deadline_lets_the_reaper_win() {
     let sup = Supervisor::with_grace(Duration::from_millis(100));
-    let _reaper = sup.start_reaper(Duration::from_millis(50));
+    let _reaper = sup.start_reaper();
 
     let mut handle = sup
         .spawn_supervised(sh("sleep 30 & wait"), persistent_spec("idle", 30_000))
@@ -471,4 +471,106 @@ async fn try_wait_reports_liveness_without_blocking() {
     tokio::time::sleep(Duration::from_millis(600)).await;
     let status = handle.try_wait().expect("try_wait").expect("exited");
     assert!(status.success());
+}
+
+/// The whole point of the parked snapshot writer: an idle daemon must stop
+/// touching the file. Before this, the writer rewrote a byte-identical `[]`
+/// every tick — 43k writes a day on a laptop that supervised nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn idle_snapshot_writer_stops_rewriting_the_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("supervisor.json");
+
+    let sup = Supervisor::new();
+    let _writer = sup.start_snapshot_writer(path.clone(), Duration::from_millis(20));
+
+    // The empty snapshot still has to land once — `status` reads this file.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("written"),
+        "[]",
+        "empty snapshot is published once"
+    );
+    let settled = std::fs::metadata(&path).expect("meta").modified().unwrap();
+
+    // Many ticks' worth of wall clock with nothing supervised.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = std::fs::metadata(&path).expect("meta").modified().unwrap();
+    assert_eq!(settled, after, "idle writer must not touch the file again");
+}
+
+/// ...but parking must not make it deaf: a spawn has to wake the writer.
+#[tokio::test(flavor = "current_thread")]
+async fn a_spawn_wakes_the_parked_snapshot_writer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("supervisor.json");
+
+    let sup = Supervisor::new();
+    let _writer = sup.start_snapshot_writer(path.clone(), Duration::from_millis(20));
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert_eq!(std::fs::read_to_string(&path).expect("written"), "[]");
+
+    let _handle = sup
+        .spawn_supervised(sh("sleep 1"), spec("woken", 30_000))
+        .await
+        .expect("spawn");
+
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    let body = std::fs::read_to_string(&path).expect("written");
+    assert!(
+        body.contains("\"label\": \"woken\""),
+        "parked writer woke on spawn, got: {body}"
+    );
+}
+
+/// The reaper is deadline-driven now; parking must not cost it its teeth.
+#[tokio::test(flavor = "current_thread")]
+async fn parked_reaper_still_kills_a_process_that_blows_its_deadline() {
+    let sup = Supervisor::with_grace(Duration::from_millis(50));
+    // Started while the reaper is parked on an empty registry.
+    let _reaper = sup.start_reaper();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let handle = sup
+        .spawn_supervised(sh("sleep 30 & wait"), spec("overrun", 100))
+        .await
+        .expect("spawn");
+    // `mem::forget`, not `drop`: Drop deregisters, which would make the
+    // assertion below pass without the reaper doing anything at all.
+    std::mem::forget(handle);
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        sup.snapshot().is_empty(),
+        "reaper woke from park and enforced the deadline"
+    );
+}
+
+/// Regression: a deadline-driven reaper sleeps on the nearest deadline it knew
+/// about. `retime` to a *shorter* one under a reaper already asleep on a long
+/// deadline must wake it — otherwise the persistent pool's idle timeout is
+/// silently deferred to the request deadline, which can be minutes away.
+#[tokio::test(flavor = "current_thread")]
+async fn retime_under_a_sleeping_reaper_pulls_the_deadline_in() {
+    let sup = Supervisor::with_grace(Duration::from_millis(50));
+    let _reaper = sup.start_reaper();
+
+    // 60s: the reaper goes to sleep on a deadline far past the end of this
+    // test. The handle stays in scope so only the reaper can collect it.
+    let handle = sup
+        .spawn_supervised(sh("sleep 30 & wait"), spec("retimed", 60_000))
+        .await
+        .expect("spawn");
+    let id = handle.id();
+    // Long enough that the reaper is demonstrably parked on the 60s deadline
+    // rather than still computing its first sleep.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(sup.retime(id, Duration::from_millis(50)), "retime accepted");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        sup.snapshot().is_empty(),
+        "reaper recomputed its sleep and enforced the shortened deadline"
+    );
 }

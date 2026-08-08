@@ -141,7 +141,20 @@ pub async fn tick(dry_run: bool, _verbose: bool) -> Result<()> {
     // persistent agent must speak its protocol here too, and nothing should
     // outlive the command that started it.
     let pool = PersistentPool::new(plugins.supervisor().clone());
-    let r = daemon::tick_once(&state, &audit, &plugins, &cache, Some(&pool), now).await;
+    // Honors `[power]` exactly as the daemon does. A `tick` that dispatched
+    // what the daemon would have held back would be a debugging tool that
+    // lies about the thing it exists to reproduce.
+    let cfg = dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
+    let r = daemon::tick_once(
+        &state,
+        &audit,
+        &plugins,
+        &cache,
+        Some(&pool),
+        &cfg.power,
+        now,
+    )
+    .await;
     pool.shutdown(Some(&audit)).await;
     println!(
         "scanned {} agent(s); dispatched {}; next event: {}",

@@ -9,9 +9,11 @@
 //!   grandchildren (e.g. `mcp` invoked by a sink plugin) die with the parent.
 //! - **Live registry.** `Supervisor::snapshot` returns what is running right
 //!   now — feeds `dotagent status` and `dotagent doctor`.
-//! - **Reaper task.** A periodic sweeper kills entries whose deadline elapsed
-//!   even if the per-handle timeout was bypassed (panic, detached task,
-//!   forgotten handle).
+//! - **Reaper task.** A sweeper kills entries whose deadline elapsed even if
+//!   the per-handle timeout was bypassed (panic, detached task, forgotten
+//!   handle). It is deadline-driven, not periodic: it sleeps until the nearest
+//!   deadline and parks outright while nothing is supervised, so an idle
+//!   daemon holds no timers. The snapshot writer parks on the same signal.
 //!
 //! The public contract is intentionally small — see `Supervisor`,
 //! `SpawnSpec`, and `SupervisedHandle`.
@@ -32,6 +34,7 @@ use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -40,9 +43,11 @@ pub use crate::reaper::ReaperHandle;
 /// Default grace window between `SIGTERM` and `SIGKILL`.
 pub const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
 
-/// Default reaper tick interval. Five seconds is a balance between catching
-/// stuck processes quickly and not waking the runtime needlessly.
-pub const DEFAULT_REAPER_TICK: Duration = Duration::from_secs(5);
+/// How often the snapshot file is refreshed *while something is supervised*.
+///
+/// There is no matching constant for the reaper: it is deadline-driven rather
+/// than periodic. See [`Supervisor::start_reaper`].
+pub const SNAPSHOT_TICK: Duration = Duration::from_secs(2);
 
 /// Stable identifier handed out by the supervisor to refer to a live process
 /// without exposing the OS pid (which can be reused).
@@ -214,6 +219,27 @@ pub(crate) struct Inner {
     /// callers can install it after clones exist (e.g. daemon clones the
     /// Supervisor across the plugin client before deciding to wire audit).
     on_event: RwLock<Option<EventHandler>>,
+    /// Bumped on every registration. The reaper and the snapshot writer park
+    /// on it while the registry is empty, which is most of a laptop's day —
+    /// polling instead would cost tens of thousands of timer wake-ups daily
+    /// to observe that nothing changed.
+    ///
+    /// `watch` rather than `Notify` for two reasons: it stores the version, so
+    /// a spawn racing a waiter that is about to park cannot be lost; and it
+    /// wakes *every* waiter, whereas `Notify::notify_one` would wake only one
+    /// of the two tasks that wait here.
+    ///
+    /// Waiters call `wake.subscribe()` **before** reading the registry:
+    /// checking first and subscribing second can miss a spawn that lands in
+    /// between, and then sleep past its deadline.
+    wake: watch::Sender<u64>,
+}
+
+impl Inner {
+    /// Wake everything parked on [`Inner::wake`].
+    fn wake_all(&self) {
+        self.wake.send_modify(|v| *v = v.wrapping_add(1));
+    }
 }
 
 /// Internal registry record. Holds the data the reaper needs to enforce the
@@ -242,6 +268,7 @@ impl Supervisor {
                 next_id: AtomicU64::new(1),
                 grace,
                 on_event: RwLock::new(None),
+                wake: watch::channel(0).0,
             }),
         }
     }
@@ -317,6 +344,11 @@ impl Supervisor {
                 },
             );
         }
+        // After the lock is released, so a woken reaper does not immediately
+        // block on it. Must happen on every registration: the reaper's next
+        // wake-up is computed from the nearest deadline in the registry, and
+        // this entry may well be nearer than whatever it is sleeping on.
+        self.inner.wake_all();
 
         self.inner.emit(SupervisorEvent::Started(info_template));
 
@@ -355,16 +387,27 @@ impl Supervisor {
     /// claimed it. Callers must read that as "this process is dead" and
     /// respawn rather than write to it.
     pub fn retime(&self, id: ProcId, deadline: Duration) -> bool {
-        let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
-        match reg.get_mut(&id) {
-            Some(entry) if !entry.killed_by_reaper => {
-                entry.started_instant = Instant::now();
-                entry.deadline = deadline;
-                entry.info_template.deadline_seconds = deadline.as_secs();
-                true
+        let retimed = {
+            let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
+            match reg.get_mut(&id) {
+                Some(entry) if !entry.killed_by_reaper => {
+                    entry.started_instant = Instant::now();
+                    entry.deadline = deadline;
+                    entry.info_template.deadline_seconds = deadline.as_secs();
+                    true
+                }
+                _ => false,
             }
-            _ => false,
+        };
+        // The reaper sleeps until the nearest deadline it knew about when it
+        // went to sleep. Re-pointing a clock under it — which is exactly what
+        // the persistent pool does on every request — can move that deadline
+        // *earlier*, so it has to recompute. Signalled after the lock drops so
+        // the woken task is not immediately blocked on it.
+        if retimed {
+            self.inner.wake_all();
         }
+        retimed
     }
 
     /// Kill one live entry: `SIGTERM` to its process group, grace, `SIGKILL`.
@@ -451,17 +494,30 @@ impl Supervisor {
     /// Start the deadline sweeper in a background tokio task. Returns a
     /// `ReaperHandle` whose `abort()` stops the loop. Safe to call once per
     /// process; calling twice gives you two reapers (harmless but wasteful).
-    pub fn start_reaper(&self, tick: Duration) -> ReaperHandle {
-        reaper::start(self.inner.clone(), tick)
+    ///
+    /// The sweeper is deadline-driven, not periodic: it sleeps until the
+    /// nearest deadline in the registry and parks entirely while the registry
+    /// is empty. It therefore takes no tick argument — there is no interval to
+    /// tune, and a sweep lands *on* the deadline rather than up to one tick
+    /// late.
+    pub fn start_reaper(&self) -> ReaperHandle {
+        reaper::start(self.inner.clone())
     }
 
-    /// Start a background task that rewrites `path` with the current snapshot
-    /// every `tick`. Lets out-of-process consumers (`dotagent status`,
-    /// `doctor`) see what the daemon is supervising without needing IPC.
-    /// Returns a `ReaperHandle` so callers can abort on shutdown.
+    /// Start a background task that keeps `path` in sync with the current
+    /// snapshot. Lets out-of-process consumers (`dotagent status`, `doctor`)
+    /// see what the daemon is supervising without needing IPC. Returns a
+    /// `ReaperHandle` so callers can abort on shutdown.
     ///
     /// Writes are atomic: payload goes to `<path>.tmp` first, then `rename`
     /// swaps it in. Readers therefore never observe a half-written file.
+    ///
+    /// `tick` bounds how stale the file can get *while something is running*
+    /// (`age_seconds` advances on its own, so a live snapshot is never twice
+    /// the same). Once the registry drains, the task writes the empty snapshot
+    /// once and then parks on [`Inner::wake`] rather than continuing to tick:
+    /// the file is already correct, and rewriting identical bytes every couple
+    /// of seconds is a wake-up and a dirtied page for no reader's benefit.
     pub fn start_snapshot_writer(&self, path: std::path::PathBuf, tick: Duration) -> ReaperHandle {
         let sup = self.clone();
         let tmp_path = {
@@ -477,19 +533,37 @@ impl Supervisor {
             let _ = std::fs::create_dir_all(parent);
         }
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(tick);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut written: Option<Vec<u8>> = None;
             loop {
-                interval.tick().await;
+                // Subscribed before the snapshot is taken so a spawn racing
+                // the park below is recorded rather than missed.
+                let mut wake = sup.inner.wake.subscribe();
+
                 let snap = sup.snapshot();
-                let payload = match serde_json::to_vec_pretty(&snap) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                if tokio::fs::write(&tmp_path, &payload).await.is_err() {
+                let Ok(payload) = serde_json::to_vec_pretty(&snap) else {
+                    tokio::time::sleep(tick).await;
                     continue;
+                };
+
+                let mut landed = written.as_deref() == Some(payload.as_slice());
+                if !landed
+                    && tokio::fs::write(&tmp_path, &payload).await.is_ok()
+                    && tokio::fs::rename(&tmp_path, &path).await.is_ok()
+                {
+                    written = Some(payload);
+                    landed = true;
                 }
-                let _ = tokio::fs::rename(&tmp_path, &path).await;
+
+                // `landed` must describe *this* payload, not merely that some
+                // earlier write succeeded: if the registry drains and writing
+                // the empty snapshot then fails (ENOSPC, permissions), parking
+                // here would strand a file still claiming a live process until
+                // the next spawn. Ticking is how a failed write gets retried.
+                if snap.is_empty() && landed {
+                    let _ = wake.changed().await;
+                } else {
+                    tokio::time::sleep(tick).await;
+                }
             }
         });
         ReaperHandle::wrap(handle)

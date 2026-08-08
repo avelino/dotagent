@@ -9,6 +9,86 @@ schema and the plugin protocol are flagged in each entry.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-08
+
+Both entries below address [#47](https://github.com/avelino/dotagent/issues/47)
+— dotagent cost battery on laptops in two unrelated ways, neither visible
+as CPU percentage.
+
+### Added
+
+- **`[power]`: agents no longer have to run on battery.** A laptop pays
+  for a scheduler twice — once for the CPU, once for being kept out of
+  idle — and dotagent had no notion of where the electricity was coming
+  from. A 15-minute interval agent fired 96 times a day whether the
+  machine was plugged in at a desk or in a bag at 12%.
+
+  ```toml
+  [power]
+  on_battery = "run"        # run | defer   (default: run)
+  min_battery_percent = 0   # defer below this charge; 0 = never
+  ```
+
+  The two rules are independent: `min_battery_percent` on its own means
+  "run on battery, but not when there's nearly none left". Any schedule
+  can override `on_battery` in its `agent.toml`, because the cost is
+  per-schedule — a cheap hourly check and an expensive 15-minute sync
+  don't deserve the same policy. `min_battery_percent` is global by
+  design.
+
+  **Deferring does not queue.** Both schedule kinds resolve to the
+  current window rather than a backlog, so an agent deferred across four
+  hours of battery runs once when the charger goes in, not sixteen
+  times. The check sits after the staleness check and writes no window
+  state, so a deferred run burns no retry and leaves no trace.
+
+  Detection is `pmset -g batt` on macOS and `/sys/class/power_supply` on
+  Linux; anything else, or a failed probe, reads as mains power. A
+  machine whose battery cannot be read must keep running its agents —
+  failing to run is the worse failure. **Defaults change nothing**: an
+  untouched install dispatches exactly as before and never probes at
+  all.
+
+  `dotagent tick` applies the same gate as the daemon — a tick that
+  dispatched what the daemon would have held back would misreport the
+  thing it exists to reproduce.
+
+  `agent.toml` schema: additive (`on_battery` on a schedule).
+
+### Changed
+
+- **The daemon holds no timers while it supervises nothing.** Two
+  background tasks polled to observe that nothing had happened: the
+  reaper swept on a fixed 5-second tick (~17k wake-ups/day) and the
+  snapshot writer rewrote a byte-identical `[]` every 2 seconds (~43k
+  writes/day). On an idle daemon that was the entirety of its cost, and
+  the disk writes kept the SSD from settling.
+
+  The reaper is now deadline-driven — it sleeps until the nearest
+  deadline in the registry — and the snapshot writer skips writes whose
+  payload is unchanged. Both park outright on an empty registry and are
+  woken by a spawn, or by a `retime` that pulls a deadline in.
+
+  Losing the tick made the reaper *more* precise: it fires on the
+  deadline rather than up to one tick late.
+
+  **Breaking (public API), `dotagent-supervisor`:**
+  `Supervisor::start_reaper` no longer takes a `tick` argument — a
+  deadline-driven loop has no interval to tune, and leaving the
+  parameter in place would have implied one. `DEFAULT_REAPER_TICK` is
+  removed; `SNAPSHOT_TICK` replaces it as the one interval that remains
+  meaningful (how often the snapshot file is refreshed *while* something
+  is running).
+
+### Fixed
+
+- **`retime` to a shorter deadline could be ignored.** Re-pointing a
+  supervised entry's clock — which the persistent pool does on every
+  request, to swap the idle window for the request deadline — did not
+  wake the reaper. With the deadline-driven loop this became load-
+  bearing: a reaper asleep on a 60-second deadline would sleep through a
+  50ms one set under it. Regression test included.
+
 ## [0.3.0] - 2026-08-07
 
 ### Security
@@ -742,6 +822,7 @@ break only code that depends on the crates as libraries:
 - CLI run-now output pretty-prints the outcome instead of dumping
   `Debug` and tightens the renderer test suite.
 
+[0.4.0]: https://github.com/avelino/dotagent/releases/tag/v0.4.0
 [0.3.0]: https://github.com/avelino/dotagent/releases/tag/v0.3.0
 [0.2.1]: https://github.com/avelino/dotagent/releases/tag/v0.2.1
 [0.2.0]: https://github.com/avelino/dotagent/releases/tag/v0.2.0

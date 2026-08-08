@@ -75,6 +75,9 @@ id = "every-90"
 type = "interval"
 interval_minutes = 90
 args = []
+on_battery = "defer"                    # "run" (default) | "defer"
+                                        # overrides [power] in config.toml for
+                                        # this schedule only
 
 # Optional: preflight checks (run BEFORE the agent; abort if any fail)
 [[preflight]]
@@ -197,6 +200,26 @@ A **single** daemon (`run.avelino.dotagent`) owns every schedule. There is no
 per-agent plist and no per-agent systemd timer: launchd / systemd start the
 daemon, and the daemon computes the next event across all schedules and sleeps
 until then. See [`daemon-lifecycle.md`](../guides/daemon-lifecycle.md).
+
+#### `on_battery`
+
+| Value     | Effect                                                            |
+|-----------|-------------------------------------------------------------------|
+| `run`     | Dispatch regardless of power source. The default.                 |
+| `defer`   | Hold the run until the machine is back on mains power.            |
+
+Absent, the schedule inherits `[power] on_battery` from `config.toml`
+(itself `run` by default, so an untouched install is unaffected). Declared
+here, it wins — the cost of a run is a property of the schedule, so an agent
+can keep a cheap hourly check running unplugged while its expensive
+15-minute sync waits for a charger.
+
+Deferring does not queue: the window that fires when the charger goes back in
+is the *current* one, not a backlog. The check runs after the staleness check,
+so a window that ages past `stale_after_minutes` while unplugged is dropped
+rather than run late. Full semantics — including the global
+`min_battery_percent` floor, which is not overridable per schedule — in
+[`config-reference.md`](../guides/config-reference.md).
 
 #### How `interval` windows advance
 

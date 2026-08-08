@@ -12,6 +12,7 @@ pub mod frontmatter;
 pub mod heartbeat;
 pub mod lifecycle;
 pub mod manifest;
+pub mod power;
 pub mod security;
 pub mod skill;
 pub mod state;
@@ -29,6 +30,7 @@ pub use lifecycle::{LifecycleConfig, LifecycleMode};
 pub use manifest::{
     AgentManifest, AgentMeta, EnvConfig, PluginRef, RunConfig, Schedule, ScheduleDefaults,
 };
+pub use power::{PowerConfig, PowerPolicy, PowerSource};
 pub use security::{NetworkMode, NetworkPolicy, SecurityConfig};
 pub use skill::{SkillManifest, SKILL_FILE};
 pub use state::WindowState;

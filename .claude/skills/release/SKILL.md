@@ -31,11 +31,28 @@ Enquanto pre-1.0: minor pode quebrar API. Avisar no CHANGELOG.
 
 ### 2. Bump da versão
 
-Em `Cargo.toml` raiz:
+**Dois lugares no `Cargo.toml` raiz, não um.** Esquecer o segundo faz
+`cargo clippy`/`test` falhar na hora com `failed to select a version for
+the requirement dotagent-core = "^0.3.0"` — as crates internas se
+referenciam por versão, e `^0.3.0` não aceita `0.4.0`.
 
 ```toml
 [workspace.package]
-version = "X.Y.Z"
+version = "X.Y.Z"            # (1) o que cada crate herda
+
+[workspace.dependencies]
+# (2) TODAS as deps internas — o `version =` aqui é o que vai pro
+# crates.io, o `path` só vale no workspace local
+dotagent-core = { path = "crates/dotagent-core", version = "X.Y.Z" }
+dotagent-scheduler = { path = "crates/dotagent-scheduler", version = "X.Y.Z" }
+# ... e as outras dez
+```
+
+```bash
+# Bump das duas de uma vez (ajuste OLD/NEW):
+sed -i '' 's/version = "OLD"/version = "NEW"/' Cargo.toml
+# Confere que não sobrou nenhuma:
+grep -n 'version = "OLD"' Cargo.toml   # deve voltar vazio
 ```
 
 Todas as crates do workspace herdam via `version.workspace = true`. Não
@@ -67,12 +84,21 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-### 5. Tag
+### 5. Commit, depois tag
+
+**Nesta ordem, e o agente não faz nenhum dos dois.** `cargo publish`
+recusa working tree suja (`4 files ... not yet committed`), então o
+commit não é opcional nem adiável — é pré-requisito do passo 6.
 
 ```bash
+git add -A && git commit -m "release: X.Y.Z"
 git tag -a vX.Y.Z -m "release X.Y.Z"
-# NÃO push (commit policy do Avelino) — usuário faz o push manual
+# NÃO push (commit policy do Avelino) — usuário faz commit/tag/push manual
 ```
+
+Nunca passe `--allow-dirty` no publish pra contornar isso: publica
+bytes que não existem em nenhum commit, e o que está no crates.io deixa
+de ser reproduzível a partir da tag.
 
 ### 6. Publicar nas crates.io (ordem importa!)
 
@@ -88,6 +114,8 @@ cargo publish -p dotagent-secrets
 cargo publish -p dotagent-supervisor
 cargo publish -p dotagent-unit-gen
 cargo publish -p dotagent-mcp
+cargo publish -p dotagent-memory        # o CLI depende dele; esquecer aqui
+                                        # só falha lá no nível 6
 
 # Nível 1
 cargo publish -p dotagent-notify        # → secrets
