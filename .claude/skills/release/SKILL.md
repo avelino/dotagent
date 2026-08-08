@@ -31,10 +31,10 @@ Enquanto pre-1.0: minor pode quebrar API. Avisar no CHANGELOG.
 
 ### 2. Bump da versão
 
-**Dois lugares no `Cargo.toml` raiz, não um.** Esquecer o segundo faz
-`cargo clippy`/`test` falhar na hora com `failed to select a version for
-the requirement dotagent-core = "^0.3.0"` — as crates internas se
-referenciam por versão, e `^0.3.0` não aceita `0.4.0`.
+**There are two places in the root `Cargo.toml`, not one.** Forgetting the
+second makes `cargo clippy`/`test` fail immediately with `failed to select a
+version for the requirement dotagent-core = "^0.3.0"` — internal crates
+reference one another by version, and `^0.3.0` does not accept `0.4.0`.
 
 ```toml
 [workspace.package]
