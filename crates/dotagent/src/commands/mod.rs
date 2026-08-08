@@ -121,8 +121,11 @@ pub async fn tick(dry_run: bool, _verbose: bool) -> Result<()> {
     let state = StateStore::from_home().context("opening state store")?;
     let now = chrono::Local::now();
 
+    // Loaded before the dry-run branch so both paths judge power identically.
+    let cfg = dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
+
     if dry_run {
-        let r = daemon::tick_dry_run(&state, now).await;
+        let r = daemon::tick_dry_run(&state, &cfg.power, now).await;
         println!(
             "(dry-run) scanned {} agent(s); would dispatch {}; next event: {}",
             r.agents_scanned,
@@ -144,7 +147,6 @@ pub async fn tick(dry_run: bool, _verbose: bool) -> Result<()> {
     // Honors `[power]` exactly as the daemon does. A `tick` that dispatched
     // what the daemon would have held back would be a debugging tool that
     // lies about the thing it exists to reproduce.
-    let cfg = dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
     let r = daemon::tick_once(
         &state,
         &audit,

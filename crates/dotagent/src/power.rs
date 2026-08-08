@@ -184,42 +184,191 @@ fn detect_linux() -> PowerSource {
         return PowerSource::Unknown;
     };
 
-    let mut saw_mains = false;
-    let mut on_mains = false;
+    classify_supplies(entries.flatten().map(|entry| {
+        let path = entry.path();
+        let read = |name: &str| std::fs::read_to_string(path.join(name)).ok();
+        Supply {
+            kind: read("type").unwrap_or_default(),
+            online: read("online"),
+            scope: read("scope"),
+            capacity: read("capacity"),
+        }
+    }))
+}
+
+/// One entry under `/sys/class/power_supply`, with every field as read (or
+/// `None` when it could not be read at all).
+///
+/// Not gated on `target_os` so the classification below stays testable on the
+/// machine doing the work — nothing about the shape is Linux-specific, and a
+/// fail-open rule this load-bearing should not be verified only on CI.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Default)]
+struct Supply {
+    kind: String,
+    online: Option<String>,
+    scope: Option<String>,
+    capacity: Option<String>,
+}
+
+/// The decision half of [`detect_linux`], split out so it can be tested on any
+/// platform. The sysfs walk is the only part that needs a real Linux.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn classify_supplies(supplies: impl IntoIterator<Item = Supply>) -> PowerSource {
+    // `None` means no mains supply told us anything we could read. It is
+    // deliberately distinct from `Some(false)`: an unreadable or malformed
+    // `online` is an absence of information, and treating it as a confirmed
+    // "unplugged" would make a probe failure suppress every run under
+    // `on_battery = "defer"` — the exact opposite of the documented
+    // fail-open behavior.
+    let mut mains_online: Option<bool> = None;
     let mut percent = None;
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let kind = std::fs::read_to_string(path.join("type")).unwrap_or_default();
-        match kind.trim() {
-            "Mains" => {
-                saw_mains = true;
-                if std::fs::read_to_string(path.join("online")).is_ok_and(|s| s.trim() == "1") {
-                    on_mains = true;
-                }
-            }
+    for supply in supplies {
+        match supply.kind.trim() {
+            "Mains" => match supply.online.as_deref().map(str::trim) {
+                // Any charger reporting online wins over one reporting off.
+                Some("1") => mains_online = Some(true),
+                Some("0") => mains_online = mains_online.or(Some(false)),
+                _ => {}
+            },
             // `scope = Device` is a peripheral's battery — a wireless mouse,
             // keyboard, or headset also reports `type = Battery` with a
             // readable `capacity`, and letting one through would judge
             // `min_battery_percent` against the charge of the mouse.
             "Battery"
                 if percent.is_none()
-                    && !std::fs::read_to_string(path.join("scope"))
-                        .is_ok_and(|s| s.trim() == "Device") =>
+                    && supply.scope.as_deref().map(str::trim) != Some("Device") =>
             {
-                percent = std::fs::read_to_string(path.join("capacity"))
-                    .ok()
+                percent = supply
+                    .capacity
+                    .as_deref()
                     .and_then(|s| s.trim().parse::<u8>().ok());
             }
             _ => {}
         }
     }
 
-    match (saw_mains, on_mains) {
-        // No mains supply at all: not a laptop we understand. Don't guess.
-        (false, _) => PowerSource::Unknown,
-        (true, true) => PowerSource::Ac,
-        (true, false) => PowerSource::Battery { percent },
+    match mains_online {
+        // No mains supply, or none whose state we could read. Don't guess.
+        None => PowerSource::Unknown,
+        Some(true) => PowerSource::Ac,
+        Some(false) => PowerSource::Battery { percent },
+    }
+}
+
+#[cfg(test)]
+mod sysfs {
+    use super::*;
+
+    fn supply(
+        kind: &str,
+        online: Option<&str>,
+        scope: Option<&str>,
+        capacity: Option<&str>,
+    ) -> Supply {
+        Supply {
+            kind: kind.into(),
+            online: online.map(Into::into),
+            scope: scope.map(Into::into),
+            capacity: capacity.map(Into::into),
+        }
+    }
+
+    fn mains(online: Option<&str>) -> Supply {
+        supply("Mains", online, None, None)
+    }
+
+    fn battery(capacity: &str) -> Supply {
+        supply("Battery", None, Some("System"), Some(capacity))
+    }
+
+    #[test]
+    fn charger_online_reads_as_ac() {
+        assert_eq!(
+            classify_supplies([mains(Some("1")), battery("62")]),
+            PowerSource::Ac
+        );
+    }
+
+    #[test]
+    fn charger_offline_reads_as_battery_with_charge() {
+        assert_eq!(
+            classify_supplies([mains(Some("0")), battery("62")]),
+            PowerSource::Battery { percent: Some(62) }
+        );
+    }
+
+    /// Regression: an unreadable `online` used to be indistinguishable from a
+    /// confirmed `0`, so a probe failure reported `Battery` and, under
+    /// `on_battery = "defer"`, suppressed every run forever. An absence of
+    /// information has to fail open.
+    #[test]
+    fn an_unreadable_online_is_unknown_not_battery() {
+        assert_eq!(
+            classify_supplies([mains(None), battery("62")]),
+            PowerSource::Unknown
+        );
+    }
+
+    #[test]
+    fn a_malformed_online_is_unknown_not_battery() {
+        assert_eq!(
+            classify_supplies([mains(Some("banana")), battery("62")]),
+            PowerSource::Unknown
+        );
+    }
+
+    #[test]
+    fn no_mains_supply_at_all_is_unknown() {
+        assert_eq!(classify_supplies([battery("62")]), PowerSource::Unknown);
+    }
+
+    /// A laptop with both an AC brick and a USB-PD port: whichever reports
+    /// online wins, in either discovery order.
+    #[test]
+    fn any_charger_online_beats_one_reporting_off() {
+        assert_eq!(
+            classify_supplies([mains(Some("0")), mains(Some("1"))]),
+            PowerSource::Ac
+        );
+        assert_eq!(
+            classify_supplies([mains(Some("1")), mains(Some("0"))]),
+            PowerSource::Ac
+        );
+    }
+
+    /// A wireless mouse reports `type = Battery` with a readable capacity.
+    /// Reading it would judge `min_battery_percent` against the mouse.
+    #[test]
+    fn a_peripheral_battery_is_not_the_machine_battery() {
+        let mouse = supply("Battery", None, Some("Device"), Some("9"));
+        assert_eq!(
+            classify_supplies([mains(Some("0")), mouse, battery("62")]),
+            PowerSource::Battery { percent: Some(62) }
+        );
+    }
+
+    /// ...and it must not be the fallback either when the real battery has no
+    /// readable capacity.
+    #[test]
+    fn a_peripheral_battery_is_skipped_even_when_it_is_the_only_one() {
+        let mouse = supply("Battery", None, Some("Device"), Some("9"));
+        assert_eq!(
+            classify_supplies([mains(Some("0")), mouse]),
+            PowerSource::Battery { percent: None }
+        );
+    }
+
+    /// On battery but the charge unreadable: still on battery. Losing the
+    /// percentage must never look like being plugged in.
+    #[test]
+    fn an_unreadable_capacity_stays_on_battery() {
+        let no_capacity = supply("Battery", None, Some("System"), None);
+        assert_eq!(
+            classify_supplies([mains(Some("0")), no_capacity]),
+            PowerSource::Battery { percent: None }
+        );
     }
 }
 

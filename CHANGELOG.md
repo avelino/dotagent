@@ -67,7 +67,11 @@ as CPU percentage.
   The reaper is now deadline-driven — it sleeps until the nearest
   deadline in the registry — and the snapshot writer skips writes whose
   payload is unchanged. Both park outright on an empty registry and are
-  woken by a spawn, or by a `retime` that pulls a deadline in.
+  woken by a registry change: a spawn, a `retime` that pulls a deadline
+  in, or the deregistration of the entry that owned the deadline being
+  slept on. Without that last one a process finishing early left its
+  original deadline armed behind it, and "an idle daemon holds no
+  timers" stayed false until that timer fired on nothing.
 
   Losing the tick made the reaper *more* precise: it fires on the
   deadline rather than up to one tick late.
@@ -81,6 +85,29 @@ as CPU percentage.
   is running).
 
 ### Fixed
+
+- **A deferred run could raise a false `stale` alert.** The power gate
+  leaves window state untouched on purpose, so plugging in later still
+  dispatches the current window. The health sweep in the same tick had no
+  visibility into that decision and reads staleness from window age
+  alone, so a weekend spent unplugged turned every deferred schedule into
+  an outage alert for behavior the operator had asked for. The sweep now
+  skips schedules the policy is currently holding back, without clearing
+  the escalation ladder: an agent already failing before the charger came
+  out resumes its episode rather than restarting it.
+
+- **On Linux, an unreadable `online` file read as "on battery".** The
+  probe could not tell a confirmed `0` from a read that failed or
+  returned something unparseable, so under `on_battery = "defer"` a
+  broken sysfs entry suppressed every run indefinitely — the opposite of
+  the documented fail-open behavior. Charger state that cannot be
+  established is now `Unknown`, which counts as mains. A peripheral's
+  battery (`scope = Device`, as a wireless mouse reports) is also no
+  longer mistaken for the machine's, which would have judged
+  `min_battery_percent` against the charge of the mouse.
+
+- **`dotagent tick --dry-run` ignored the power policy**, reporting runs
+  as dispatchable that the daemon would have held back.
 
 - **`retime` to a shorter deadline could be ignored.** Re-pointing a
   supervised entry's clock — which the persistent pool does on every
