@@ -343,6 +343,8 @@ pub async fn run_with_hooks_streaming(
     Ok(OrchestratedOutcome::Ran(outcome))
 }
 
+// AuditEvent::AgentRun mirrors the durable audit schema, so keeping these
+// fields explicit avoids a short-lived wrapper obscuring that contract.
 #[allow(clippy::too_many_arguments)]
 fn append_agent_run_audit(
     audit: Option<&AuditLog>,
