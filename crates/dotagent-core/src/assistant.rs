@@ -78,6 +78,27 @@ mod tests {
     }
 
     #[test]
+    fn accepts_unicode_payloads_but_event_types_are_case_sensitive() {
+        assert_eq!(
+            parse_line(r#"{"type":"reply","text":"Olá, 世界 👋"}"#),
+            Some(AssistantEvent::Reply {
+                text: "Olá, 世界 👋".into()
+            })
+        );
+        assert_eq!(parse_line(r#"{"type":"Reply","text":"no"}"#), None);
+    }
+
+    #[test]
+    fn accepts_oversized_valid_json_lines() {
+        let text = "x".repeat(128 * 1024);
+        let line = serde_json::json!({ "type": "delta", "text": text }).to_string();
+        assert_eq!(
+            parse_line(&line),
+            Some(AssistantEvent::Delta { text: "x".repeat(128 * 1024) })
+        );
+    }
+
+    #[test]
     fn non_protocol_lines_are_none() {
         assert_eq!(parse_line(""), None);
         assert_eq!(parse_line("   \t "), None);
