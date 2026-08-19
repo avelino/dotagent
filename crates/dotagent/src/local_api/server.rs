@@ -1946,11 +1946,24 @@ mod tests {
         assert_eq!(response["id"], json!("continuous"));
         assert_eq!(response["error"]["code"], json!("invalid_request"));
 
-        let eof = tokio::time::timeout(Duration::from_secs(1), reader.next_line())
+        // Linux RSTs a closed socket that still had unread inbound data (the
+        // producer keeps flooding after the server gave up reading), which
+        // surfaces as ConnectionReset instead of a clean EOF. Either outcome
+        // proves the overflowed connection terminated.
+        let terminated = tokio::time::timeout(Duration::from_secs(1), reader.next_line())
             .await
-            .expect("overflowed connection must terminate")
-            .unwrap();
-        assert!(eof.is_none());
+            .expect("overflowed connection must terminate");
+        match terminated {
+            Ok(None) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                ) => {}
+            other => panic!("expected EOF or connection-closed, got {other:?}"),
+        }
         tokio::time::timeout(Duration::from_secs(1), producer)
             .await
             .expect("continuous peer must observe the closed connection")
