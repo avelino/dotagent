@@ -20,6 +20,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, watch, Notify};
+use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use dotagent_notify::telegram_inbound::RateLimiter;
@@ -351,10 +352,17 @@ impl LocalApiServer {
     ) -> std::io::Result<()> {
         info!(path = %self.socket_path.display(), "local api listening");
         let live = Arc::new(AtomicUsize::new(0));
+        let mut connections = JoinSet::new();
 
         loop {
             let (stream, _) = tokio::select! {
                 _ = shutdown.changed() => break,
+                completed = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        error!(error = %error, "local API connection task failed");
+                    }
+                    continue;
+                }
                 accepted = listener.accept() => match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
@@ -386,17 +394,37 @@ impl LocalApiServer {
                 input_closed: self.input_closed.clone(),
             };
             let conn_shutdown = shutdown.clone();
-            let conn_count = Arc::clone(&live);
-            tokio::spawn(async move {
+            // The guard is created before spawning, so it also cleans up when
+            // a task is cancelled before its future is first polled.
+            let conn_count = ConnectionCount(Arc::clone(&live));
+            connections.spawn(async move {
+                let _conn_count = conn_count;
                 serve_connection(stream, handler, limits, conn_shutdown).await;
-                conn_count.fetch_sub(1, Ordering::Relaxed);
             });
+        }
+
+        connections.abort_all();
+        while let Some(result) = connections.join_next().await {
+            if let Err(error) = result {
+                if !error.is_cancelled() {
+                    error!(error = %error, "local API connection task failed during shutdown");
+                }
+            }
         }
 
         // Best effort: leave no stale socket for the next boot to sweep. A
         // crash mid-run still leaves one, which bind() hygiene handles.
         let _ = std::fs::remove_file(&self.socket_path);
         Ok(())
+    }
+}
+
+/// Releases a connection slot even if its task panics or is cancelled.
+struct ConnectionCount(Arc<AtomicUsize>);
+
+impl Drop for ConnectionCount {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
