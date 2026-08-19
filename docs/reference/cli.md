@@ -15,6 +15,7 @@ clap-generated help.
 | [`run`](#run)              | Run a single schedule of an agent in the foreground.                  |
 | [`tick`](#tick)            | One-shot dispatch pass (what the daemon does on each cycle).          |
 | [`daemon`](#daemon)        | Long-lived adaptive scheduler. Invoked by launchd / systemd.          |
+| [`api`](#api)              | Raw JSONL bridge to the daemon's local Unix socket.                  |
 | [`status`](#status)        | Textual health dashboard.                                             |
 | [`daily-summary`](#daily-summary) | Send the end-of-day health summary.                            |
 | [`bootstrap`](#bootstrap)  | Mark every schedule's window as ok (one-shot, post-install). *Not implemented yet.* |
@@ -118,6 +119,35 @@ The daemon process responds to:
 
 See [`guides/daemon-lifecycle.md`](../guides/daemon-lifecycle.md) for
 how to install / start / stop / reload the daemon end-to-end.
+
+---
+
+## `api`
+
+Bridge raw JSON Lines between stdin/stdout and the daemon's local Unix socket.
+The command does not parse, render, or persist messages, so it can be used as a
+backend for scripts or a TUI.
+
+```bash
+dotagent api [--socket <PATH>]
+```
+
+By default it connects to `$DOTAGENT_HOME/api.sock` (normally
+`~/.config/dotagent/api.sock`). `--socket` overrides the path for tests or an
+explicit endpoint. Every input frame is forwarded with its original bytes and
+line ending; every socket frame is forwarded to stdout the same way.
+
+When stdin reaches EOF, the client half-closes its request side and continues
+reading responses/events until the daemon closes the socket. Diagnostics go to
+stderr. There is no prompt or TUI rendering.
+
+**Example**:
+
+```bash
+printf '%s\n' '{"id":"status","method":"status.get"}' | dotagent api
+```
+
+See [`Local Client API`](local-api.md#raw-cli-bridge) for the wire contract.
 
 ---
 

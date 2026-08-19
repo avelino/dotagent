@@ -34,6 +34,9 @@ flowchart LR
 - Inbound triggers do **not** go through that loop: a worker task drains
   them beside it, so a slow scheduled run no longer holds queued chat
   messages.
+- Telegram and the local Unix-socket API enter a trigger gateway that applies
+  admission, per-conversation FIFO ordering, delivery shaping, and a default
+  cap of four concurrent conversations.
 - Your agent script just reads env vars and exits with a code.
 - Failure path: retry → exhaust retries → fire `[[notifiers]]` (built-in,
   in-process) and/or `[[on_failure]]` plugins (subprocess, JSON stdio).
@@ -103,6 +106,7 @@ timeout_seconds = 1800             # default 1800. Hard kill (SIGTERM→SIGKILL)
 command = "fish"                   # REQUIRED. Executable.
 args = ["./agent.fish"]            # static argv prefix
 working_dir = "."                  # optional, relative to manifest dir
+protocol = "assistant-v1"           # optional one-shot assistant stdout protocol
 
 # ─── [env] — environment injection (optional) ─────────────────────────
 [env]
@@ -118,8 +122,8 @@ retry_backoff_minutes = [5, 15, 30]
 stale_after_minutes = 120          # window older than this → state=stale
 
 # ─── [[schedules]] — at least one, UNLESS trigger-only ────────────────
-# An agent that only ever runs because something asked (a Telegram
-# message, an MCP tools/call) may declare zero schedules. dotagent gives
+# An agent that only ever runs because something asked (a Telegram message,
+# a local client, or an MCP tools/call) may declare zero schedules. dotagent gives
 # it the synthetic schedule id "trigger". See section 19.
 [[schedules]]
 id = "daily"                       # REQUIRED. Unique within manifest.
@@ -182,6 +186,7 @@ env_passthrough = ["PATH", "HOME", "LANG"]
 | `[run]`        | `command`              | string          | yes      | —                      |
 | `[run]`        | `args`                 | `string[]`      | no       | `[]`                   |
 | `[run]`        | `working_dir`          | string          | no       | manifest dir           |
+| `[run]`        | `protocol`             | string          | no      | absent (plain stdout)  |
 | `[env]`        | `inherit`              | bool            | no       | `true`                 |
 | `[env.extra]`  | (any key)              | string          | no       | —                      |
 | `[defaults]`   | `max_retries`          | int             | no       | `0`                    |
@@ -238,23 +243,24 @@ of the inherited parent env (unless `env.inherit = false`).
 > daemon. If you need to persist arbitrary state, use `AGENT_HOME` or
 > a sink plugin.
 
-Runs started by a **trigger** (a Telegram message, an MCP `tools/call`)
-instead of a schedule get four more. They are applied BEFORE the block
+Runs started by a **trigger** (a Telegram message, a local client message, or
+an MCP `tools/call`) instead of a schedule get additional context. They are applied BEFORE the block
 above, so a payload can never redefine `AGENT_NAME` or
 `AGENT_HEARTBEAT_FILE`.
 
 | Variable                 | Type   | Example                                    |
 |--------------------------|--------|--------------------------------------------|
-| `AGENT_TRIGGER_SOURCE`   | string | `telegram` \| `mcp` \| `cli`               |
+| `AGENT_TRIGGER_SOURCE`   | string | `telegram` \| `local` \| `mcp` \| `cli`     |
 | `AGENT_TRIGGER_ACTOR`    | string | `123456789` (Telegram numeric user id)     |
 | `AGENT_TRIGGER_REPLY_TO` | string | `123456789` (chat id to answer)            |
 | `AGENT_TRIGGER_PAYLOAD`  | JSON   | `{"text":"sim","chat_id":1,"user_id":2,"message_id":9,"reply_to_text":"Posso criar?"}` |
+| `AGENT_SESSION_ID`       | string | `chat-9_a` (opaque conversation key)      |
 
 When the sender invoked a command, the payload also carries
 `{"command":{"name":"standup","args":"disk-alert"}}` — the resolved catalog
 name, ready to pass to `command-get`. It is `null` for ordinary prose.
 
-A **persistent** agent gets none of those four (see §19b): the environment
+A **persistent** agent gets none of those per-message values (see §19b): the environment
 is fixed at spawn and that process answers many messages, so the trigger
 rides in each request frame instead. It gets `AGENT_LIFECYCLE=persistent`
 and `AGENT_PERSIST_KEY=<key>`, and its `AGENT_TMPDIR` survives between
@@ -265,6 +271,11 @@ When the sender used Telegram's reply, `reply_to_text` carries what they
 replied to — a bare "sim" is meaningless without it.
 Whatever a triggered agent prints on stdout is sent back to whoever
 asked; log to stderr.
+
+`AGENT_SESSION_ID` is opaque and belongs to the trigger source. The daemon does
+not persist a transcript or LLM session; the agent decides how to use the key.
+The local API validates it as `^[A-Za-z0-9_-]{1,64}$` and defaults an omitted id
+to `default`.
 
 ### Slug derivation
 
@@ -279,6 +290,11 @@ asked; log to stderr.
 
 Rules: strip leading dashes, lowercase, replace non-alphanumeric with
 `_`, collapse repeated `_`, trim trailing `_`. Empty → `default`.
+
+For triggered runs, the slug is `trigger-<source>` without a session and
+`trigger-<source>-<sanitized-session>` with one. A local API request that omits
+`session_id` uses its effective `default` session and therefore writes
+`trigger-local-default`.
 
 ### Reading env vars
 
@@ -350,7 +366,8 @@ and deadlock the agent permanently (one real case: 55 days dead).
 Staleness is judged against the **first missed** window, not the rolling one —
 otherwise a chronically failing agent reads as a fresh failure forever.
 
-`interval_minutes = 0` never comes due (and does not panic).
+`interval_minutes` must be greater than zero; manifest validation rejects `0`
+before the schedule reaches the scheduler.
 
 ```toml
 [[schedules]]
@@ -746,7 +763,7 @@ Computed per `(agent, schedule)` pair on every `tick`:
 |-----------------------------------------------|----------------------------------------------------------|
 | `agent name missing`                           | `[agent].name` not set                                   |
 | `agent name not unique`                        | Two manifests claim the same `name`                      |
-| `at least one [[schedules]] required`          | Manifest has no schedules                                |
+| `at least one [[schedules]] required`          | Retired: trigger-only manifests may omit schedules        |
 | `schedule id missing`                          | `[[schedules]].id` not set                               |
 | `schedule id not unique within manifest`       | Two schedules share the same `id`                        |
 | `weekdays out of range`                        | A value in `weekdays` is not in `0..=6`                  |
@@ -926,7 +943,8 @@ config = { path = "/Users/me/reports/hn-today.md", mode = "overwrite" }
 ├── audit.log                        # JSONL audit trail (live)
 ├── audit.log.20260806T101500        # sealed segment, never auto-deleted
 ├── secrets.env                      # optional, mode 0600
-└── config.toml                      # optional dotagent config
+├── config.toml                      # optional dotagent config
+└── api.sock                         # local UDS API when dispatcher is discovered
 ```
 
 Retention notes:
@@ -993,6 +1011,7 @@ dotagent inspect <name>          # heartbeat + windows + schedule resolution
 dotagent daily-summary           # ad-hoc daily roll-up
 dotagent run-now <name>          # force a run now, ignoring schedule windows
 dotagent mcp                     # serve every agent as an MCP tool over stdio
+dotagent api                     # raw JSONL bridge to the daemon's local API socket
 dotagent audit verify --full     # verify the audit log's hash chain; exits 1 on a break
 dotagent completions <shell>     # bash|zsh|fish|elvish|powershell — tab-completes agent names
 ```
@@ -1013,20 +1032,22 @@ dotagent completions <shell>     # bash|zsh|fish|elvish|powershell — tab-compl
 
 ## 19. Triggers — runs caused by an event, not the clock
 
-A run can start because something asked: a Telegram message arrived, an
-MCP client called a tool. A triggered run keeps everything a scheduled
+A run can start because something asked: a Telegram message arrived, a local
+client sent a message, or an MCP client called a tool. A triggered run keeps everything a scheduled
 one has (supervisor, heartbeat, audit, hooks, notifiers) and differs in
 two ways: it has **no window state** (no attempts counter, never
 consumes a retry, never marks a cron window given up) and it uses its
-**own slug** (`trigger-telegram`, `trigger-mcp`) so it can't overwrite
+**own slug** (`trigger-<source>`, or `trigger-<source>-<sanitized-session>`
+when a session is present) so it can't overwrite
 `last_success_at` for a window that never fired.
 
-Triggers are drained by a single worker task, FIFO, one at a time — so
-they are serialized against each other (per-conversation order is
-preserved) but **not** against the scheduler's tick. A long scheduled
-run no longer delays a chat reply; a long triggered run still delays the
-next trigger. The channel holds 64 pending requests, then applies
-backpressure.
+Triggers enter a gateway with one FIFO worker per conversation key
+`(source, session_id/reply_to/default)`. Same-conversation order is preserved;
+different conversations run in parallel up to a default cap of four. This is
+**not** serialized against the scheduler's tick. A long scheduled run no longer
+delays a chat reply; a long triggered run still delays the next trigger for its
+conversation. The gateway and per-conversation queues are bounded at 64 pending
+jobs, then apply backpressure.
 
 ### MCP server — every agent as a tool
 
@@ -1106,6 +1127,27 @@ there is no model in the daemon.
 Security: this is the one path where someone with NO access to the
 machine can cause a local process to run. Read V8 in
 `docs/security/threat-model.md` before enabling.
+
+### Local client API — same-machine assistant transport
+
+When `telegram.dispatcher_agent` resolves to a discovered agent, the daemon
+also listens on `$DOTAGENT_HOME/api.sock` (default
+`~/.config/dotagent/api.sock`) with Unix-socket permissions `0600`. This is
+JSON Lines, not HTTP/TCP, and is independent of whether Telegram polling has a
+bot token and allowlist.
+
+Requests are `message.send` (`{"session_id?":"...","text":"..."}`),
+`commands.list`, and `status.get`. Responses are `{id,result}` or
+`{id,error}`; ids may be strings or numbers and are normalized to strings.
+Events are `typing`, `run.started`, raw `reply.delta`, and final `reply`.
+The socket caps connections at 16, requests at 30/minute/connection, text at
+32 KiB, session ids at 64 ASCII identifier characters, and pending event bytes
+at 1 MiB. A slow client is disconnected.
+
+The API is a harness boundary: it routes and supervises the configured
+dispatcher, but it does not own sessions, transcripts, or LLM state. Local
+clients receive raw streaming deltas; Telegram remains final-only. Full wire
+contract: `docs/reference/local-api.md`.
 
 ### A broken manifest does not stop the others
 
@@ -1190,6 +1232,7 @@ answer `{"id":…,"output":…}` to `request`. See
 - Config reference (`config.toml`): `docs/guides/config-reference.md`
 - LLM agents (`claude -p`, headless gotchas): `docs/guides/llm-agents.md`
 - Triggers (event-caused runs): `docs/concepts/triggers.md`
+- Local client API (UDS JSON Lines): `docs/reference/local-api.md`
 - Lifecycle (persistent agents): `docs/concepts/lifecycle.md`
 - Persistent protocol (JSON lines): `docs/reference/persistent-protocol.md`
 - Telegram (inbound chat): `docs/concepts/telegram.md`
@@ -1212,7 +1255,7 @@ When you, the LLM, generate an `agent.toml`, verify against this digest:
 
 1. [ ] `[agent].name` is unique and matches the directory name (advisory)
 2. [ ] `[run].command` resolves on `$PATH` (or is absolute)
-3. [ ] At least one `[[schedules]]` with a unique `id`
+3. [ ] At least one `[[schedules]]` with a unique `id`, unless the agent is trigger-only
 4. [ ] Schedule fields match the `type`: cron needs `weekdays/hours/minute`,
    interval needs `interval_minutes`, expression needs `expression`
 5. [ ] `weekdays` in `0..=6`, `hours` in `0..=23`, `minute` in `0..=59`

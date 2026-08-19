@@ -95,7 +95,7 @@ async fn sweep_once(inner: &Inner) {
     // First pass: identify victims AND atomically mark them under a single
     // lock acquisition. Marking inside the same critical section as the
     // check guarantees that a racing `SupervisedHandle::wait_*` sees the
-    // flag via `claim_handle_kill` and bails — no double-emit.
+    // claim and bails — no double-emit.
     let (victims, grace) = {
         let mut reg = inner.registry.lock().expect("registry lock poisoned");
         let mut found: Vec<(u64, i32, Duration)> = Vec::new();
@@ -107,6 +107,9 @@ async fn sweep_once(inner: &Inner) {
             if age >= entry.deadline {
                 if let Some(pgid) = entry.pgid {
                     entry.killed_by_reaper = true;
+                    entry
+                        .reaper_owned
+                        .store(true, std::sync::atomic::Ordering::Release);
                     found.push((*id, pgid, age));
                 }
             }

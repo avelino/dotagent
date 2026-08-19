@@ -29,6 +29,9 @@ flowchart LR
     D -->|sleeps until<br/>next event| D
     D -->|spawn| A[your agent script]
     A -->|stdout / exit code| D
+    IN["Telegram / local UDS"] -->|trigger| G["gateway<br/>admission + FIFO + delivery"]
+    G -->|supervised run| A
+    G -->|reply events| IN
     D -->|fire| P["plugins<br/>(preflight, sink)"]
     D -->|fire| N["notifiers<br/>(in-process)"]
     D -->|append| AU[(audit log)]
@@ -51,6 +54,10 @@ Three things to internalize:
    "persistent"` is kept alive between runs and handed requests over JSON
    lines. Same supervisor, same deadline, same reaping — see
    [`lifecycle.md`](lifecycle.md).
+4. **The trigger gateway is transport and policy, not a conversation runtime.**
+   It admits and orders Telegram/local triggers, caps concurrent conversations,
+   and delivers output through the submitting transport. Session ids are opaque;
+   transcripts, model state, and conversation persistence belong to the agent.
 
 Everything else in this doc is detail.
 
@@ -105,7 +112,7 @@ close the loop.
 | `dotagent-supervisor` | Subprocess lifecycle: deadlines, kill-tree via POSIX process groups, live registry.             |
 | `dotagent-telemetry`  | `tracing` setup, JSON file logging, daily rotation, retention sweep, optional OTLP export.      |
 | `dotagent-unit-gen`   | Render `daemon.plist` (macOS) / `daemon.service` (Linux) from templates.                        |
-| `dotagent` (binary)   | CLI subcommands. Wires the crates together.                                                     |
+| `dotagent` (binary)   | CLI subcommands plus daemon wiring for scheduling, Telegram ingress, the local UDS API, and the trigger gateway. |
 
 **Rule of thumb**: if you can write it as `fn f(now: DateTime, ...) -> X`
 with no `std::fs`, it goes in `dotagent-scheduler`. Anything that touches
@@ -293,6 +300,9 @@ Two important properties:
 - **Embed AI / call LLMs.** dotagent has zero LLM dependencies. Your
   agent decides whether and when to invoke `claude -p`, `openai`, the
   `mcp` CLI, or nothing at all.
+- **Own conversation state.** The daemon routes and supervises a trigger, but
+  `session_id`, transcripts, and LLM state belong to the agent process. The
+  local API is a Unix socket, not a public HTTP/TCP conversation service.
 - **Replace the `mcp` CLI.** dotagent and `mcp` are independent
   projects. Agents that use Roam / Sentry / Grafana / etc. call `mcp`
   directly the same way they did before dotagent existed. dotagent
@@ -313,6 +323,7 @@ Two important properties:
 - [`notifications.md`](notifications.md) — why notifiers are NOT plugins
 - [`lifecycle.md`](lifecycle.md) — agents kept alive between runs
 - [`triggers.md`](triggers.md) — runs caused by an event, not the clock
+- [`../reference/local-api.md`](../reference/local-api.md) — local UDS transport and wire contract
 - [`telegram.md`](telegram.md) — inbound chat
 - [`../reference/mcp.md`](../reference/mcp.md) — agents as MCP tools
 - [`../reference/cli.md`](../reference/cli.md) — every CLI subcommand

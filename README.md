@@ -193,6 +193,7 @@ Canonical raw URL for `WebFetch`:
 - [Agent spec](docs/reference/agent-spec.md) — `agent.toml` schema
 - [Plugin protocol](docs/reference/plugin-protocol.md) — formal spec
 - [MCP server](docs/reference/mcp.md) — every agent as a callable tool
+- [Local client API](docs/reference/local-api.md) — Unix-socket JSON-lines contract
 - [Environment variables](docs/reference/env-vars.md) — injected + read
 - [Filesystem layout](docs/reference/paths.md) — where every file lives
 

@@ -7,7 +7,88 @@ adheres to [Semantic Versioning](https://semver.org/).
 Pre-1.0: minor bumps may include breaking changes; both `agent.toml`
 schema and the plugin protocol are flagged in each entry.
 
-## [Unreleased]
+## [0.5.0] - 2026-08-18
+
+### Added
+
+- **Local client API** — the daemon serves path-independent JSON Lines over
+  `$DOTAGENT_HOME/api.sock` when the configured dispatcher is discovered. The
+  current transport is Unix-socket only; requests support `message.send`,
+  `commands.list`, and `status.get`, with streamed `typing`, `run.started`,
+  `reply.delta`, and final `reply` events. The socket is 0600, peer
+  credentials are kernel-verified (same-uid), and a bind/accept failure is
+  fatal to the daemon rather than silently disabling the endpoint.
+- **`dotagent api` — the smallest built-in local client.** A raw JSONL bridge:
+  stdin to the socket, socket to stdout, no rendering and no session state.
+  Scripts and future TUIs speak the wire contract directly;
+  `--socket <PATH>` overrides the default path. After stdin EOF the bridge
+  half-closes and keeps reading, so late `reply` events still arrive.
+- **`TriggerSource::Local` and session-scoped trigger state.** One-shot
+  triggered runs keep the legacy `trigger-<source>` slug without a session and
+  use `trigger-<source>-<sanitized-session>` when one is present. The opaque
+  session id is exposed to the agent as `AGENT_SESSION_ID`.
+- **`assistant-v1` stdout protocol.** A manifest may declare
+  `[run] protocol = "assistant-v1"` for `delta`, `reply`, and optional
+  `session` JSON Lines frames. The daemon uses the final `reply` frame for
+  delivery shaping and does not own assistant transcript state. The protocol
+  is opt-in: plain stdout is never parsed as assistant frames.
+
+### Changed
+
+- **Persistent trigger frames carry `session_id` per request.**
+  `AGENT_TRIGGER_*` and `AGENT_SESSION_ID` are no longer fixed in the
+  persistent process environment.
+- **Trigger admission is now gateway-based.** Conversations are FIFO per
+  `(source, session)` and different conversations can run concurrently up to
+  a default cap of four. Telegram retains its allowlist and ingress rate
+  limit; local clients receive raw streaming output while Telegram remains
+  final-only. Gateway stdout streaming uses a bounded delta channel — a slow
+  sink drops intermediate deltas (logged, with a count) instead of growing
+  without limit.
+- **Ambiguous persistent delivery is a terminal, counted failure.** A request
+  whose bytes crossed the process boundary but never got an answer
+  (`RequestLost`) consumes the attempt, closes the heartbeat with a dedicated
+  exit code, writes an `agent_run` audit event, fires `given_up`, and is never
+  redispatched — a side effect that may have run must not run twice. A
+  supervisor-deadline kill is classified as `timed_out`, not as a lost
+  request.
+- **Telegram reply correlation keys on the canonical chat id.** Outbound
+  notifications register the numeric `chat.id` returned by `sendMessage`, so
+  an allowlist configured with `@channel_username` resolves `reply_to_run`
+  the same way a numeric id always did.
+- **Reload keeps one local socket owner.** Telegram ingress restarts on
+  SIGHUP after aborting and joining the previous poller — two pollers never
+  overlap on the offset file — while the local API listener remains on the
+  same socket until daemon restart.
+
+### Fixed
+
+- **The local API answers before it narrates.** `accepted` is enqueued before
+  `run.started`, `typing`, `reply.delta` and `reply` can reach the same
+  connection, on a multi-thread runtime. A client that half-closes after
+  sending still receives its final `reply`: the writer stays alive until the
+  request's producers finish instead of being cut by a fixed drain window.
+  An oversized frame without a terminating newline now ends the connection
+  instead of pinning one of the connection slots, and the Darwin
+  peer-credential constants match the SDK (`0x001`/`0x002`).
+- **The persistent pool cannot run two instances of one key.** Slot states
+  are explicit (`Starting`, `Live`, `Retiring`, `Stopped`): spawn
+  reservations survive the idle sweep, an LRU eviction holds its key until
+  the old process is actually gone, and a request arriving mid-retirement
+  waits instead of forking a second instance.
+- **Cancelling a run kills the process group.** Aborting a gateway worker
+  (forced shutdown) now terminates the agent's process group and cleans the
+  supervisor registry — a dropped `SupervisedHandle` no longer leaves a
+  one-shot agent running unsupervised.
+- **The persistent protocol parser only accepts answers.** Frames such as
+  `{"kind":"progress","id":"1"}` or a `ready` handshake carrying an `id` are
+  ignored instead of completing a request with an empty response; a manifest
+  combining `assistant-v1` with `lifecycle.mode = "persistent"` is rejected
+  at load rather than failing mid-handshake at runtime.
+- **Post-run audit failure no longer corrupts retry accounting.** An audit
+  append error after the agent already ran is logged and the run's outcome,
+  window state and hooks proceed — a completed execution cannot be
+  redispatched because observability write failed.
 
 ## [0.4.0] - 2026-08-08
 
@@ -849,6 +930,7 @@ break only code that depends on the crates as libraries:
 - CLI run-now output pretty-prints the outcome instead of dumping
   `Debug` and tightens the renderer test suite.
 
+[0.5.0]: https://github.com/avelino/dotagent/releases/tag/v0.5.0
 [0.4.0]: https://github.com/avelino/dotagent/releases/tag/v0.4.0
 [0.3.0]: https://github.com/avelino/dotagent/releases/tag/v0.3.0
 [0.2.1]: https://github.com/avelino/dotagent/releases/tag/v0.2.1

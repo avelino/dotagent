@@ -149,30 +149,36 @@ kills anything past its deadline, so the pool simply re-points that clock:
 the request deadline while an answer is in flight, the idle window while it is
 not. One clock, one kill path, no second implementation to get wrong.
 
-## Concurrency
+## Trigger gateway concurrency
 
-Requests to one instance are serialized by the pool: a mutex per `(agent, key)`
-means a second request for the same instance queues rather than interleaving
-with the first.
+The trigger gateway is separate from the persistent-process pool. It owns one
+FIFO worker per `(source, session_id/reply_to/default)` conversation, so a
+second request for the same conversation queues rather than interleaving with
+the first. Different conversations can run concurrently up to four live
+gateway workers by default.
 
-Requests to *different* instances are not parallel either, and that is still
-deliberate — but the reason is the trigger worker, not the tick loop. Triggers
-are drained by a single task that awaits each request to completion before
-taking the next, so instances of one agent never race the heartbeat file they
-share. Ordering within a conversation falls out of the same property.
+The local Unix-socket API and Telegram ingress use this gateway. A local client
+also has a 64-job per-conversation queue and a 30-request-per-minute local
+admission limit. Telegram keeps its allowlist and its own configured rate
+limit before submission. New conversations over the gateway cap and full
+conversation queues are rejected; they do not block unrelated conversations.
 
-What changed is that this queue no longer sits behind the scheduler. A trigger
-used to wait for whatever scheduled run the tick was awaiting inline; it now
-runs beside it. See [triggers](triggers.md#serialization) for why that pair is
-safe on every piece of shared state.
+This is independent of `[lifecycle]`:
 
-The practical consequence is unchanged: a slow *answer* delays the next one.
-What persistence removes is the startup cost, not the queue.
+- In `oneshot` mode, each admitted message still spawns one supervised agent
+  process.
+- In `persistent` mode, the pool reuses a process, while the gateway still
+  owns trigger ordering and admission.
 
-`dotagent reload` (SIGHUP) retires every instance so the next request re-reads
-the manifest. Retirement waits for the slot's mutex, so an instance answering a
-request when the signal lands is retired once that answer is delivered —
-bounded by the agent's `timeout_seconds`.
+What persistence removes is the startup cost, not the gateway's ordering or
+capacity policy. See [Triggers](triggers.md#serialization) for the shared
+state boundaries.
+
+`dotagent reload` retires persistent instances so the next request re-reads the
+manifest. Telegram ingress is restarted against the new configuration. The
+local API listener intentionally stays on the same socket and keeps one owner
+until daemon restart; a changed `dispatcher_agent` therefore does not replace
+the local handler during reload.
 
 ## Outside the daemon
 
@@ -192,5 +198,6 @@ path rather than a fiction.
 - [Persistent protocol](../reference/persistent-protocol.md) — the wire format
 - [Agent spec](../reference/agent-spec.md#lifecycle--how-long-one-process-lives) — every field
 - [Triggers](triggers.md) — what causes a run
+- [Local Client API](../reference/local-api.md) — Unix-socket streaming transport
 - [Architecture](architecture.md) — where the pool sits
 - [Threat model](../security/threat-model.md) — state shared between senders

@@ -33,6 +33,8 @@ pub enum TriggerSource {
     Cli,
     /// An MCP `tools/call`.
     Mcp,
+    /// A local client over the assistant API (`assistant-v1`).
+    Local,
 }
 
 impl TriggerSource {
@@ -53,6 +55,7 @@ impl std::fmt::Display for TriggerSource {
             TriggerSource::Telegram => "telegram",
             TriggerSource::Cli => "cli",
             TriggerSource::Mcp => "mcp",
+            TriggerSource::Local => "local",
         })
     }
 }
@@ -85,18 +88,50 @@ pub struct TriggerRequest {
     /// is the chat id of the conversation that asked.
     #[serde(default)]
     pub reply_to: Option<String>,
+    /// Local conversation id, when the source is one. Scopes the slug — and
+    /// therefore the heartbeat file — per conversation, so two parallel
+    /// sessions keep separate run histories instead of clobbering each other.
+    /// Sanitized before it reaches a filename; see [`crate::slug`].
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl TriggerRequest {
     /// Slug used for heartbeat and window files. See [`TriggerSource::slug`].
+    ///
+    /// A `session_id` scopes it further, so each conversation gets its own
+    /// history instead of sharing one `trigger-local` file with every other.
+    /// Without one, the slug is exactly what it has always been.
     pub fn slug(&self) -> String {
-        self.source.slug()
+        match &self.session_id {
+            Some(session) => {
+                format!(
+                    "{}-{}",
+                    self.source.slug(),
+                    crate::slug::sanitize_key(session)
+                )
+            }
+            None => self.source.slug(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn req(source: TriggerSource, session_id: Option<&str>) -> TriggerRequest {
+        TriggerRequest {
+            source,
+            agent: "a".into(),
+            schedule: None,
+            args: vec![],
+            payload: None,
+            actor: None,
+            reply_to: None,
+            session_id: session_id.map(str::to_string),
+        }
+    }
 
     #[test]
     fn slug_is_namespaced_by_source() {
@@ -108,26 +143,72 @@ mod tests {
             payload: None,
             actor: None,
             reply_to: None,
+            session_id: None,
         };
         assert_eq!(req.slug(), "trigger-telegram");
     }
 
     #[test]
+    fn slug_without_a_session_is_exactly_what_it_always_was() {
+        // Backcompat: these exact strings are already on disk as heartbeat
+        // filenames. A session-less trigger must keep writing to them.
+        for (source, want) in [
+            (TriggerSource::Telegram, "trigger-telegram"),
+            (TriggerSource::Cli, "trigger-cli"),
+            (TriggerSource::Mcp, "trigger-mcp"),
+            (TriggerSource::Local, "trigger-local"),
+        ] {
+            assert_eq!(req(source, None).slug(), want);
+        }
+    }
+
+    #[test]
     fn slug_never_collides_across_sources() {
-        let mk = |source| TriggerRequest {
-            source,
-            agent: "a".into(),
-            schedule: None,
-            args: vec![],
-            payload: None,
-            actor: None,
-            reply_to: None,
-        };
         assert_ne!(
-            mk(TriggerSource::Telegram).slug(),
-            mk(TriggerSource::Cli).slug()
+            req(TriggerSource::Telegram, None).slug(),
+            req(TriggerSource::Cli, None).slug()
         );
-        assert_ne!(mk(TriggerSource::Cli).slug(), mk(TriggerSource::Mcp).slug());
+        assert_ne!(
+            req(TriggerSource::Cli, None).slug(),
+            req(TriggerSource::Mcp, None).slug()
+        );
+    }
+
+    #[test]
+    fn a_session_namespaces_the_slug() {
+        assert_eq!(
+            req(TriggerSource::Local, Some("chat-9_a")).slug(),
+            "trigger-local-chat-9_a"
+        );
+        assert_eq!(
+            req(TriggerSource::Telegram, Some("12345")).slug(),
+            "trigger-telegram-12345"
+        );
+    }
+
+    #[test]
+    fn a_dirty_session_yields_a_stable_safe_slug() {
+        let a = req(TriggerSource::Local, Some("../../etc/passwd")).slug();
+        assert!(a.starts_with("trigger-local-k"), "{a}");
+        assert_eq!(
+            a,
+            req(TriggerSource::Local, Some("../../etc/passwd")).slug(),
+            "must be stable"
+        );
+        assert_ne!(
+            a,
+            req(TriggerSource::Local, Some("../../etc/shadow")).slug(),
+            "must not collide"
+        );
+        // No path separator ever reaches a filename.
+        assert!(!a.contains('/'), "{a}");
+    }
+
+    #[test]
+    fn distinct_sessions_never_share_a_slug() {
+        let first = req(TriggerSource::Local, Some("s-1")).slug();
+        let second = req(TriggerSource::Local, Some("s-2")).slug();
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -138,5 +219,15 @@ mod tests {
         assert!(req.schedule.is_none());
         assert!(req.args.is_empty());
         assert!(req.reply_to.is_none());
+        assert!(req.session_id.is_none());
+    }
+
+    #[test]
+    fn local_round_trips_through_serde() {
+        let req: TriggerRequest =
+            serde_json::from_str(r#"{"source":"local","agent":"a","session_id":"s1"}"#).unwrap();
+        assert_eq!(req.source, TriggerSource::Local);
+        assert_eq!(req.session_id.as_deref(), Some("s1"));
+        assert_eq!(req.slug(), "trigger-local-s1");
     }
 }

@@ -38,6 +38,7 @@ $DOTAGENT_HOME/
 ├── plugins/                      # YOUR custom plugin binaries (optional)
 ├── config.toml                   # global config (optional)
 ├── secrets.env                   # daemon-loaded KEY=VALUE secrets (optional, 0600)
+├── api.sock                      # local client API socket (daemon, 0600)
 ├── state/                        # daemon state (read-write, machine-managed)
 ├── logs/                         # operational logs (rotated)
 ├── audit.log                     # append-only hash-chained event log
@@ -52,6 +53,7 @@ $DOTAGENT_HOME/
 | `plugins/`       | **you**            | `PluginClient`      | Per-user plugin binaries. Skip if you install plugins via brew / cargo. |
 | `config.toml`    | **you** (optional) | daemon              | Schema in [`config-reference.md`](../guides/config-reference.md).      |
 | `secrets.env`    | **you** (optional) | daemon              | KEY=VALUE secrets for `${VAR}` interpolation in notifier configs. **Must be mode 0600.** See [`concepts/secrets.md`](../concepts/secrets.md). |
+| `api.sock`       | daemon             | local clients        | Unix-socket JSON-lines API, mode 0600. Created only when `telegram.dispatcher_agent` resolves to a discovered agent. See [`local-api.md`](local-api.md). |
 | `state/`         | daemon, runner     | daemon, CLI         | **Don't edit by hand.**                                                |
 | `logs/`          | daemon             | you (via `dotagent logs` / `tail`) | Rotated daily, gzipped after 1d, deleted after retention horizon. |
 | `audit.log`      | daemon             | you (`tail`, `jq`)  | Append-only, hash-chained. Rotates at 32MB into `audit.log.<stamp>` segments, which are **never deleted automatically**. |
@@ -425,7 +427,8 @@ run that caused it.
 ```jsonc
 {
   "entries": {
-    "4821": {
+    "5:-1001:4821": {
+      "chat_id": "-1001",
       "agent": "disk-alert",
       "schedule": "every-15min",
       "event": "given_up",
@@ -434,6 +437,10 @@ run that caused it.
   }
 }
 ```
+
+The key is scoped by Telegram chat, because `message_id` is only unique within
+that chat. Older entries may keep the numeric key and omit `chat_id`; they stay
+available to legacy callers but are not used for scoped Telegram correlation.
 
 Capped at the most recent 500, oldest dropped first. It is a lookup table for
 alerts you might still answer, not a history — and losing it costs correlation

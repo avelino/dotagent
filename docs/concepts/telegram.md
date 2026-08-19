@@ -106,11 +106,13 @@ move, and the reply carries which run it answers:
 "reply_to_run": { "agent": "disk-alert", "schedule": "every-15min", "event": "given_up" }
 ```
 
-Resolved from the replied-to message id, through a table of the last few
-hundred notifications at `state/notify/telegram/sent.json`. Not from the text:
-one event reads `🚨 disk-alert/every-15min gave up after 3 attempts` and
-another reads only `preflight aborted by plugin preflight-warp`, so a
-dispatcher parsing the wording would work for one and be wrong on the other.
+Resolved from the replied-to message id and the inbound chat id, through a
+chat-scoped table of the last few hundred notifications at
+`state/notify/telegram/sent.json`. Not from the text: one event reads `🚨
+disk-alert/every-15min gave up after 3 attempts` and another reads only
+`preflight aborted by plugin preflight-warp`, so a dispatcher parsing the
+wording would work for one and be wrong on the other. Legacy records without a
+chat id fail closed rather than risking a match from another chat.
 
 With it, "por que falhou?" is answerable without guessing which agent — the
 dispatcher reads the field and calls `dotagent-logs` on the right one. If the

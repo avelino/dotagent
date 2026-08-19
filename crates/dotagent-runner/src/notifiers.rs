@@ -109,7 +109,18 @@ pub async fn fire_notifier_entries(
                 continue;
             }
         };
-        let outcome = driver_box.send(&ctx).await;
+        let (outcome, canonical_chat_id) = match &entry.config {
+            NotifierConfig::Telegram(config) => {
+                let result = config.send_with_result(&ctx).await;
+                let canonical_chat_id = match &result {
+                    Ok(Some(result)) => result.chat_id.map(|chat_id| chat_id.to_string()),
+                    _ => None,
+                };
+                let outcome = result.map(|result| result.map(|result| result.message_id));
+                (outcome, canonical_chat_id)
+            }
+            _ => (driver_box.send(&ctx).await, None),
+        };
 
         // Remember what this notification was about, when the transport gave
         // it an id. A failure alert is the message someone replies to, and
@@ -121,14 +132,12 @@ pub async fn fire_notifier_entries(
         // notification that was already delivered.
         if let Ok(Some(message_id)) = &outcome {
             let store = dotagent_state::SentMessageStore::from_home();
-            if let Err(e) = store.record(
+            if let Err(e) = record_sent_message(
+                &store,
+                entry,
                 *message_id,
-                dotagent_state::SentMessage {
-                    agent: ctx.agent.to_string(),
-                    schedule: ctx.schedule.to_string(),
-                    event: ctx.event.to_string(),
-                    at: chrono::Local::now().timestamp(),
-                },
+                canonical_chat_id.as_deref(),
+                &ctx,
             ) {
                 warn!(driver, error = %e, "could not record notification for reply correlation");
             }
@@ -150,6 +159,39 @@ pub async fn fire_notifier_entries(
     }
 }
 
+fn record_sent_message(
+    store: &dotagent_state::SentMessageStore,
+    entry: &NotifierEntry,
+    message_id: i64,
+    canonical_chat_id: Option<&str>,
+    ctx: &NotifyContext<'_>,
+) -> dotagent_state::Result<()> {
+    let message = dotagent_state::SentMessage {
+        chat_id: None,
+        agent: ctx.agent.to_string(),
+        schedule: ctx.schedule.to_string(),
+        event: ctx.event.to_string(),
+        at: chrono::Local::now().timestamp(),
+    };
+
+    match &entry.config {
+        NotifierConfig::Telegram(config) => {
+            let chat_id = if let Some(chat_id) = canonical_chat_id {
+                chat_id
+            } else if config.chat_id.parse::<i64>().is_ok() {
+                // Numeric configuration was already the canonical inbound id.
+                &config.chat_id
+            } else {
+                // A username can send successfully but cannot scope an inbound
+                // reply when Telegram omitted the canonical id.
+                return Ok(());
+            };
+            store.record_for_chat(chat_id, message_id, message)
+        }
+        _ => store.record(message_id, message),
+    }
+}
+
 fn audit_notifier(audit: Option<&AuditLog>, agent: &str, driver: &'static str, ok: bool) {
     if let Some(log) = audit {
         let _ = log.append(AuditEvent::PluginInvoked {
@@ -158,5 +200,89 @@ fn audit_notifier(audit: Option<&AuditLog>, agent: &str, driver: &'static str, o
             plugin_kind: "notify".into(),
             ok,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dotagent_notify::telegram::{TelegramConfig, TelegramSendResult};
+
+    fn telegram_entry(chat_id: &str) -> NotifierEntry {
+        NotifierEntry {
+            config: NotifierConfig::Telegram(TelegramConfig {
+                bot_token: "token".into(),
+                chat_id: chat_id.into(),
+                parse_mode: None,
+                disable_notification: None,
+            }),
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn telegram_correlation_is_recorded_for_its_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dotagent_state::SentMessageStore::new(dir.path().join("sent.json"));
+        let entry = telegram_entry("-1001");
+        let ctx = NotifyContext {
+            agent: "agent",
+            schedule: "daily",
+            event: "given_up",
+            message: "failed",
+        };
+
+        record_sent_message(&store, &entry, 42, None, &ctx).unwrap();
+
+        let found = store.resolve_for_chat("-1001", 42).expect("scoped record");
+        assert_eq!(found.chat_id.as_deref(), Some("-1001"));
+        assert_eq!(found.agent, "agent");
+        assert!(store.resolve_for_chat("chat-b", 42).is_none());
+        assert!(store.resolve(42).is_none());
+    }
+
+    #[test]
+    fn telegram_username_correlation_uses_canonical_chat_id_from_send_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dotagent_state::SentMessageStore::new(dir.path().join("sent.json"));
+        let entry = telegram_entry("@channel_username");
+        let ctx = NotifyContext {
+            agent: "agent",
+            schedule: "daily",
+            event: "given_up",
+            message: "failed",
+        };
+        // Mock the successful sendMessage response; no Telegram request is made.
+        let response = serde_json::json!({
+            "ok": true,
+            "result": {
+                "message_id": 42,
+                "chat": {"id": -1001234567890i64}
+            }
+        });
+        let send_result = TelegramSendResult {
+            message_id: response["result"]["message_id"]
+                .as_i64()
+                .expect("sendMessage must return message_id"),
+            chat_id: response["result"]["chat"]["id"].as_i64(),
+        };
+        let inbound_chat_id = send_result.chat_id.unwrap().to_string();
+
+        record_sent_message(
+            &store,
+            &entry,
+            send_result.message_id,
+            Some(&inbound_chat_id),
+            &ctx,
+        )
+        .unwrap();
+
+        let found = store
+            .resolve_for_chat(&inbound_chat_id, send_result.message_id)
+            .expect("inbound numeric chat id must resolve the record");
+        assert_eq!(found.agent, "agent");
+        assert!(store
+            .resolve_for_chat("@channel_username", send_result.message_id)
+            .is_none());
     }
 }

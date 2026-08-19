@@ -34,6 +34,7 @@ timeout_seconds = 1800                  # hard kill SIGTERM→SIGKILL; default 1
 command = "fish"                        # the executable
 args = ["./agent.fish"]                 # static args (the schedule's args are appended)
 working_dir = "."                       # optional, relative to the manifest dir
+protocol = "assistant-v1"                 # optional stdout protocol for triggered delivery
 
 # Optional: environment variable injection
 [env]
@@ -57,7 +58,7 @@ max_retries = 3
 retry_backoff_minutes = [5, 15, 30]
 stale_after_minutes = 120
 
-# Required: at least one schedule
+# Optional: schedules. Trigger-only agents may declare none.
 [[schedules]]
 id = "daily"                            # unique within this manifest
 type = "cron"                           # "cron" | "interval" | "expression"
@@ -154,6 +155,30 @@ Two things change meaning in this mode:
 
 Full reasoning in [Lifecycle](../concepts/lifecycle.md).
 
+### `[run].protocol` — assistant stdout
+
+The optional `protocol` field declares the stdout shape used by an assistant
+dispatcher. The only supported value is `"assistant-v1"`:
+
+```toml
+[run]
+command = "bash"
+args = ["./agent.sh"]
+protocol = "assistant-v1"
+```
+
+An `assistant-v1` agent emits one JSON object per stdout line with `type` set
+to `delta`, `reply`, or `session`. The gateway forwards every raw stdout line
+to a local client as `reply.delta`, and uses the last `reply` frame to shape the
+final `reply` event. `session` is agent bookkeeping only; dotagent does not own
+or persist the assistant transcript.
+
+The value is validated when the manifest loads. Unknown protocol values fail
+manifest validation instead of producing a run that the client cannot decode.
+`assistant-v1` is the one-shot assistant stdout protocol, not the persistent
+agent request/response protocol and not a version of the local Unix-socket API.
+See [Local Client API](local-api.md).
+
 ### `[[notifiers]]` — built-in drivers
 
 The `notifiers` array runs **in-process inside the daemon**, no subprocess.
@@ -244,9 +269,8 @@ the last success, not the rolling one. Judging staleness against a window that
 rolls forward would report a chronically failing agent as a fresh failure
 forever. So dispatch stays alive and `dotagent status` still says `stale`.
 
-`interval_minutes = 0` has no meaningful cadence. It is accepted and the
-schedule simply never comes due — it does not fire every tick, and it does not
-crash the daemon.
+`interval_minutes` must be greater than zero. A value of `0` is rejected during
+manifest validation instead of reaching the scheduler.
 
 ### Heartbeat slug
 
@@ -260,6 +284,21 @@ dotagent derives a slug from the schedule's `args` to namespace state files:
 
 Rules: strip leading dashes, lowercase, replace non-alphanumeric with `_`,
 collapse repeated `_`, trim trailing `_`. Empty input → `default`.
+
+Triggered runs use a source namespace instead of schedule args. Without a
+session, the slug keeps the existing `trigger-<source>` form:
+
+| Source | No session | With `session_id = "chat-9_a"` |
+|---|---|---|
+| `telegram` | `trigger-telegram` | `trigger-telegram-chat-9_a` |
+| `local` | `trigger-local` | `trigger-local-chat-9_a` |
+| `mcp` | `trigger-mcp` | `trigger-mcp-chat-9_a` |
+| `cli` | `trigger-cli` | `trigger-cli-chat-9_a` |
+
+The session part is sanitized before it reaches a filename. The local API uses
+the effective session `default` when `message.send` omits `session_id`, so a
+local API request without an explicit session is associated with
+`trigger-local-default`.
 
 ## Environment variables dotagent injects
 
@@ -303,15 +342,21 @@ LANG = "pt_BR.UTF-8"
 ```
 
 Runs started by a [trigger](../concepts/triggers.md) rather than a schedule get
-four more, applied *before* the block above so a payload can never redefine
+additional context, applied *before* the block above so a payload can never redefine
 `AGENT_NAME` or `AGENT_HEARTBEAT_FILE`:
 
 | Variable                 | Value                                                    |
 |--------------------------|----------------------------------------------------------|
-| `AGENT_TRIGGER_SOURCE`   | `telegram`, `mcp`, `cli`                                  |
+| `AGENT_TRIGGER_SOURCE`   | `telegram`, `local`, `mcp`, `cli`                          |
 | `AGENT_TRIGGER_ACTOR`    | who asked, as the source can attest it                    |
 | `AGENT_TRIGGER_REPLY_TO` | opaque handle for the conversation to answer              |
 | `AGENT_TRIGGER_PAYLOAD`  | source-specific JSON body                                 |
+| `AGENT_SESSION_ID`       | opaque conversation id, when the trigger has one           |
+
+`AGENT_SESSION_ID` is not a transcript or a Claude session id. It is an opaque
+key supplied by the trigger source. The local client API validates it against
+`^[A-Za-z0-9_-]{1,64}$`; the agent remains responsible for deciding whether to
+persist conversation state under that key. See [Local Client API](local-api.md).
 
 ## Heartbeat & state
 
@@ -468,8 +513,15 @@ revision.
 
 ## What dotagent does NOT do
 
-- **Run the agent's business logic.** dotagent is a scheduler+monitor; the agent
+- **Run the agent's business logic.** dotagent is a scheduler, supervisor, and
+  trigger harness; the agent
   is an independent process.
+- **Own conversation state.** Trigger `session_id` values are opaque and are
+  passed through as `AGENT_SESSION_ID`. Transcripts, LLM state, and persistence
+  belong to the agent.
+- **Provide a network API.** The current local client API is a user-local Unix
+  socket, not HTTP or TCP. It is enabled only when the configured dispatcher is
+  discovered; see [Local Client API](local-api.md).
 - **Provide an SDK.** No client library is required. Read env vars, write
   stdout/stderr, exit with a code. That's it.
 - **Wait for the schedule.** The OS scheduler (launchd / systemd) fires the

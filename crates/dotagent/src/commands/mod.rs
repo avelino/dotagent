@@ -16,6 +16,7 @@ use dotagent_state::{AuditLog, StateStore};
 use dotagent_supervisor::Supervisor;
 use dotagent_unit_gen::GenContext;
 
+pub mod api;
 pub mod audit;
 pub mod completions;
 pub mod daemon;

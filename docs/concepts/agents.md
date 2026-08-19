@@ -19,6 +19,8 @@ This guide covers:
 For the formal `agent.toml` schema see [`agent-spec.md`](../reference/agent-spec.md).
 For plugins see [`plugins.md`](plugins.md). For built-in notifiers see
 [`notifications.md`](notifications.md).
+For the local assistant transport see
+[`local-api.md`](../reference/local-api.md).
 
 ---
 
@@ -359,7 +361,8 @@ inherited environment (unless `env.inherit = false` in the manifest):
 | `AGENT_SLUG`           | derived slug for the heartbeat (from args)            |
 | `AGENT_START_EPOCH`    | epoch seconds of `started_at`                         |
 | `AGENT_ARGV`           | JSON array of the schedule's `args`                   |
-| `AGENT_TRIGGER_*`      | only on [triggered](triggers.md) runs — source, actor, reply handle, payload. **Not set** for a [persistent](lifecycle.md) agent. |
+| `AGENT_TRIGGER_*`      | only on one-shot [triggered](triggers.md) runs — source, actor, reply handle, payload. **Not set** for a [persistent](lifecycle.md) agent. |
+| `AGENT_SESSION_ID`     | opaque conversation id for a one-shot triggered run, when present. Persistent agents receive it as `trigger.session_id` per request instead. |
 | `AGENT_LIFECYCLE`      | `persistent` when the agent stays alive between runs; absent otherwise |
 | `AGENT_PERSIST_KEY`    | which slice a persistent instance answers for              |
 | `AGENT_HEARTBEAT_FILE` | path to the heartbeat file (empty if `dry_run`)       |
@@ -367,6 +370,23 @@ inherited environment (unless `env.inherit = false` in the manifest):
 
 Use them. Don't reinvent (no need for your own tempdir, no need to write
 your own state).
+
+### Triggered assistant runs
+
+Telegram and the local Unix-socket API can send a message to the configured
+dispatcher agent. The daemon is the harness at this boundary: it admits and
+orders the trigger, supervises the process, and delivers stdout. It does not
+hold the conversation transcript or an LLM session. For one-shot triggered
+runs, `AGENT_SESSION_ID` is an opaque key passed to the agent; persistent agents
+receive the per-request key as `trigger.session_id`. The agent owns any
+transcript or durable conversation state.
+
+An agent that wants structured streaming declares
+`[run] protocol = "assistant-v1"` and emits JSON Lines `delta`, `reply`, and
+optional `session` frames. Local clients receive raw stdout lines as
+`reply.delta` followed by the shaped final `reply`; Telegram delivers only the
+final reply. The `claude --include-partial-messages` flag is an example detail,
+not a dotagent requirement. See the [Local Client API](../reference/local-api.md).
 
 ### Extra env vars
 
@@ -540,9 +560,10 @@ dotagent is a hammer. Not everything is a nail.
   not an agent. That's a CLI you run.
 - **Sub-second latency** → dotagent's daemon wakes adaptively; spawn
   overhead is real. Don't schedule something that needs to fire 100x/s.
-- **Pure event-driven work** → if the trigger is "webhook hits an
-  endpoint," you want a real service. dotagent only wakes on its own
-  schedule.
+- **Public event-driven work** → if the trigger is "a webhook hits an HTTP
+  endpoint," you want a real service. dotagent's event transports are the
+  user-local Unix socket and the configured Telegram poller; it does not expose
+  a public HTTP/TCP endpoint.
 
 A good rule of thumb: if the task naturally fits in a sentence like
 "every weekday at 08:30, …" or "every 90 minutes, …", it's an agent.

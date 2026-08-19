@@ -951,6 +951,7 @@ mod tests {
                 command: "fish".into(),
                 args: vec![],
                 working_dir: None,
+                protocol: None,
             },
             env: None,
             lifecycle: Default::default(),

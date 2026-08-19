@@ -58,6 +58,17 @@ pub struct TelegramConfig {
     pub disable_notification: Option<bool>,
 }
 
+/// The identifiers Telegram assigned to a sent message.
+///
+/// `chat_id` is optional only to preserve the existing best-effort behavior
+/// when a successful but incomplete API response can still provide a message
+/// id. Normal `sendMessage` responses always include it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramSendResult {
+    pub message_id: i64,
+    pub chat_id: Option<i64>,
+}
+
 impl fmt::Debug for TelegramConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TelegramConfig")
@@ -203,10 +214,27 @@ impl Notifier for TelegramConfig {
     }
 
     async fn send(&self, ctx: &NotifyContext<'_>) -> Result<Option<i64>> {
+        self.send_with_result(ctx)
+            .await
+            .map(|result| result.map(|result| result.message_id))
+    }
+}
+
+impl TelegramConfig {
+    /// Send a notification while retaining Telegram's canonical chat id.
+    ///
+    /// The regular [`Notifier::send`] contract intentionally stays limited to
+    /// a message id because other drivers do not have a destination handle.
+    /// The runner uses this Telegram-specific path when it needs to persist a
+    /// reply correlation record.
+    pub async fn send_with_result(
+        &self,
+        ctx: &NotifyContext<'_>,
+    ) -> Result<Option<TelegramSendResult>> {
         if self.chat_id.trim().is_empty() {
             return Err(NotifyError::Config("telegram: chat_id is required".into()));
         }
-        send_message(
+        send_message_with_result(
             &self.bot_token,
             &self.chat_id,
             ctx.message,
@@ -242,6 +270,19 @@ pub(crate) async fn send_message(
     silent: bool,
     reply_to: Option<i64>,
 ) -> Result<Option<i64>> {
+    send_message_with_result(bot_token, chat_id, text, parse_mode, silent, reply_to)
+        .await
+        .map(|result| result.map(|result| result.message_id))
+}
+
+async fn send_message_with_result(
+    bot_token: &str,
+    chat_id: &str,
+    text: &str,
+    parse_mode: Option<ParseMode>,
+    silent: bool,
+    reply_to: Option<i64>,
+) -> Result<Option<TelegramSendResult>> {
     if bot_token.trim().is_empty() {
         return Err(NotifyError::Config(
             "telegram: bot_token is required".into(),
@@ -311,12 +352,23 @@ pub(crate) async fn send_message(
     // resolved back to the run that caused it. Not being able to read it is
     // not a delivery failure: the message arrived, and the only thing lost is
     // the ability to correlate a future reply.
-    let message_id = res
+    let send_result = res
         .json::<serde_json::Value>()
         .await
         .ok()
-        .and_then(|v| v.get("result")?.get("message_id")?.as_i64());
-    Ok(message_id)
+        .and_then(|value| parse_send_message_result(&value));
+    Ok(send_result)
+}
+
+fn parse_send_message_result(value: &serde_json::Value) -> Option<TelegramSendResult> {
+    let result = value.get("result")?;
+    Some(TelegramSendResult {
+        message_id: result.get("message_id")?.as_i64()?,
+        chat_id: result
+            .get("chat")
+            .and_then(|chat| chat.get("id"))
+            .and_then(serde_json::Value::as_i64),
+    })
 }
 
 #[cfg(test)]
@@ -641,6 +693,25 @@ mod tests {
         assert_eq!(cfg.disable_notification, Some(true));
         assert!(entry.matches_event("given_up"));
         assert!(!entry.matches_event("success"));
+    }
+
+    #[test]
+    fn parses_send_message_result_chat_id() {
+        let response = json!({
+            "ok": true,
+            "result": {
+                "message_id": 42,
+                "chat": {"id": -1001234567890i64}
+            }
+        });
+
+        assert_eq!(
+            parse_send_message_result(&response),
+            Some(TelegramSendResult {
+                message_id: 42,
+                chat_id: Some(-1001234567890),
+            })
+        );
     }
 
     #[tokio::test]

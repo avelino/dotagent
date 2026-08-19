@@ -4,7 +4,7 @@
 //! orchestration logic for `tick`, `status`, `daily-summary`, `run`, etc.
 //! lives in `commands/`.
 
-use std::io::IsTerminal;
+use std::{io::IsTerminal, path::PathBuf};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -12,6 +12,8 @@ use clap_complete::Shell;
 
 mod commands;
 mod discovery;
+mod gateway;
+mod local_api;
 mod power;
 mod skills;
 mod slash;
@@ -48,6 +50,16 @@ enum Command {
     /// Run the long-lived daemon (adaptive scheduler). Invoked by launchd /
     /// systemd from the unit installed by `dotagent install`.
     Daemon,
+
+    /// Bridge raw JSON Lines between stdin/stdout and the daemon's local API.
+    ///
+    /// This is a transport for scripts and TUIs, not an interactive TUI: input
+    /// and output are forwarded without parsing or rendering.
+    Api {
+        /// Unix socket path (default: `$DOTAGENT_HOME/api.sock`).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
 
     /// Print a textual health dashboard.
     Status,
@@ -225,6 +237,7 @@ async fn main() -> Result<()> {
         } => commands::run(name, schedule, dry_run).await,
         Command::Tick { dry_run, verbose } => commands::tick(dry_run, verbose).await,
         Command::Daemon => commands::daemon_cmd().await,
+        Command::Api { socket } => commands::api::run(socket).await,
         Command::Status => commands::status().await,
         Command::DailySummary { dry_run } => commands::daily_summary(dry_run).await,
         Command::Bootstrap => commands::bootstrap().await,
