@@ -156,17 +156,19 @@ impl Signals {
 
 /// Sleep until something asks the loop to do its next thing.
 ///
-/// The gateway supervisor is one of those things. Its task is selected here so
-/// a panic or unexpected return cannot leave a daemon that still ticks but can
-/// no longer answer inbound requests.
+/// Required ingress supervisors are selected here so a panic or unexpected
+/// return cannot leave a daemon that still ticks but can no longer answer
+/// inbound requests.
 async fn wait_for_event(
     sleep_for: Duration,
     signals: &mut Signals,
     gateway: &mut crate::gateway::GatewayHandle,
     local_api_task: &mut Option<LocalApiTask>,
+    telegram: &mut Option<tokio::task::JoinHandle<()>>,
 ) -> Wake {
     let gateway_task = gateway.task();
     let local_api_running = local_api_task.is_some();
+    let telegram_running = telegram.is_some();
     tokio::select! {
         _ = tokio::time::sleep(sleep_for) => Wake::Tick,
         _ = signals.hangup.recv() => Wake::Reload,
@@ -200,6 +202,25 @@ async fn wait_for_event(
                     "local API task failed: {error}"
                 )),
                 None => unreachable!("local API branch was enabled without a task"),
+            }
+        }
+        outcome = async {
+            match telegram.as_mut() {
+                Some(task) => Some(task.await),
+                None => None,
+            }
+        }, if telegram_running => {
+            // Completion here is never intentional: reload and shutdown take
+            // ownership of this handle outside the select loop.
+            telegram.take();
+            match outcome {
+                Some(Ok(())) => Wake::Fatal(anyhow::anyhow!(
+                    "telegram ingress stopped unexpectedly"
+                )),
+                Some(Err(error)) => Wake::Fatal(anyhow::anyhow!(
+                    "telegram ingress task failed: {error}"
+                )),
+                None => unreachable!("telegram branch was enabled without a task"),
             }
         }
     }
@@ -1235,15 +1256,16 @@ pub async fn run() -> Result<()> {
             &mut signals,
             &mut gateway_handle,
             &mut local_api_task,
+            &mut telegram,
         )
         .await
         {
             Wake::Tick => continue,
             Wake::Stop(reason) => break reason,
             Wake::Fatal(error) => {
-                warn!(error = %error, "local API supervision failed; stopping daemon");
+                warn!(error = %error, "ingress supervision failed; stopping daemon");
                 fatal_error = Some(error);
-                break "local API failed";
+                break "ingress failed";
             }
             Wake::Reload => {
                 info!("SIGHUP — reloading on next tick");
