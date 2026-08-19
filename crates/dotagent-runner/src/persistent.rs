@@ -628,7 +628,10 @@ impl PersistentPool {
                 // New key. Make room before adding, counting reservations and
                 // retiring slots as occupied. The victim stays in the map
                 // until `retire_slot` finishes.
-                let max = spec.manifest.lifecycle.max_instances as usize;
+                // Direct PersistentPool callers may bypass manifest loading,
+                // which rejects zero. Retain one slot rather than retrying an
+                // impossible allocation forever.
+                let max = (spec.manifest.lifecycle.max_instances as usize).max(1);
                 let mine: Vec<_> = slots.keys().filter(|(a, _)| a == name).cloned().collect();
                 if mine.len() < max {
                     let slot = SlotCell::starting();
