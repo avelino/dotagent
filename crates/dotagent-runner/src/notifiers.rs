@@ -184,6 +184,11 @@ fn record_sent_message(
             } else {
                 // A username can send successfully but cannot scope an inbound
                 // reply when Telegram omitted the canonical id.
+                warn!(
+                    chat_id = %config.chat_id,
+                    message_id,
+                    "Telegram notification cannot be recorded for reply correlation: response omitted canonical chat id"
+                );
                 return Ok(());
             };
             store.record_for_chat(chat_id, message_id, message)
