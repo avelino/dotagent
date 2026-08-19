@@ -213,6 +213,8 @@ enum ProcessResult {
 }
 
 impl ConversationWorker {
+    // Each parameter is a distinct worker dependency; grouping them would make
+    // ownership and test-only replacement of individual dependencies less clear.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         key: ConversationKey,
