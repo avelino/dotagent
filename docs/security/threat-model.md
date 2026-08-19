@@ -383,6 +383,53 @@ blip. Nothing was compromised to cause it; the notifier just had a bad day.
 `${VAR}` path exists so this never has to happen; `doctor` does not currently
 flag literals that look like credentials.
 
+### V15 — Local Unix-socket API
+
+The daemon can expose a local client API at `$DOTAGENT_HOME/api.sock` when
+`telegram.dispatcher_agent` resolves to a discovered manifest. A local process
+can send messages to that socket and cause the configured dispatcher agent to
+run. This is intentionally a same-machine transport, not a network endpoint.
+
+**Mitigations:**
+
+- **Socket permissions.** The listener is created with mode `0600`, so another
+  uid cannot open it through the normal Unix-socket permission check.
+- **Bind hygiene.** The daemon uses `lstat`-style metadata checks, refuses a
+  non-socket file or symlink at the path, refuses a live listener, and removes a
+  stale socket only when its uid is the current uid. A stale socket owned by
+  another uid is left in place and reported as an error.
+- **Peer attribution.** Linux `SO_PEERCRED` and Darwin local peer credential
+  APIs provide uid and, when available, pid. The daemon carries that identity
+  into the trigger actor used for audit entries. If the kernel cannot provide it,
+  the actor is honestly recorded as `local` rather than guessed.
+- **Bounded input and work.** The API caps connections at 16, requests at 30 per
+  minute per connection, text at 32 KiB, session ids at 64 ASCII identifier
+  characters, gateway conversations at 4, and each conversation queue at 64.
+  A pending event queue is capped at 1 MiB per connection; a slow client is
+  disconnected instead of pinning daemon memory.
+- **Audit without transcript capture.** Gateway admission, rejection, and
+  agent execution are auditable, with actor/session attribution. Message text
+  is not copied into the audit log because it is content, not identity.
+- **No public listener.** The current implementation has no HTTP or TCP mode.
+  Mobile clients, remote clients, and token-based authentication are future
+  transport decisions, not capabilities of this socket.
+
+**Trade-offs and not mitigated:**
+
+- `0600` is an OS-user boundary, not authentication. A process already running
+  as the dotagent user can open the socket, submit arbitrary dispatcher input,
+  and read the replies it requested. That is user-equivalent capability, which
+  this threat model explicitly does not claim to prevent.
+- Rate limits and gateway caps reduce accidental floods and resource pressure;
+  they do not distinguish a trusted process from another process running as the
+  same user. `session_id` is an opaque routing key, not an access-control
+  credential.
+- Local clients receive raw streamed stdout lines. A client with socket access
+  can therefore see the output of the work it triggered; agents that persist
+  transcripts or other sensitive state must enforce their own data boundary.
+- A daemon crash can leave `api.sock` behind. The next daemon applies ownership
+  and liveness checks before removing it, rather than blindly unlinking a path.
+
 ## Defenses shipped in v0 (with the daemon engine)
 
 | Defense | Status | Scope |
@@ -396,6 +443,7 @@ flag literals that look like credentials.
 | Trigger env cannot shadow runner env | ✅ | Per-invocation variables are applied before the `AGENT_*` block, so an untrusted payload cannot redefine `AGENT_NAME` or `AGENT_HEARTBEAT_FILE`. |
 | Notifier credentials cannot reach `tracing` | ✅ | `NotifyError` has no `From<reqwest::Error>`, so a `?` that would log a webhook URL does not compile. Transport errors are reduced to kind + status; API error bodies are token-scrubbed. See [V14](#v14--notifier-credentials-written-to-the-daemons-own-log). |
 | `${VAR}` for every credential-bearing notifier field | ✅ | `slack.webhook_url`, `ntfy.token`/`base_url`/`topic`, `pushover.token`/`user`, `telegram.bot_token`. Resolved at send time from `secrets.env` (0600-enforced), env as fallback. Unresolved = failed send, never the literal placeholder. |
+| Local client API socket hygiene and backpressure | ✅ v0 | Unix socket `0600`, stale-path ownership checks, peer uid/pid attribution when available, connection/request/text/session/event-queue limits. This is not same-user authentication. See [V15](#v15--local-unix-socket-api). |
 | Alerts that repeat while a failure holds | ✅ | `stale` and `given_up` re-notify on a rising ladder (entry, 1h, 6h, daily) rather than once. A monitoring channel that goes quiet while the failure persists is indistinguishable from one where nothing is wrong. |
 
 ### The `[security]` gap, stated plainly

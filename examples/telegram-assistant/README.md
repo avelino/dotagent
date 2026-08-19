@@ -19,8 +19,8 @@ sequenceDiagram
     d->>target: dispatch
     target-->>d: output
     d-->>llm: result
-    llm-->>d: answer in plain language
-    d-->>tg: stdout of telegram-assistant
+    llm-->>d: assistant-v1 frames: delta... reply
+    d-->>tg: reply shaped from the frames
     tg-->>me: reply
 ```
 
@@ -63,13 +63,23 @@ Your message reaches the script through `AGENT_TRIGGER_PAYLOAD` as JSON — in t
 
 ## The conversation
 
-Each chat gets its own `claude` session, keyed off the chat id, so "sim" refers to whatever was just proposed. Without it a confirm-then-act flow is impossible: the assistant asks "shall I?" and then has no idea what it offered.
+Each conversation gets its own `claude` session, so "sim" refers to whatever was just proposed. Without it a confirm-then-act flow is impossible: the assistant asks "shall I?" and then has no idea what it offered.
+
+The session belongs to this agent, not to Telegram. The daemon hands over an opaque `AGENT_SESSION_ID` and the script uses it as the conversation key without ever parsing it. Telegram's `chat_id` survives only as a fallback, so conversations started before the upgrade keep their history; running the script by hand with neither set lands in `"default"`. The claude session id itself is a uuid5 of the key plus a generation counter — derived, not stored — so it survives daemon restarts.
 
 That history is not kept forever. `--resume` replays the whole transcript as model input and nothing trims it, so a chat gets slower the more you use it — measured on a real bot, a ~90 KB transcript answers in 8-10s and a 977 KB one in 26-141s. Past 400 KB the session is retired and a fresh one starts, which costs the recent back and forth.
 
-So anything that must survive goes to [memory](../../docs/concepts/memory.md), not to the transcript. State lives in `~/.config/dotagent/state/telegram-assistant/`: which session belongs to which chat, and how many times it has been retired.
+So anything that must survive goes to [memory](../../docs/concepts/memory.md), not to the transcript. State lives in `~/.config/dotagent/state/telegram-assistant/`: `$SESSION_ID.gen` (how many times the conversation was retired) and `$SESSION_ID.started` (which claude session it is in).
 
 More on what latency costs in a conversational agent: [LLM agents](../../docs/guides/llm-agents.md#where-the-latency-actually-is).
+
+## The output protocol
+
+`[run] protocol = "assistant-v1"` in the manifest changes what stdout means: instead of free-form text, the script emits one JSON object per line — `{"type":"delta","text":...}` chunks as the answer is composed, exactly one `{"type":"reply","text":...}` with the final answer, and a best-effort `{"type":"session","claude_session":...,"transcript_bytes":N}` bookkeeping frame. The daemon does delivery shaping on top of those frames (streaming, truncation, transport limits).
+
+A failed run prints no reply and exits non-zero — failure reporting is the daemon's job, not the chat's. And if the model CLI cannot stream (old version, unexpected output shape), the script captures the whole stdout and emits it as a single `reply` frame, so every line on stdout is always a valid frame of one of those three types.
+
+This is the same wire the daemon will speak on its local API (docs/reference/local-api.md, landing with the daemon-side slice).
 
 ## Check it without Telegram
 
@@ -85,13 +95,23 @@ You should see one tool per installed agent. The same server works from Claude C
 { "mcpServers": { "dotagent": { "command": "dotagent", "args": ["mcp"] } } }
 ```
 
+The dispatcher half can also run on its own, Telegram nowhere in sight — export a payload and read the frames off stdout:
+
+```bash
+AGENT_TRIGGER_PAYLOAD='{"text":"hi","chat_id":12345,"message_id":1}' \
+  AGENT_NAME=telegram-assistant AGENT_HOME=$PWD AGENT_TMPDIR=$(mktemp -d) \
+  bash ./agent.sh
+```
+
+Deltas first, then the `session` and `reply` frames. State lands under `~/.config/dotagent/state/telegram-assistant/12345.*`.
+
 ## Failure modes worth knowing
 
 **Nothing arrives.** The allowlist is the usual reason. A message from an unlisted id is refused before anything runs and lands in the audit log as `trigger_rejected` — `dotagent inspect` and the audit file will show it. An empty `allowed_user_ids` means nobody, not everybody, and the daemon logs that the ingress stayed off.
 
 **The reply is cut off.** Telegram caps a message at 4096 characters. Longer output is trimmed with a `[truncated]` marker; the full text is in `dotagent logs`.
 
-**A long agent times out.** `[agent].timeout_seconds` here has to cover the model call plus whichever agent it picks. The script's own `TELEGRAM_ASSISTANT_CLAUDE_TIMEOUT` fires first so you get "claude exited 142" instead of the supervisor killing the process group.
+**A long agent times out.** `[agent].timeout_seconds` here has to cover the model call plus whichever agent it picks. The script's own `TELEGRAM_ASSISTANT_CLAUDE_TIMEOUT` fires first so you get "claude exited 142" in the logs — under assistant-v1 a timed-out run sends no reply frame and exits non-zero, and the daemon reports the failure through its notifiers.
 
 **Runs started this way are invisible to `dotagent status`.** `dotagent mcp` runs agents in its own process, like `run-now`. They keep their own heartbeat under the `trigger-mcp` slug, so they never overwrite the scheduled history of the same agent, but the live subprocess tree is not the daemon's.
 
@@ -137,7 +157,7 @@ guarantees a persistent agent.
 
 ## Rewriting it
 
-The contract is env vars in, stdout out, exit code for success. Nothing about it is bash-specific:
+The contract is env vars in, assistant-v1 frames on stdout, exit code for success. Nothing about it is bash-specific:
 
 | Variable | Meaning |
 |---|---|
@@ -145,8 +165,9 @@ The contract is env vars in, stdout out, exit code for success. Nothing about it
 | `AGENT_TRIGGER_ACTOR` | numeric sender id |
 | `AGENT_TRIGGER_REPLY_TO` | chat id being answered |
 | `AGENT_TRIGGER_PAYLOAD` | JSON: `text`, `chat_id`, `user_id` |
+| `AGENT_SESSION_ID` | opaque conversation key owned by the daemon |
 
-Print the reply on stdout. Log everything else to stderr — stdout is what reaches the chat.
+Print frames on stdout — `delta` chunks, one `reply`, an optional `session` — and log everything else to stderr. A failed run prints no reply and exits non-zero.
 
 In persistent mode that table does not apply: the environment is fixed at spawn
 and the process sees many messages, so the same fields arrive in each request

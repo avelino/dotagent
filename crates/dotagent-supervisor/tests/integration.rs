@@ -162,6 +162,30 @@ async fn reaper_kills_forgotten_handle_via_deadline() {
     }
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn reaper_ownership_survives_registry_removal() {
+    let sup = Supervisor::with_grace(Duration::from_millis(50));
+    let _reaper = sup.start_reaper();
+    let handle = sup
+        .spawn_supervised(sh("sleep 30"), spec("ownership", 100))
+        .await
+        .expect("spawn");
+
+    assert!(!handle.reaper_owns_deadline());
+    assert!(
+        until(Duration::from_secs(1), || handle.reaper_owns_deadline()).await,
+        "the reaper must claim the deadline before removing the registry entry"
+    );
+    assert!(
+        until(Duration::from_secs(1), || sup.snapshot().is_empty()).await,
+        "the reaper must eventually remove the entry"
+    );
+    assert!(
+        handle.reaper_owns_deadline(),
+        "ownership must remain observable after registry removal"
+    );
+}
+
 /// Shutdown reaps everything live. Used by the daemon on SIGTERM.
 ///
 /// The handles are kept (not dropped) — `SupervisedHandle::Drop` now

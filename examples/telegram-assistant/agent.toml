@@ -4,7 +4,9 @@
 #   - an agent triggered by a message instead of a clock (no [[schedules]])
 #   - `claude -p` with dotagent's own MCP server attached, so the model
 #     picks from a closed catalog of agents instead of composing a command
-#   - stdout as the reply: whatever this prints goes back to the chat
+#   - `protocol = "assistant-v1"`: stdout is a stream of JSON frames
+#     (delta/reply/session) instead of a plain-text reply, and the daemon
+#     does delivery shaping on top of it
 #
 # Wiring lives in ~/.config/dotagent/config.toml, not here — one bot means
 # one getUpdates consumer, so the token and allowlist are daemon-level:
@@ -34,6 +36,9 @@ timeout_seconds = 600
 [run]
 command = "bash"
 args = ["./agent.sh"]
+# Opt in to the assistant stdout protocol: one JSON object per line
+# ({"type":"delta"|"reply"|"session", ...}) instead of free-form text.
+protocol = "assistant-v1"
 
 [env]
 inherit = true
@@ -54,6 +59,7 @@ TELEGRAM_ASSISTANT_CLAUDE_TIMEOUT = "540"
 [security]
 allowed_commands = ["bash", "jq", "claude", "dotagent", "perl", "python3"]
 network = ["api.anthropic.com"]
-# Also the session state: which claude session belongs to which chat, and how
-# many times it has been retired for length.
+# Also the session state: which claude session belongs to which conversation
+# (keyed by the daemon's opaque session id), and how many times it has been
+# retired for length.
 filesystem_writable = ["/tmp", "~/.config/dotagent/state/telegram-assistant"]

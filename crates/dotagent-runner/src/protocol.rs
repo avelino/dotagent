@@ -70,9 +70,9 @@ pub struct RequestFrame {
     /// Trigger context. Present when the run came from a message or a tool
     /// call, absent when it came from a clock.
     ///
-    /// This is the field that replaces the `AGENT_TRIGGER_*` block: those are
-    /// environment variables, fixed at spawn, and a persistent process is
-    /// spawned once for many different messages.
+    /// This is the field that replaces the per-request `AGENT_TRIGGER_*` and
+    /// `AGENT_SESSION_ID` environment block: those variables are fixed at
+    /// spawn, and a persistent process is spawned once for many messages.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<TriggerFrame>,
 }
@@ -81,6 +81,9 @@ pub struct RequestFrame {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct TriggerFrame {
     pub source: String,
+    /// Opaque conversation/session identifier for this request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,10 +96,10 @@ impl TriggerFrame {
     /// Rebuild the trigger from the per-invocation environment the caller
     /// already assembled.
     ///
-    /// The daemon flattens a `TriggerRequest` into `AGENT_TRIGGER_*` for
-    /// one-shot agents; rather than thread a second representation through
-    /// `RunSpec`, the pool reads that same block back. One producer, so the
-    /// two paths can never describe different triggers.
+    /// The daemon flattens a `TriggerRequest` into `AGENT_TRIGGER_*` and
+    /// `AGENT_SESSION_ID` for one-shot agents; rather than thread a second
+    /// representation through `RunSpec`, the pool reads that same block back.
+    /// One producer, so the two paths can never describe different triggers.
     ///
     /// Returns `None` when there is no trigger — a scheduled run of a
     /// persistent agent is legal and simply has no context to carry.
@@ -110,6 +113,7 @@ impl TriggerFrame {
         let source = get("AGENT_TRIGGER_SOURCE")?;
         Some(Self {
             source,
+            session_id: get("AGENT_SESSION_ID"),
             actor: get("AGENT_TRIGGER_ACTOR"),
             reply_to: get("AGENT_TRIGGER_REPLY_TO"),
             payload: get("AGENT_TRIGGER_PAYLOAD").and_then(|raw| serde_json::from_str(&raw).ok()),
@@ -117,15 +121,15 @@ impl TriggerFrame {
     }
 }
 
-/// Is this an `AGENT_TRIGGER_*` variable?
+/// Is this a per-request trigger variable?
 ///
 /// The pool strips them from the spawn environment: they describe one message
 /// and the process outlives every message. Leaving them in would freeze the
 /// first request's context into every later one, which is worse than absent —
-/// an agent reading `AGENT_TRIGGER_PAYLOAD` would get stale text that looks
-/// perfectly valid.
+/// an agent reading `AGENT_TRIGGER_PAYLOAD` or `AGENT_SESSION_ID` would get
+/// stale data that looks perfectly valid.
 pub fn is_trigger_env(key: &str) -> bool {
-    key.starts_with("AGENT_TRIGGER_")
+    key.starts_with("AGENT_TRIGGER_") || key == "AGENT_SESSION_ID"
 }
 
 /// Anything the agent writes on stdout, parsed leniently.
@@ -165,7 +169,20 @@ impl InboundFrame {
         if !line.starts_with('{') {
             return None;
         }
-        serde_json::from_str(line).ok()
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        let object = value.as_object()?;
+        let has_response_field = ["id", "output", "error", "exit_code"]
+            .iter()
+            .any(|field| object.contains_key(*field));
+        match object.get("kind") {
+            Some(kind) => match kind.as_str() {
+                Some("hello" | "ready" | "response") => {}
+                _ => return None,
+            },
+            None if !has_response_field => return None,
+            None => {}
+        }
+        serde_json::from_value(value).ok()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -178,9 +195,13 @@ impl InboundFrame {
     /// possible agent answers without echoing it back, and there is only ever
     /// one request in flight per instance.
     pub fn answers(&self, id: &str) -> bool {
+        match self.kind.as_deref() {
+            Some("response") | None => {}
+            Some(_) => return false,
+        }
         match self.id.as_deref() {
             Some(got) => got == id,
-            None => self.kind.as_deref() != Some("ready"),
+            None => true,
         }
     }
 
@@ -218,6 +239,38 @@ mod tests {
     }
 
     #[test]
+    fn progress_only_frame_is_dropped() {
+        assert!(InboundFrame::parse(r#"{"progress":50}"#).is_none());
+    }
+
+    #[test]
+    fn progress_with_id_is_dropped() {
+        assert!(InboundFrame::parse(r#"{"kind":"progress","id":"7"}"#).is_none());
+    }
+
+    #[test]
+    fn response_kind_is_enough_to_recognize_a_frame() {
+        let f = InboundFrame::parse(r#"{"kind":"response"}"#).expect("frame");
+        assert!(f.answers("7"));
+    }
+
+    #[test]
+    fn unknown_kind_without_response_fields_is_dropped() {
+        assert!(InboundFrame::parse(r#"{"kind":"progress"}"#).is_none());
+    }
+
+    #[test]
+    fn unknown_kind_with_output_is_dropped() {
+        assert!(InboundFrame::parse(r#"{"kind":"custom","output":"not an answer"}"#).is_none());
+    }
+
+    #[test]
+    fn extra_fields_do_not_invalidate_a_response() {
+        let f = InboundFrame::parse(r#"{"output":"hi","progress":50}"#).expect("frame");
+        assert_eq!(f.output.as_deref(), Some("hi"));
+    }
+
+    #[test]
     fn a_failure_without_an_exit_code_is_one() {
         let f = InboundFrame::parse(r#"{"ok":false,"error":"nope"}"#).expect("frame");
         assert_eq!(f.resolved_exit_code(), 1);
@@ -240,6 +293,28 @@ mod tests {
     }
 
     #[test]
+    fn ready_with_id_is_never_mistaken_for_an_answer() {
+        let f = InboundFrame::parse(r#"{"kind":"ready","id":"1","output":"warm"}"#)
+            .expect("handshake frame");
+        assert!(f.is_ready());
+        assert!(!f.answers("1"));
+    }
+
+    #[test]
+    fn response_with_id_answers_matching_request() {
+        let f = InboundFrame::parse(r#"{"kind":"response","id":"1","output":"ok"}"#)
+            .expect("response frame");
+        assert!(f.answers("1"));
+    }
+
+    #[test]
+    fn response_without_id_answers_the_request_in_flight() {
+        let f =
+            InboundFrame::parse(r#"{"kind":"response","output":"ok"}"#).expect("response frame");
+        assert!(f.answers("1"));
+    }
+
+    #[test]
     fn trigger_is_rebuilt_from_the_env_block() {
         let env = vec![
             ("AGENT_TRIGGER_SOURCE".to_string(), "telegram".to_string()),
@@ -248,9 +323,11 @@ mod tests {
                 "AGENT_TRIGGER_PAYLOAD".to_string(),
                 r#"{"text":"oi","chat_id":9}"#.to_string(),
             ),
+            ("AGENT_SESSION_ID".to_string(), "chat-9".to_string()),
         ];
         let t = TriggerFrame::from_env(&env).expect("trigger");
         assert_eq!(t.source, "telegram");
+        assert_eq!(t.session_id.as_deref(), Some("chat-9"));
         assert_eq!(t.actor.as_deref(), Some("123"));
         assert_eq!(t.payload.unwrap()["chat_id"], 9);
     }
@@ -258,6 +335,13 @@ mod tests {
     #[test]
     fn a_scheduled_run_carries_no_trigger() {
         assert!(TriggerFrame::from_env(&[]).is_none());
+    }
+
+    #[test]
+    fn a_trigger_without_a_session_id_keeps_it_absent() {
+        let env = vec![("AGENT_TRIGGER_SOURCE".to_string(), "mcp".to_string())];
+        let trigger = TriggerFrame::from_env(&env).expect("trigger");
+        assert!(trigger.session_id.is_none());
     }
 
     #[test]
@@ -273,10 +357,37 @@ mod tests {
     }
 
     #[test]
-    fn trigger_env_is_recognised_by_prefix() {
+    fn trigger_env_is_recognised() {
         assert!(is_trigger_env("AGENT_TRIGGER_PAYLOAD"));
+        assert!(is_trigger_env("AGENT_SESSION_ID"));
         assert!(!is_trigger_env("AGENT_NAME"));
         assert!(!is_trigger_env("TELEGRAM_ASSISTANT_MODEL"));
+    }
+
+    #[test]
+    fn request_frame_carries_session_id_from_env_and_omits_absent() {
+        let with_session = vec![
+            ("AGENT_TRIGGER_SOURCE".to_string(), "telegram".to_string()),
+            ("AGENT_SESSION_ID".to_string(), "chat-9".to_string()),
+        ];
+        let without_session = vec![("AGENT_TRIGGER_SOURCE".to_string(), "telegram".to_string())];
+        let mut req = RequestFrame {
+            v: PROTOCOL_VERSION,
+            kind: "request",
+            id: "1".into(),
+            agent: "x".into(),
+            schedule: "trigger".into(),
+            args: vec![],
+            deadline_seconds: 60,
+            trigger: TriggerFrame::from_env(&with_session),
+        };
+
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["trigger"]["session_id"], "chat-9");
+
+        req.trigger = TriggerFrame::from_env(&without_session);
+        let value = serde_json::to_value(&req).unwrap();
+        assert!(value["trigger"].get("session_id").is_none());
     }
 
     #[test]

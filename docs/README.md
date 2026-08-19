@@ -69,6 +69,10 @@ handles the load-bearing parts:
   ship inside the daemon. No extra binaries on `$PATH`.
 - **Pluggable I/O** — preflight checks and output sinks are external
   binaries speaking JSON over stdio. Write one in any language.
+- **Local client transport** — `dotagent api` bridges raw JSONL over a
+  user-local Unix socket, so scripts and TUI backends can stream assistant
+  output without turning the daemon into a conversation runtime. It is not a
+  TUI itself.
 - **No SDK** — your agent reads env vars and exits with a code. That's the
   entire API.
 
@@ -120,6 +124,7 @@ gives up.
   daemon-managed in 15 minutes
 - [Architecture](concepts/architecture.md) — daemon, runner, plugins, state
 - [Agents](concepts/agents.md) — the patterns worth copying
+- [Local client API](reference/local-api.md) — Unix-socket JSON-lines contract
 - [LLM agents](guides/llm-agents.md) — calling `claude -p` from an agent,
   and the headless gotchas
 - [FAQ](faq.md) — quick answers

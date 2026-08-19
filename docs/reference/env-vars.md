@@ -29,10 +29,11 @@ SDK to import.
 | `AGENT_HEARTBEAT_FILE` | abs path | `~/.config/dotagent/state/agents/.../slug.heartbeat.json` | Set when NOT dry-run.        |
 | `AGENT_LIFECYCLE`      | string   | `persistent`                                       | Only when `[lifecycle] mode = "persistent"`. Absent otherwise, so one script can support both shapes. |
 | `AGENT_PERSIST_KEY`    | string   | `12345`                                            | Persistent runs only — which slice this instance answers for (the resolved `[lifecycle] key`, or `default`). |
-| `AGENT_TRIGGER_SOURCE` | string   | `telegram`                                         | Only on [triggered](../concepts/triggers.md) runs. One of `telegram`, `mcp`, `cli`. **Never set in persistent mode** — see below. |
-| `AGENT_TRIGGER_ACTOR`  | string   | `123456789`                                        | Triggered runs, when the source can attest an identity. Telegram: numeric user id. |
-| `AGENT_TRIGGER_REPLY_TO` | string | `123456789`                                        | Triggered runs, when the source can be answered. Telegram: chat id. |
-| `AGENT_TRIGGER_PAYLOAD` | JSON object | `{"text":"/standup x","chat_id":1,"user_id":2,"command":{"name":"standup","args":"x"}}` | Triggered runs. Body travels here, never in argv. `command` is present only when the sender invoked one — see [Commands](../concepts/commands.md#the-payload). `reply_to_run` is present when the sender replied to a notification dotagent sent — see below. |
+| `AGENT_TRIGGER_SOURCE` | string   | `telegram`                                         | One-shot [triggered](../concepts/triggers.md) runs only. One of `telegram`, `local`, `mcp`, `cli`. **Never set in persistent mode** — see below. |
+| `AGENT_TRIGGER_ACTOR`  | string   | `123456789`                                        | One-shot triggered runs, when the source can attest an identity. Telegram: numeric user id. |
+| `AGENT_TRIGGER_REPLY_TO` | string | `123456789`                                        | One-shot triggered runs, when the source can be answered. Telegram: chat id. |
+| `AGENT_TRIGGER_PAYLOAD` | JSON object | `{"text":"/standup x","chat_id":1,"user_id":2,"command":{"name":"standup","args":"x"}}` | One-shot triggered runs. Body travels here, never in argv. `command` is present only when the sender invoked one — see [Commands](../concepts/commands.md#the-payload). `reply_to_run` is present when the sender replied to a notification dotagent sent — see below. |
+| `AGENT_SESSION_ID`      | string   | `chat-9_a`                                         | One-shot triggered runs only, when the source has a conversation id. Persistent agents receive this as `trigger.session_id` in each request frame instead. |
 | `LANG`                 | string   | `en_US.UTF-8`                                      | Only when neither `LANG` nor `LC_ALL` was inherited — see below. |
 
 ### `LANG`, and why a daemon has to name one
@@ -74,18 +75,18 @@ which run it came from:
 }
 ```
 
-Resolved from the replied-to message id, not from the text. The wording is not
-a stable interface — one event names `agent/schedule` and another says only
-`preflight aborted by plugin preflight-warp` — and two agents can fail
-identically. Absent when the reply is to something else, or when the
-notification is older than the few hundred kept in
+Resolved from the replied-to message id within the inbound chat, not from the
+text. The wording is not a stable interface — one event names `agent/schedule`
+and another says only `preflight aborted by plugin preflight-warp` — and two
+agents can fail identically. Absent when the reply is to something else, when
+the notification is older than the few hundred kept in
 `state/notify/telegram/sent.json`.
 
-#### Persistent agents get no `AGENT_TRIGGER_*`
+#### Persistent agents get no per-message trigger environment
 
 An environment is fixed at spawn. A persistent process is spawned once and
-answers many different messages, so those four variables would freeze the first
-one and keep serving it — and stale trigger context reads as perfectly valid,
+answers many different messages, so those per-message variables would freeze
+the first one and keep serving it — and stale trigger context reads as perfectly valid,
 which is worse than absent.
 
 In `[lifecycle] mode = "persistent"` the same information arrives in the
@@ -93,9 +94,16 @@ In `[lifecycle] mode = "persistent"` the same information arrives in the
 
 ```jsonc
 { "kind": "request", "id": "1", "deadline_seconds": 600,
-  "trigger": { "source": "telegram", "actor": "123", "reply_to": "123",
-               "payload": { "text": "…", "chat_id": 12345 } } }
+  "trigger": { "source": "telegram", "session_id": "chat-9_a",
+                "actor": "123", "reply_to": "123",
+                "payload": { "text": "…", "chat_id": 12345 } } }
 ```
+
+The request's `trigger` object carries `source`, optional `session_id`, `actor`,
+`reply_to`, and `payload`. `session_id` is per-trigger context, not a
+process-wide conversation store. The local one-shot API validates local session
+ids against `^[A-Za-z0-9_-]{1,64}$` and defaults an omitted id to `default`.
+See [Local Client API](local-api.md).
 
 `AGENT_TMPDIR` also changes lifetime: it belongs to the instance rather than to
 one request, so it survives between them and is removed when the instance is
@@ -118,6 +126,11 @@ unless they want JSON-shaped access.
 
 Rules: strip leading dashes, lowercase, replace non-alphanumeric with
 `_`, collapse repeated `_`, trim trailing `_`. Empty input → `default`.
+
+For triggered runs, `AGENT_SLUG` is the source slug rather than the schedule
+slug. Without a session it is `trigger-<source>`; with a session it is
+`trigger-<source>-<sanitized-session>`. The local API uses its effective
+`default` session when the request omits `session_id`.
 
 ### Reading these vars
 

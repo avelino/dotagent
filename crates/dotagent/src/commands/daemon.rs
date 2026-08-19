@@ -14,17 +14,21 @@
 //! the filesystem if a new manifest was dropped and (b) bound how stale
 //! the loaded state can get.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, TimeZone};
 use dotagent_core::{
-    audit::AuditEvent, AgentManifest, Heartbeat, Schedule, TriggerRequest, TriggerSource,
-    WindowState, TRIGGER_SCHEDULE_ID,
+    assistant::ASSISTANT_PROTOCOL_V1, audit::AuditEvent, AgentManifest, Heartbeat, Schedule,
+    TriggerRequest, TriggerSource, WindowState, TRIGGER_SCHEDULE_ID,
 };
 use dotagent_plugin::PluginClient;
-use dotagent_runner::persistent::PersistentPool;
-use dotagent_runner::{run_with_hooks, OrchestratedOutcome, RunContext, RunSpec};
+use dotagent_runner::persistent::{PersistentPool, REQUEST_LOST_EXIT_CODE};
+use dotagent_runner::{
+    run_with_hooks, run_with_hooks_streaming, OrchestratedOutcome, RunContext, RunSpec,
+    StreamOptions,
+};
 use dotagent_scheduler::{
     compute_next_event, expected_at, health_state, is_stale, should_retry, window_key,
     AgentSchedulePair, HealthState, ResolvedPolicy,
@@ -37,15 +41,27 @@ use dotagent_state::{
 };
 use dotagent_supervisor::{Supervisor, SNAPSHOT_TICK};
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{watch, Notify};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::discovery::{self, DiscoveredAgent};
+use crate::gateway::{
+    GatewayConfig, GatewayRunner, ReplySink, RunFuture, SubmitRejected, TelegramSink,
+    TriggerGateway,
+};
+use crate::local_api::protocol::{error_code, MessageSendParams, ServerEvent};
+use crate::local_api::server::{EventSendError, EventTx, LocalApiHandler, PeerInfo, ResponseHook};
 use crate::power::PowerGate;
 
 /// Hard upper bound on a single sleep cycle. After this, the daemon
 /// re-discovers manifests even if no event fires — covers the case where a
 /// fresh manifest was dropped into `~/.config/dotagent/agents/`.
 const MAX_SLEEP_MINUTES: i64 = 30;
+const TELEGRAM_INGRESS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+
+type LocalApiTask = JoinHandle<Result<()>>;
+type LocalApiHandles = (Option<watch::Sender<()>>, Option<LocalApiTask>);
 
 /// PID file location (used by `dotagent reload` / `status` to find the daemon).
 pub fn pidfile_path() -> Option<std::path::PathBuf> {
@@ -108,95 +124,8 @@ struct DaemonCtx<'a> {
     plugins: &'a PluginClient,
 }
 
-/// How many pending triggers to hold before the producer blocks. Deep enough
-/// that a burst of chat messages survives one slow run, shallow enough that a
-/// wedged daemon applies backpressure instead of growing without bound.
-const TRIGGER_CHANNEL_DEPTH: usize = 64;
-
-/// Drain the trigger channel from a task of its own, so an inbound message is
-/// answered on its own clock rather than the scheduler's.
-///
-/// The bug this exists for: [`run`]'s `select!` is only reached *after* a tick
-/// returns, and a tick awaits every scheduled run inline. One 20-minute agent
-/// therefore held every queued chat message for 20 minutes — the sender saw
-/// silence, resent, and then got both answers at once when the run ended.
-///
-/// Deliberately **one** worker, not one task per message:
-///
-/// - **Ordering.** Messages from one conversation must be answered in the
-///   order they were sent. A task per message would hand that ordering to the
-///   scheduler and to whichever task happened to reach the persistent pool's
-///   per-key mutex first — non-deterministic, and wrong exactly when a
-///   conversation is going fast.
-/// - **Concurrency ceiling.** A burst of N messages stays N *queued* requests
-///   rather than N concurrent agent processes. The ingress rate limit bounds
-///   arrivals; this bounds execution, which is the expensive half.
-///
-/// The price is that it serializes conversations that never needed it: with two
-/// chats live and a 20-minute run, the second chat waits out the first. The
-/// alternative is a worker per conversation — `HashMap<key, Sender>`, each FIFO,
-/// same per-conversation ordering, ceiling equal to the number of live chats.
-/// Not taken yet, for three reasons:
-///
-/// - The blocking that was actually observed was a **scheduled** run holding a
-///   chat, and that one is fixed where it belonged: the persistent pool keys
-///   scheduled and triggered runs apart, so they no longer queue behind one
-///   mutex. Chat-against-chat blocking needs two people talking at once.
-/// - "Conversation" would have to mean the same thing here and in
-///   `[lifecycle] key`. If it does not, two workers land on one instance mutex
-///   and ordering becomes whichever task got there first — the guarantee this
-///   design exists to keep, lost in exchange for the concurrency.
-/// - N workers is N concurrent agent processes for a `oneshot` agent, and N
-///   handles to watch instead of one. The ceiling is not `allowed_user_ids`:
-///   that list is who may speak, not how many may run at once.
-///
-/// Worth revisiting the moment a second concurrent conversation is real. The
-/// change is contained — the channel becomes a map keyed by
-/// `(source, reply_to)` — and by then `[lifecycle] key` says what a
-/// conversation is.
-///
-/// What it does introduce is exactly one new concurrent pair — a triggered run
-/// beside a scheduled one — and that pair is safe on every shared resource
-/// they touch:
-///
-/// - **Heartbeat.** A triggered run's slug is namespaced by source
-///   (`trigger-telegram`), so it never shares a file with the scheduled
-///   history of the same agent. `dotagent-state` takes a per-file `flock`
-///   regardless.
-/// - **Window state.** Triggered runs never write it (see [`run_triggered`]),
-///   so retry accounting stays single-writer.
-/// - **Audit log.** Every append takes an exclusive `flock` on the log.
-/// - **Persistent pool.** Slots are `(agent, key)`-keyed mutexes, so a
-///   scheduled and a triggered request for the same instance queue instead of
-///   interleaving.
-///
-/// The handler is a parameter so tests can drive this loop's real shape
-/// without a filesystem, a manifest, or a subprocess.
-///
-/// The returned handle is **not** optional bookkeeping: [`wait_for_event`]
-/// selects on it, so this task ending — returning or panicking — stops the
-/// daemon instead of leaving a process that ticks forever and answers nobody.
-fn spawn_trigger_worker<H, F>(
-    mut rx: tokio::sync::mpsc::Receiver<TriggerRequest>,
-    handler: H,
-) -> tokio::task::JoinHandle<()>
-where
-    H: Fn(TriggerRequest) -> F + Send + 'static,
-    F: std::future::Future<Output = ()> + Send,
-{
-    tokio::spawn(async move {
-        while let Some(req) = rx.recv().await {
-            handler(req).await;
-        }
-        // Only reachable once every sender is gone, which for a live daemon
-        // means the loop itself dropped them — worth a line at a level someone
-        // reads, because from here on no trigger will ever be answered.
-        warn!("trigger worker stopped — channel closed");
-    })
-}
-
 /// What ended a sleep cycle.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 enum Wake {
     /// The sleep elapsed. Run the next tick.
     Tick,
@@ -204,6 +133,8 @@ enum Wake {
     Reload,
     /// Stop the daemon, with the reason the audit log records.
     Stop(&'static str),
+    /// A required ingress failed; the daemon must return the underlying error.
+    Fatal(anyhow::Error),
 }
 
 /// The three signals the daemon reacts to, registered once.
@@ -225,39 +156,51 @@ impl Signals {
 
 /// Sleep until something asks the loop to do its next thing.
 ///
-/// The trigger worker is one of those things. It used to be spawned and then
-/// only ever `abort()`ed, which meant its death was invisible: the task ends,
-/// its receiver drops, the channel closes, and the ingress logs one line and
-/// returns. The bot goes permanently deaf while the loop keeps ticking and
-/// `dotagent status` keeps saying the daemon is fine.
-///
-/// Before the worker existed, a trigger ran inline in this `select!`, so a
-/// panic unwound the daemon and launchd restarted it — loud, and self-healing.
-/// Selecting on the handle restores exactly that: the daemon exits through its
-/// normal shutdown path and comes back with a worker that works.
-///
-/// Split out of [`run`] so it is testable — the property is "a dead worker
-/// stops the loop", which cannot be asserted on a `select!` buried in a
-/// function that needs a state store, a supervisor and a signal disposition.
+/// The gateway supervisor is one of those things. Its task is selected here so
+/// a panic or unexpected return cannot leave a daemon that still ticks but can
+/// no longer answer inbound requests.
 async fn wait_for_event(
     sleep_for: Duration,
     signals: &mut Signals,
-    trigger_worker: &mut tokio::task::JoinHandle<()>,
+    gateway: &mut crate::gateway::GatewayHandle,
+    local_api_task: &mut Option<LocalApiTask>,
 ) -> Wake {
+    let gateway_task = gateway.task();
+    let local_api_running = local_api_task.is_some();
     tokio::select! {
         _ = tokio::time::sleep(sleep_for) => Wake::Tick,
         _ = signals.hangup.recv() => Wake::Reload,
         _ = signals.terminate.recv() => Wake::Stop("SIGTERM"),
         _ = signals.interrupt.recv() => Wake::Stop("SIGINT"),
-        outcome = &mut *trigger_worker => {
+        outcome = &mut *gateway_task => {
             match outcome {
-                Ok(()) => warn!("trigger worker returned — no trigger can be answered anymore"),
+                Ok(()) => warn!("gateway supervisor returned — no trigger can be answered anymore"),
                 Err(e) if e.is_panic() => {
-                    warn!(error = %e, "trigger worker panicked — no trigger can be answered anymore")
+                    warn!(error = %e, "gateway supervisor panicked — no trigger can be answered anymore")
                 }
-                Err(e) => warn!(error = %e, "trigger worker ended unexpectedly"),
+                Err(e) => warn!(error = %e, "gateway supervisor ended unexpectedly"),
             }
-            Wake::Stop("trigger worker died")
+            Wake::Stop("gateway supervisor died")
+        }
+        outcome = async {
+            match local_api_task.as_mut() {
+                Some(task) => Some(task.await),
+                None => None,
+            }
+        }, if local_api_running => {
+            // The JoinHandle output has been consumed by this branch. Do not
+            // poll it again during shutdown.
+            local_api_task.take();
+            match outcome {
+                Some(Ok(Ok(()))) => Wake::Fatal(anyhow::anyhow!(
+                    "local API task stopped unexpectedly"
+                )),
+                Some(Ok(Err(error))) => Wake::Fatal(error),
+                Some(Err(error)) => Wake::Fatal(anyhow::anyhow!(
+                    "local API task failed: {error}"
+                )),
+                None => unreachable!("local API branch was enabled without a task"),
+            }
         }
     }
 }
@@ -272,8 +215,9 @@ async fn wait_for_event(
 /// its `Supervisor`), which keeps the run visible in `dotagent status` and
 /// reapable on SIGTERM. Window state is untouched on purpose — a triggered run
 /// has no attempts counter and can never mark a cron window as given up.
-pub(crate) async fn run_triggered(
+pub(crate) async fn run_triggered_streaming(
     req: &TriggerRequest,
+    stream: StreamOptions,
     state: &StateStore,
     audit: &AuditLog,
     plugins: &PluginClient,
@@ -297,13 +241,6 @@ pub(crate) async fn run_triggered(
     let manifest_sha256 = hash_manifest_file(&agent.dir.join("agent.toml")).ok();
     let slug = req.slug();
     let extra_env = trigger_env(req);
-
-    let _ = audit.append(AuditEvent::AgentTriggered {
-        source: req.source.to_string(),
-        actor: req.actor.clone(),
-        agent: agent.manifest.agent.name.clone(),
-        schedule: schedule_id.clone(),
-    });
 
     info!(
         agent = %agent.manifest.agent.name,
@@ -329,134 +266,344 @@ pub(crate) async fn run_triggered(
         supervisor: Some(plugins.supervisor()),
         persistent: pool,
     };
-    run_with_hooks(spec, &ctx).await.map_err(Into::into)
+    Ok(run_with_hooks_streaming(spec, stream, &ctx).await?)
 }
 
-/// Run one trigger and send whatever it produced back to whoever asked.
-///
-/// Never propagates an error: a malformed or hostile trigger must not be able
-/// to stop the daemon. Failures are logged and, when the source gave us a way
-/// to answer, reported back to it.
-async fn handle_trigger(
-    req: TriggerRequest,
-    state: &StateStore,
-    audit: &AuditLog,
-    plugins: &PluginClient,
-    pool: &PersistentPool,
-) {
-    // Show "typing…" for as long as the run takes. A triggered run is seconds
-    // to minutes of silence otherwise, which reads as the bot being broken.
-    let typing = spawn_typing_indicator(&req);
+/// Owns only the daemon handles needed to execute a trigger. Conversation
+/// ordering and delivery remain gateway concerns; transcript/session ownership
+/// remains with the agent process.
+struct GatewayRunnerAdapter {
+    state: StateStore,
+    audit: AuditLog,
+    plugins: PluginClient,
+    pool: Arc<PersistentPool>,
+}
 
-    let reply = match run_triggered(&req, state, audit, plugins, Some(pool)).await {
-        Ok(OrchestratedOutcome::Ran(outcome)) if outcome.exit_code == 0 => {
-            if outcome.stdout_tail.trim().is_empty() {
-                format!("{} finished with no output.", req.agent)
-            } else {
-                outcome.stdout_tail
+impl GatewayRunnerAdapter {
+    fn new(
+        state: &StateStore,
+        audit: &AuditLog,
+        plugins: &PluginClient,
+        pool: &Arc<PersistentPool>,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            audit: audit.clone(),
+            plugins: plugins.clone(),
+            pool: pool.clone(),
+        }
+    }
+}
+
+impl GatewayRunner for GatewayRunnerAdapter {
+    fn uses_assistant_protocol(&self, req: &TriggerRequest) -> bool {
+        discovery::find_by_name(&req.agent)
+            .map(|agent| agent.manifest.run.protocol.as_deref() == Some(ASSISTANT_PROTOCOL_V1))
+            .unwrap_or(false)
+    }
+
+    fn run_trigger(&self, req: TriggerRequest, stream: StreamOptions) -> RunFuture {
+        let state = self.state.clone();
+        let audit = self.audit.clone();
+        let plugins = self.plugins.clone();
+        let pool = self.pool.clone();
+        Box::pin(async move {
+            run_triggered_streaming(&req, stream, &state, &audit, &plugins, Some(&pool)).await
+        })
+    }
+}
+
+/// Deliver assistant-v1 output to one local API connection.
+struct LocalReplyGate {
+    state: Mutex<LocalReplyGateState>,
+    notify: Notify,
+}
+
+struct LocalReplyGateState {
+    released: bool,
+    releasing: bool,
+    started: Option<ServerEvent>,
+}
+
+impl LocalReplyGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(LocalReplyGateState {
+                released: false,
+                releasing: false,
+                started: None,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Hold `run.started` until the accepted response has been queued.
+    ///
+    /// The gateway calls `ReplySink::started` synchronously from its supervisor
+    /// task, before the local API reader can queue the response. Returning the
+    /// event after the gate is already open also keeps this safe if a future
+    /// caller invokes `started` late: it can only happen after the ACK path has
+    /// established the ordering point.
+    fn defer_started(&self, event: ServerEvent) -> Option<ServerEvent> {
+        let mut state = self.state.lock().expect("local reply gate poisoned");
+        if state.released || state.releasing {
+            Some(event)
+        } else {
+            state.started = Some(event);
+            None
+        }
+    }
+
+    /// Enqueue the held event, then open the gate for asynchronous deliveries.
+    ///
+    /// `enqueue_started` is synchronous (`EventTx::send` uses `try_send`). The
+    /// state lock is released before invoking it, so a callback cannot deadlock
+    /// by inspecting the gate and no mutex is held across future async work. The
+    /// gate is marked released only after enqueue returns, even when enqueue
+    /// fails; the failed enqueue has already poisoned the client connection, so
+    /// subsequent sends return `Closed`.
+    fn release<F>(&self, enqueue_started: F) -> Result<(), EventSendError>
+    where
+        F: FnOnce(&ServerEvent) -> Result<(), EventSendError>,
+    {
+        let started = {
+            let mut state = self.state.lock().expect("local reply gate poisoned");
+            if state.released || state.releasing {
+                return Ok(());
             }
-        }
-        Ok(OrchestratedOutcome::Ran(outcome)) => {
-            warn!(
-                agent = %req.agent,
-                exit_code = outcome.exit_code,
-                timed_out = outcome.timed_out,
-                "triggered run failed"
-            );
-            let what = if outcome.timed_out {
-                "timed out".to_string()
-            } else {
-                format!("exited {}", outcome.exit_code)
-            };
-            format!("{} {what}.\n{}", req.agent, outcome.stderr_tail)
-        }
-        Ok(OrchestratedOutcome::PreflightFailed { plugin, suggest }) => {
-            let hint = suggest.map(|s| format!(": {s}")).unwrap_or_default();
-            format!("{} blocked by preflight {plugin}{hint}", req.agent)
-        }
-        Err(e) => {
-            warn!(agent = %req.agent, error = %e, "trigger could not run");
-            format!("Could not run {}: {e}", req.agent)
-        }
-    };
+            state.releasing = true;
+            state.started.take()
+        };
 
-    // Stop before answering, so the indicator never outlives the reply.
-    if let Some(t) = typing {
-        t.abort();
+        let result = started.as_ref().map(enqueue_started).unwrap_or(Ok(()));
+        let mut state = self.state.lock().expect("local reply gate poisoned");
+        state.releasing = false;
+        state.released = true;
+        drop(state);
+        self.notify.notify_waiters();
+        result
     }
-    deliver_reply(&req, &reply).await;
-}
 
-/// The configured bot token, or `None` when inbound Telegram is not set up.
-///
-/// Both the typing indicator and the reply need it, and each was re-reading
-/// `config.toml` from disk — twice per message for the same string.
-fn telegram_bot_token() -> Option<String> {
-    let token = dotagent_core::Config::load(dotagent_state::paths::config_file())
-        .unwrap_or_default()
-        .telegram
-        .bot_token;
-    (!token.is_empty()).then_some(token)
-}
-
-/// Keep "typing…" alive in the chat until the returned handle is aborted.
-///
-/// `None` when the source cannot show one. Failures are logged at debug and
-/// never surface: a missing indicator is cosmetic, and a run that dies because
-/// a spinner failed would be a bad trade.
-fn spawn_typing_indicator(req: &TriggerRequest) -> Option<tokio::task::JoinHandle<()>> {
-    if req.source != TriggerSource::Telegram {
-        return None;
+    /// Unblock a worker after the response itself failed to queue. The server
+    /// has poisoned the connection in that case, so no event can be delivered.
+    fn cancel(&self) {
+        let mut state = self.state.lock().expect("local reply gate poisoned");
+        state.started = None;
+        state.releasing = false;
+        state.released = true;
+        drop(state);
+        self.notify.notify_waiters();
     }
-    let chat_id: i64 = req.reply_to.as_ref()?.parse().ok()?;
-    let token = telegram_bot_token()?;
 
-    Some(tokio::spawn(async move {
+    fn is_released(&self) -> bool {
+        self.state
+            .lock()
+            .expect("local reply gate poisoned")
+            .released
+    }
+
+    async fn wait(&self) {
         loop {
-            if let Err(e) = dotagent_notify::telegram_inbound::typing(&token, chat_id).await {
-                debug!(error = %e, "typing indicator failed");
+            if self.is_released() {
+                return;
             }
-            tokio::time::sleep(dotagent_notify::telegram_inbound::TYPING_REFRESH).await;
+            let notified = self.notify.notified();
+            if self.is_released() {
+                return;
+            }
+            notified.await;
         }
-    }))
+    }
 }
 
-/// Deliver a trigger's answer back to its origin. No-op when the source is
-/// fire-and-forget (no `reply_to`).
-async fn deliver_reply(req: &TriggerRequest, body: &str) {
-    let Some(reply_to) = &req.reply_to else {
-        return;
-    };
-    match req.source {
-        TriggerSource::Telegram => {
-            let Some(token) = telegram_bot_token() else {
-                warn!("telegram reply skipped — no bot_token configured");
-                return;
-            };
-            let Ok(chat_id) = reply_to.parse::<i64>() else {
-                warn!(reply_to = %reply_to, "telegram reply_to is not a chat id");
-                return;
-            };
-            // Quote the message being answered. Runs are asynchronous, so a
-            // chat with several questions in flight would otherwise show
-            // answers with no way to tell which is which. Absent (older
-            // payload, or a source that has no such concept) just sends
-            // unquoted rather than dropping the answer.
-            let message_id = req
-                .payload
-                .as_ref()
-                .and_then(|p| p.get("message_id"))
-                .and_then(|v| v.as_i64());
-            if let Err(e) =
-                dotagent_notify::telegram_inbound::reply(&token, chat_id, message_id, body).await
-            {
-                // `NotifyError` from this path is already token-sanitized.
-                warn!(error = %e, "could not deliver telegram reply");
-            }
+struct LocalReplySink {
+    events: EventTx,
+    accepted: Arc<LocalReplyGate>,
+}
+
+impl ReplySink for LocalReplySink {
+    fn started(&self, session: Option<&str>, agent: &str) {
+        let session = session.unwrap_or("default").to_string();
+        let event = ServerEvent::run_started(session, agent.to_string());
+        if let Some(event) = self.accepted.defer_started(event) {
+            let _ = self.events.send(&event);
         }
-        // Nothing to answer: the CLI already printed, MCP returned inline.
-        TriggerSource::Cli | TriggerSource::Mcp => {}
     }
+
+    fn reply<'a>(
+        &'a self,
+        session: Option<&'a str>,
+        text: &'a str,
+    ) -> crate::gateway::SinkFuture<'a> {
+        let events = self.events.clone();
+        let accepted = self.accepted.clone();
+        let session = session.unwrap_or("default").to_string();
+        let text = text.to_string();
+        Box::pin(async move {
+            accepted.wait().await;
+            let _ = events.send(&ServerEvent::reply(session, text));
+        })
+    }
+
+    fn typing<'a>(&'a self, session: Option<&'a str>) -> crate::gateway::SinkFuture<'a> {
+        let events = self.events.clone();
+        let accepted = self.accepted.clone();
+        let session = session.unwrap_or("default").to_string();
+        Box::pin(async move {
+            accepted.wait().await;
+            let _ = events.send(&ServerEvent::typing(session));
+        })
+    }
+
+    fn delta<'a>(
+        &'a self,
+        session: Option<&'a str>,
+        line: &'a str,
+    ) -> crate::gateway::SinkFuture<'a> {
+        let events = self.events.clone();
+        let accepted = self.accepted.clone();
+        let session = session.unwrap_or("default").to_string();
+        let line = line.to_string();
+        Box::pin(async move {
+            accepted.wait().await;
+            let _ = events.send(&ServerEvent::reply_delta(session, line));
+        })
+    }
+}
+
+/// Gateway-backed local API handler. It only translates wire requests into
+/// triggers; it does not retain messages, sessions or assistant transcripts.
+struct DaemonLocalApiHandler {
+    dispatcher_agent: String,
+    gateway: Arc<TriggerGateway>,
+}
+
+#[async_trait::async_trait]
+impl LocalApiHandler for DaemonLocalApiHandler {
+    async fn handle_message(
+        &self,
+        params: MessageSendParams,
+        peer: PeerInfo,
+        events: EventTx,
+    ) -> std::result::Result<Option<ResponseHook>, crate::local_api::protocol::ServerError> {
+        params.validate()?;
+        let session_id = params.effective_session_id().to_string();
+        let req = TriggerRequest {
+            source: TriggerSource::Local,
+            agent: self.dispatcher_agent.clone(),
+            schedule: None,
+            args: Vec::new(),
+            payload: Some(serde_json::json!({
+                "text": params.text,
+                "session_id": session_id.clone(),
+            })),
+            actor: Some(peer.actor()),
+            reply_to: Some(session_id.clone()),
+            session_id: Some(session_id.clone()),
+        };
+        let accepted = Arc::new(LocalReplyGate::new());
+        self.gateway
+            .submit(
+                req,
+                Arc::new(LocalReplySink {
+                    events: events.clone(),
+                    accepted: accepted.clone(),
+                }),
+            )
+            .await
+            .map_err(local_submit_error)?;
+        // The server invokes this hook after the response queue attempt. Only
+        // a successful enqueue may release delivery; a failed response still
+        // cancels the gate so an admitted worker cannot remain blocked forever.
+        let events_for_hook = events.clone();
+        Ok(Some(Box::new(move |enqueued| {
+            if enqueued {
+                let _ = accepted.release(|event| events_for_hook.send(event));
+            } else {
+                accepted.cancel();
+            }
+        })))
+    }
+
+    async fn commands_list(
+        &self,
+    ) -> std::result::Result<serde_json::Value, crate::local_api::protocol::ServerError> {
+        let found = crate::slash::discover();
+        for bad in &found.invalid {
+            warn!(path = %bad.path.display(), error = %bad.error, "local command not listed");
+        }
+        let commands = found
+            .telegram_menu()
+            .into_iter()
+            .map(|(telegram_name, command)| {
+                serde_json::json!({
+                    "name": command.manifest.name,
+                    "telegram_name": telegram_name,
+                    "description": command.summary(),
+                    "argument_hint": command.manifest.argument_hint,
+                })
+            })
+            .collect();
+        Ok(serde_json::Value::Array(commands))
+    }
+
+    async fn status_get(
+        &self,
+    ) -> std::result::Result<serde_json::Value, crate::local_api::protocol::ServerError> {
+        Ok(serde_json::json!({
+            "daemon": "ok",
+            "gateway": "ok",
+            "dispatcher_agent": self.dispatcher_agent,
+        }))
+    }
+}
+
+fn local_submit_error(rejection: SubmitRejected) -> crate::local_api::protocol::ServerError {
+    let reason = rejection.reason();
+    let code = match &rejection {
+        SubmitRejected::RateLimited { .. } => error_code::RATE_LIMITED,
+        SubmitRejected::InvalidSessionId => error_code::SESSION_ID_INVALID,
+        SubmitRejected::CapExceeded { .. }
+        | SubmitRejected::QueueFull { .. }
+        | SubmitRejected::Unavailable => error_code::INTERNAL,
+    };
+    crate::local_api::protocol::ServerError::new(code, reason)
+}
+
+/// Start the local API only when the configured dispatcher is installed. The
+/// listener is intentionally not restarted on SIGHUP; keeping one owner of the
+/// socket avoids two listeners during a reload, and a dispatcher change takes
+/// effect on the next daemon restart.
+fn start_local_api(
+    dispatcher_agent: &str,
+    gateway: &Arc<TriggerGateway>,
+) -> Result<LocalApiHandles> {
+    if let Err(e) = discovery::find_by_name(dispatcher_agent) {
+        warn!(
+            dispatcher = %dispatcher_agent,
+            error = %e,
+            "local api disabled: dispatcher agent was not discovered"
+        );
+        return Ok((None, None));
+    }
+
+    let handler = Arc::new(DaemonLocalApiHandler {
+        dispatcher_agent: dispatcher_agent.to_string(),
+        gateway: gateway.clone(),
+    });
+    let socket_path = dotagent_state::paths::home().join("api.sock");
+    let server = crate::local_api::server::LocalApiServer::new(socket_path.clone(), handler);
+    let listener = server
+        .bind()
+        .with_context(|| format!("binding local API endpoint {}", socket_path.display()))?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(());
+    let task = tokio::spawn(async move {
+        server
+            .run_bound(listener, shutdown_rx)
+            .await
+            .with_context(|| format!("local API endpoint {}", socket_path.display()))
+    });
+    Ok((Some(shutdown_tx), Some(task)))
 }
 
 /// Start the ingress when the config asks for it, logging why when it does not.
@@ -467,13 +614,13 @@ async fn deliver_reply(req: &TriggerRequest, body: &str) {
 /// revoked now.
 fn start_telegram_ingress(
     cfg: &dotagent_core::TelegramIngressConfig,
-    tx: &tokio::sync::mpsc::Sender<TriggerRequest>,
+    gateway: &Arc<TriggerGateway>,
     audit: &AuditLog,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if cfg.is_enabled() {
         return Some(spawn_telegram_ingress(
             cfg.clone(),
-            tx.clone(),
+            gateway.clone(),
             audit.clone(),
         ));
     }
@@ -483,7 +630,7 @@ fn start_telegram_ingress(
     None
 }
 
-/// Long-poll Telegram and feed accepted messages into the trigger channel.
+/// Long-poll Telegram and submit accepted messages directly to the gateway.
 ///
 /// Runs as its own task rather than inside the main loop, which sleeps up to
 /// [`MAX_SLEEP_MINUTES`] and would make the bot answer half an hour late.
@@ -491,7 +638,7 @@ fn start_telegram_ingress(
 /// `dotagent_notify::telegram_inbound` stays pure transport.
 fn spawn_telegram_ingress(
     cfg: dotagent_core::TelegramIngressConfig,
-    tx: tokio::sync::mpsc::Sender<TriggerRequest>,
+    gateway: Arc<TriggerGateway>,
     audit: AuditLog,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -570,20 +717,75 @@ fn spawn_telegram_ingress(
                         }
                     }
                     Screened::Run(req) => {
-                        let _ = audit.append(AuditEvent::TriggerReceived {
-                            source: TriggerSource::Telegram.to_string(),
-                            actor,
-                            reply_to: msg.chat_id.to_string(),
-                        });
-                        if tx.send(*req).await.is_err() {
-                            info!("trigger channel closed — stopping telegram ingress");
-                            return;
+                        let sink = Arc::new(TelegramSink::new(
+                            cfg.bot_token.clone(),
+                            msg.chat_id,
+                            Some(msg.message_id),
+                        ));
+                        if let Err(rejection) = gateway.submit(*req, sink).await {
+                            warn!(
+                                user_id = msg.user_id,
+                                reason = rejection.reason(),
+                                "telegram trigger rejected by gateway"
+                            );
+                            let short = format!("Request not accepted: {}.", rejection.reason());
+                            if let Err(e) = dotagent_notify::telegram_inbound::reply(
+                                &cfg.bot_token,
+                                msg.chat_id,
+                                Some(msg.message_id),
+                                &short,
+                            )
+                            .await
+                            {
+                                warn!(error = %e, "could not report telegram trigger rejection");
+                            }
                         }
                     }
                 }
             }
         }
     })
+}
+
+/// Stop an ingress task and keep its handle if it refuses to terminate.
+///
+/// A dropped `JoinHandle` would detach the old poller and let a replacement
+/// access Telegram and the offset file concurrently. Keeping it in the caller
+/// makes the safe fallback explicit: no replacement is started until this
+/// handle can be joined.
+async fn stop_telegram_ingress(
+    mut handle: tokio::task::JoinHandle<()>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    handle.abort();
+    match tokio::time::timeout(TELEGRAM_INGRESS_SHUTDOWN_TIMEOUT, &mut handle).await {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) if error.is_cancelled() => None,
+        Ok(Err(error)) => {
+            warn!(error = %error, "telegram ingress task failed while stopping");
+            None
+        }
+        Err(_) => {
+            warn!(
+                timeout_secs = TELEGRAM_INGRESS_SHUTDOWN_TIMEOUT.as_secs(),
+                "telegram ingress task did not stop within shutdown grace; replacement remains off"
+            );
+            Some(handle)
+        }
+    }
+}
+
+/// Replace an ingress only after the previous task has been joined.
+async fn restart_telegram_ingress<F>(current: &mut Option<tokio::task::JoinHandle<()>>, start: F)
+where
+    F: FnOnce() -> Option<tokio::task::JoinHandle<()>>,
+{
+    if let Some(handle) = current.take() {
+        if let Some(handle) = stop_telegram_ingress(handle).await {
+            *current = Some(handle);
+            return;
+        }
+    }
+    *current = start();
 }
 
 /// Register the `/` menu with Telegram, once per allowlisted chat.
@@ -688,6 +890,17 @@ fn screen(
     limiter: &mut dotagent_notify::telegram_inbound::RateLimiter,
     catalog: &crate::slash::CommandDiscovery,
 ) -> Screened {
+    let store = dotagent_state::SentMessageStore::from_home();
+    screen_with_store(msg, cfg, limiter, catalog, &store)
+}
+
+fn screen_with_store(
+    msg: &dotagent_notify::telegram_inbound::InboundMessage,
+    cfg: &dotagent_core::TelegramIngressConfig,
+    limiter: &mut dotagent_notify::telegram_inbound::RateLimiter,
+    catalog: &crate::slash::CommandDiscovery,
+    store: &dotagent_state::SentMessageStore,
+) -> Screened {
     if !cfg.allows(msg.user_id) {
         // Someone found the bot.
         return Screened::Reject("user id not in allowed_user_ids");
@@ -723,6 +936,7 @@ fn screen(
         // `message_id` rides along so the reply can quote what it answers.
         payload: Some(serde_json::json!({
             "text": msg.text,
+            "session_id": msg.chat_id.to_string(),
             "chat_id": msg.chat_id,
             "user_id": msg.user_id,
             "message_id": msg.message_id,
@@ -736,7 +950,7 @@ fn screen(
             // parsing prose would guess wrong eventually.
             "reply_to_run": msg
                 .reply_to_message_id
-                .and_then(|id| dotagent_state::SentMessageStore::from_home().resolve(id))
+                .and_then(|id| store.resolve_for_chat(&msg.chat_id.to_string(), id))
                 .map(|s| serde_json::json!({
                     "agent": s.agent,
                     "schedule": s.schedule,
@@ -752,6 +966,7 @@ fn screen(
         })),
         actor: Some(msg.user_id.to_string()),
         reply_to: Some(msg.chat_id.to_string()),
+        session_id: Some(msg.chat_id.to_string()),
     }))
 }
 
@@ -786,6 +1001,9 @@ fn unknown_command_text(name: &str, catalog: &crate::slash::CommandDiscovery) ->
 /// rather than grow this variable.
 fn trigger_env(req: &TriggerRequest) -> Vec<(String, String)> {
     let mut env = vec![("AGENT_TRIGGER_SOURCE".into(), req.source.to_string())];
+    if let Some(session_id) = &req.session_id {
+        env.push(("AGENT_SESSION_ID".into(), session_id.clone()));
+    }
     if let Some(actor) = &req.actor {
         env.push(("AGENT_TRIGGER_ACTOR".into(), actor.clone()));
     }
@@ -862,11 +1080,11 @@ pub async fn run() -> Result<()> {
     // one-shot run — which is the whole reason this lives in the orchestrator
     // rather than beside it.
     //
-    // `Arc` because the trigger worker runs in its own task (see
-    // `spawn_trigger_worker`) and needs an owned handle; the pool is
-    // internally synchronized, so sharing it is what keeps a chat message and
-    // a scheduled run from spawning two instances for the same key.
-    let pool = std::sync::Arc::new(PersistentPool::new(supervisor.clone()));
+    // `Arc` because gateway workers run in their own tasks and need an owned
+    // handle; the pool is internally synchronized, so sharing it keeps a local
+    // or Telegram message and a scheduled run from spawning two instances for
+    // the same key.
+    let pool = Arc::new(PersistentPool::new(supervisor.clone()));
     let cache = ManifestCache::from_home().context("opening manifest cache")?;
 
     audit
@@ -914,34 +1132,31 @@ pub async fn run() -> Result<()> {
     load_secrets_at_startup(&app_config, &audit);
     ensure_memory_workspace(&app_config);
 
-    // Inbound triggers. Drained by a worker task rather than by an arm of the
-    // `select!` below: that arm is only polled between ticks, so a long
-    // scheduled run used to hold every queued message for its whole duration.
-    // See `spawn_trigger_worker` for why there is exactly one worker and why
-    // running it beside the tick is safe.
-    let (trigger_tx, trigger_rx) =
-        tokio::sync::mpsc::channel::<TriggerRequest>(TRIGGER_CHANNEL_DEPTH);
-    let mut trigger_worker = {
-        let state = state.clone();
-        let audit = audit.clone();
-        let plugins = plugins.clone();
-        let pool = pool.clone();
-        spawn_trigger_worker(trigger_rx, move |req| {
-            let state = state.clone();
-            let audit = audit.clone();
-            let plugins = plugins.clone();
-            let pool = pool.clone();
-            async move { handle_trigger(req, &state, &audit, &plugins, &pool).await }
-        })
-    };
+    let runner = Arc::new(GatewayRunnerAdapter::new(&state, &audit, &plugins, &pool));
+    let (gateway, mut gateway_handle) =
+        TriggerGateway::start(GatewayConfig::default(), runner, Some(audit.clone()));
+
+    // The local endpoint is conditional on the configured dispatcher being a
+    // discovered manifest. SIGHUP deliberately leaves this listener in place;
+    // one socket owner is safer than trying to replace it while clients are
+    // connected, and a dispatcher change takes effect on restart.
+    let (mut local_api_shutdown, mut local_api_task) =
+        match start_local_api(&app_config.telegram.dispatcher_agent, &gateway) {
+            Ok(handles) => handles,
+            Err(error) => {
+                gateway_handle.shutdown().await;
+                return Err(error).context("starting local API");
+            }
+        };
 
     // Inbound chat. Off unless `[telegram]` names both a token and at least
     // one allowed user id — an empty allowlist is misconfiguration, not
     // permission to run anything for anyone.
-    let mut telegram = start_telegram_ingress(&app_config.telegram, &trigger_tx, &audit);
+    let mut telegram = start_telegram_ingress(&app_config.telegram, &gateway, &audit);
 
     let mut last_summary_date: Option<chrono::NaiveDate> = None;
     let mut last_retention_date: Option<chrono::NaiveDate> = None;
+    let mut fatal_error = None;
     let exit_reason = loop {
         let cycle_start = Local::now();
         let TickResult { next_event, .. } = tick_once(
@@ -1015,9 +1230,21 @@ pub async fn run() -> Result<()> {
             sleep_for.as_secs()
         );
 
-        match wait_for_event(sleep_for, &mut signals, &mut trigger_worker).await {
+        match wait_for_event(
+            sleep_for,
+            &mut signals,
+            &mut gateway_handle,
+            &mut local_api_task,
+        )
+        .await
+        {
             Wake::Tick => continue,
             Wake::Stop(reason) => break reason,
+            Wake::Fatal(error) => {
+                warn!(error = %error, "local API supervision failed; stopping daemon");
+                fatal_error = Some(error);
+                break "local API failed";
+            }
             Wake::Reload => {
                 info!("SIGHUP — reloading on next tick");
                 let _ = audit.append(AuditEvent::ConfigReloaded {
@@ -1036,10 +1263,10 @@ pub async fn run() -> Result<()> {
                 // reload would leave the old allowlist live: removing a user
                 // id and reloading would look like it took effect while the
                 // daemon kept accepting their messages.
-                if let Some(handle) = telegram.take() {
-                    handle.abort();
-                }
-                telegram = start_telegram_ingress(&reloaded.telegram, &trigger_tx, &audit);
+                restart_telegram_ingress(&mut telegram, || {
+                    start_telegram_ingress(&reloaded.telegram, &gateway, &audit)
+                })
+                .await;
                 // Same reasoning once more, for everything the loop itself
                 // reads: retention thresholds and the daily-summary time and
                 // destination were pinned at boot, so editing config.toml and
@@ -1060,7 +1287,29 @@ pub async fn run() -> Result<()> {
     // Stop accepting new work first. A trigger already in flight loses its
     // reply, which is the honest outcome — the run itself is a supervised
     // subprocess and gets reaped below like everything else.
-    trigger_worker.abort();
+    if let Some(handle) = telegram.take() {
+        let _ = stop_telegram_ingress(handle).await;
+    }
+    if let Some(shutdown) = local_api_shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    if let Some(mut task) = local_api_task.take() {
+        match tokio::time::timeout(Duration::from_secs(1), &mut task).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                warn!(error = %error, "local API endpoint failed during daemon shutdown")
+            }
+            Ok(Err(error)) => {
+                warn!(error = %error, "local API task failed during daemon shutdown")
+            }
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                warn!("local API task did not stop within the shutdown grace");
+            }
+        }
+    }
+    gateway_handle.shutdown().await;
     // Graceful supervisor shutdown — SIGTERM every live subprocess, wait
     // grace, SIGKILL stragglers. Without this, daemon exit would orphan
     // long-running plugin invocations.
@@ -1085,7 +1334,10 @@ pub async fn run() -> Result<()> {
     audit.append(AuditEvent::DaemonStopped {
         reason: exit_reason.into(),
     })?;
-    Ok(())
+    match fatal_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// The pid of another daemon that looks alive right now, if there is one.
@@ -1769,6 +2021,28 @@ async fn dispatch_one(
 
     let outcome = match run_with_hooks(spec, &ctx).await {
         Ok(o) => o,
+        Err(dotagent_runner::RunnerError::RequestLost(lost)) => {
+            // The pool deliberately does not resend a request after its bytes
+            // were written. Count this ambiguous delivery as a terminal
+            // failure so the scheduler cannot silently retry a side effect.
+            let message = lost.to_string();
+            window.attempts += 1;
+            window.last_attempt_at = Some(now.timestamp());
+            window.last_attempt_exit_code = Some(REQUEST_LOST_EXIT_CODE);
+            window.last_attempt_stderr = Some(message.clone());
+
+            fire_on_failure_event(
+                &agent.manifest,
+                sched.id(),
+                "attempt_failed",
+                &message,
+                plugins,
+                audit,
+            )
+            .await;
+            give_up(agent, sched, &mut window, &dctx, &slug, expected).await;
+            return true;
+        }
         Err(e) => {
             warn!(
                 agent = %agent.manifest.agent.name,
@@ -2277,197 +2551,46 @@ fn check_cache(agents: &[DiscoveredAgent], cache: &ManifestCache, audit: &AuditL
 }
 
 #[cfg(test)]
-mod trigger_worker_tests {
-    use super::*;
-    use std::sync::{Arc, Mutex};
-    use tokio::time::{advance, Duration as TokioDuration, Instant};
-
-    // Why an integration-style test on paused time rather than a pure
-    // "what should run now" function:
-    //
-    // The bug was never a wrong decision — every decision the daemon made was
-    // correct. It was *when* the decision got a chance to be made: the
-    // `select!` arm holding `trigger_rx` is not polled while a tick awaits a
-    // scheduled run inline. A pure function cannot express "was not polled".
-    // The property under test is temporal, so the test has to be too.
-    //
-    // `tokio::time::pause()` makes it deterministic and instant: sleeps
-    // auto-advance, so "the tick takes 20 minutes" costs microseconds, and
-    // the assertions are on the *virtual* clock, not on wall-clock luck.
-
-    fn req(agent: &str) -> TriggerRequest {
-        TriggerRequest {
-            agent: agent.into(),
-            schedule: None,
-            args: Vec::new(),
-            source: TriggerSource::Telegram,
-            actor: None,
-            reply_to: Some("42".into()),
-            payload: None,
-        }
-    }
-
-    /// The regression: a 20-minute scheduled run must not delay a message that
-    /// arrived 21 seconds into it. Reproduces the production timeline
-    /// (dispatch → trigger 21s later → answered 19m45s late).
-    #[tokio::test(start_paused = true)]
-    async fn a_long_scheduled_run_does_not_delay_a_trigger() {
-        let seen: Arc<Mutex<Vec<TokioDuration>>> = Arc::new(Mutex::new(Vec::new()));
-        let t0 = Instant::now();
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(TRIGGER_CHANNEL_DEPTH);
-        let sink = seen.clone();
-        let worker = spawn_trigger_worker(rx, move |_req| {
-            let sink = sink.clone();
-            async move {
-                sink.lock().unwrap().push(Instant::now() - t0);
-            }
-        });
-
-        // The main loop, busy the way it was: one scheduled run awaited inline
-        // for 1200 seconds. Nothing in here touches the trigger channel.
-        let tick = tokio::spawn(async move {
-            tokio::time::sleep(TokioDuration::from_secs(1200)).await;
-        });
-
-        advance(TokioDuration::from_secs(21)).await;
-        tx.send(req("telegram-assistant")).await.unwrap();
-        // Yield enough for the worker task to be scheduled and run.
-        tokio::task::yield_now().await;
-        tokio::time::sleep(TokioDuration::from_millis(1)).await;
-
-        let observed = seen.lock().unwrap().clone();
-        assert_eq!(observed.len(), 1, "the trigger was never picked up");
-        assert!(
-            observed[0] < TokioDuration::from_secs(60),
-            "trigger waited {:?} — it must not wait for the scheduled run",
-            observed[0]
-        );
-
-        tick.await.unwrap();
-        worker.abort();
-    }
-
-    /// A conversation's messages must come out in the order they went in, even
-    /// when each one takes real time. This is the property that rules out
-    /// "just `tokio::spawn` each trigger".
-    #[tokio::test(start_paused = true)]
-    async fn messages_are_handled_one_at_a_time_in_order() {
-        let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let max_inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-
-        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(TRIGGER_CHANNEL_DEPTH);
-        let (o, f, m) = (order.clone(), inflight.clone(), max_inflight.clone());
-        let worker = spawn_trigger_worker(rx, move |req: TriggerRequest| {
-            let (o, f, m) = (o.clone(), f.clone(), m.clone());
-            async move {
-                use std::sync::atomic::Ordering::SeqCst;
-                let now = f.fetch_add(1, SeqCst) + 1;
-                m.fetch_max(now, SeqCst);
-                // A persistent agent answering a chat message takes seconds.
-                tokio::time::sleep(TokioDuration::from_secs(30)).await;
-                o.lock().unwrap().push(req.agent.clone());
-                f.fetch_sub(1, SeqCst);
-            }
-        });
-
-        for name in ["first", "second", "third"] {
-            tx.send(req(name)).await.unwrap();
-        }
-        // No explicit `advance`: with the clock paused, an idle runtime jumps
-        // to the next pending timer on its own, so the worker's three 30s
-        // sleeps resolve in sequence inside this one.
-        tokio::time::sleep(TokioDuration::from_secs(200)).await;
-
-        assert_eq!(*order.lock().unwrap(), vec!["first", "second", "third"]);
-        assert_eq!(
-            max_inflight.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "a burst must not become concurrent agent processes"
-        );
-        worker.abort();
-    }
-
-    /// Closing the channel ends the worker instead of leaking a task that
-    /// spins on a dead receiver.
-    #[tokio::test(start_paused = true)]
-    async fn worker_stops_when_the_channel_closes() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(4);
-        let worker = spawn_trigger_worker(rx, |_req| async {});
-        drop(tx);
-        tokio::time::timeout(TokioDuration::from_secs(1), worker)
-            .await
-            .expect("worker should finish")
-            .expect("worker should not panic");
-    }
-
-    // --- the worker has to be watched by somebody ---
-    //
-    // Moving trigger handling off the `select!` moved it out of anyone's sight:
-    // the handle was spawned and only ever `abort()`ed. A panicking handler
-    // therefore killed the worker, closed the channel, and the ingress logged
-    // one line and returned — a bot that never answers again, on a daemon that
-    // keeps ticking and reports itself healthy. Before the worker existed the
-    // same panic unwound `run()` and launchd restarted the process.
-
-    /// A worker that panics must stop the daemon, not silence it.
-    #[tokio::test(start_paused = true)]
-    async fn a_panicking_trigger_worker_stops_the_daemon() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(TRIGGER_CHANNEL_DEPTH);
-        let mut worker = spawn_trigger_worker(rx, |_req| async { panic!("handler blew up") });
-        tx.send(req("telegram-assistant")).await.unwrap();
-
-        let mut signals = Signals::register().expect("signals must register");
-        // A full safety-cap sleep: nothing but the dead worker can end this.
-        let wake = wait_for_event(
-            Duration::from_secs(MAX_SLEEP_MINUTES as u64 * 60),
-            &mut signals,
-            &mut worker,
-        )
-        .await;
-
-        assert_eq!(wake, Wake::Stop("trigger worker died"));
-    }
-
-    /// Same for a worker that ends without panicking — the channel is closed
-    /// either way, and a daemon that cannot hear is a daemon that should exit.
-    #[tokio::test(start_paused = true)]
-    async fn a_worker_that_returns_also_stops_the_daemon() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(4);
-        let mut worker = spawn_trigger_worker(rx, |_req| async {});
-        drop(tx);
-
-        let mut signals = Signals::register().expect("signals must register");
-        let wake = wait_for_event(
-            Duration::from_secs(MAX_SLEEP_MINUTES as u64 * 60),
-            &mut signals,
-            &mut worker,
-        )
-        .await;
-
-        assert_eq!(wake, Wake::Stop("trigger worker died"));
-    }
-
-    /// And a live worker must not be mistaken for a dead one: an ordinary sleep
-    /// still ends in a tick.
-    #[tokio::test(start_paused = true)]
-    async fn a_live_worker_lets_the_loop_tick() {
-        let (tx, rx) = tokio::sync::mpsc::channel::<TriggerRequest>(4);
-        let mut worker = spawn_trigger_worker(rx, |_req| async {});
-
-        let mut signals = Signals::register().expect("signals must register");
-        let wake = wait_for_event(Duration::from_secs(600), &mut signals, &mut worker).await;
-
-        assert_eq!(wake, Wake::Tick);
-        drop(tx);
-        worker.abort();
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    struct LocalApiTestClient {
+        reader: tokio::io::Lines<tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>>,
+        writer: tokio::net::unix::OwnedWriteHalf,
+    }
+
+    impl LocalApiTestClient {
+        async fn connect(path: &Path) -> Self {
+            let stream = tokio::net::UnixStream::connect(path)
+                .await
+                .unwrap_or_else(|error| panic!("connect {}: {error}", path.display()));
+            let (reader, writer) = stream.into_split();
+            Self {
+                reader: tokio::io::BufReader::new(reader).lines(),
+                writer,
+            }
+        }
+
+        async fn send(&mut self, request: &str) {
+            self.writer
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+            self.writer.write_all(b"\n").await.expect("write newline");
+            self.writer.flush().await.expect("flush request");
+        }
+
+        async fn recv(&mut self) -> serde_json::Value {
+            let line = tokio::time::timeout(Duration::from_secs(2), self.reader.next_line())
+                .await
+                .expect("timed out waiting for local API frame")
+                .expect("read local API frame")
+                .expect("local API closed before sending a frame");
+            serde_json::from_str(&line).expect("local API frame must be JSON")
+        }
+    }
 
     // --- daily summary scheduling ---
     //
@@ -2487,6 +2610,261 @@ mod tests {
             grace_minutes: grace,
             ..Default::default()
         }
+    }
+
+    struct DropRecorder {
+        order: Arc<Mutex<Vec<&'static str>>>,
+        label: &'static str,
+    }
+
+    impl Drop for DropRecorder {
+        fn drop(&mut self) {
+            self.order.lock().unwrap().push(self.label);
+        }
+    }
+
+    fn pending_ingress_for_test(
+        ready: Arc<tokio::sync::Barrier>,
+        started: Arc<tokio::sync::Barrier>,
+        order: Arc<Mutex<Vec<&'static str>>>,
+        started_label: &'static str,
+        finished_label: &'static str,
+    ) -> JoinHandle<()> {
+        tokio::spawn(async move {
+            ready.wait().await;
+            order.lock().unwrap().push(started_label);
+            let _finished = DropRecorder {
+                order,
+                label: finished_label,
+            };
+            started.wait().await;
+            std::future::pending::<()>().await;
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn telegram_reload_joins_each_old_ingress_before_starting_the_next() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let first_ready = Arc::new(tokio::sync::Barrier::new(2));
+        let first_started = Arc::new(tokio::sync::Barrier::new(2));
+        let mut ingress = Some(pending_ingress_for_test(
+            first_ready.clone(),
+            first_started.clone(),
+            order.clone(),
+            "first-started",
+            "first-finished",
+        ));
+        first_ready.wait().await;
+        first_started.wait().await;
+
+        let second_ready = Arc::new(tokio::sync::Barrier::new(2));
+        let second_started = Arc::new(tokio::sync::Barrier::new(2));
+        let second_order = order.clone();
+        restart_telegram_ingress(&mut ingress, || {
+            second_order.lock().unwrap().push("second-created");
+            Some(pending_ingress_for_test(
+                second_ready.clone(),
+                second_started.clone(),
+                order.clone(),
+                "second-started",
+                "second-finished",
+            ))
+        })
+        .await;
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec!["first-started", "first-finished", "second-created"]
+        );
+        second_ready.wait().await;
+        second_started.wait().await;
+
+        let third_ready = Arc::new(tokio::sync::Barrier::new(2));
+        let third_started = Arc::new(tokio::sync::Barrier::new(2));
+        let third_order = order.clone();
+        restart_telegram_ingress(&mut ingress, || {
+            third_order.lock().unwrap().push("third-created");
+            Some(pending_ingress_for_test(
+                third_ready.clone(),
+                third_started.clone(),
+                order.clone(),
+                "third-started",
+                "third-finished",
+            ))
+        })
+        .await;
+        assert_eq!(
+            *order.lock().unwrap(),
+            vec![
+                "first-started",
+                "first-finished",
+                "second-created",
+                "second-started",
+                "second-finished",
+                "third-created",
+            ]
+        );
+        third_ready.wait().await;
+        third_started.wait().await;
+        assert!(stop_telegram_ingress(ingress.take().unwrap())
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_local_api_failure_stops_the_daemon_loop() {
+        let (_gateway, mut gateway_handle) = TriggerGateway::start(
+            GatewayConfig::default(),
+            Arc::new(crate::gateway::testutil::FakeRunner::default()),
+            None,
+        );
+        let mut local_api_task: Option<LocalApiTask> = Some(tokio::spawn(async {
+            Err(anyhow::anyhow!("accept failed"))
+        }));
+        let mut signals = Signals::register().expect("signals must register");
+
+        let wake = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_event(
+                Duration::from_secs(MAX_SLEEP_MINUTES as u64 * 60),
+                &mut signals,
+                &mut gateway_handle,
+                &mut local_api_task,
+            ),
+        )
+        .await
+        .expect("the failed local API task must wake the daemon");
+
+        let Wake::Fatal(error) = wake else {
+            panic!("a local API failure must be fatal");
+        };
+        assert!(error.to_string().contains("accept failed"));
+        assert!(
+            local_api_task.is_none(),
+            "the completed task must be consumed"
+        );
+        gateway_handle.shutdown().await;
+    }
+
+    #[test]
+    fn local_reply_gate_enqueues_started_before_opening() {
+        let gate = LocalReplyGate::new();
+        gate.defer_started(ServerEvent::run_started("session-1", "dispatcher"));
+        assert!(!gate.is_released());
+
+        let mut order = Vec::new();
+        gate.release(|event| {
+            assert!(
+                !gate.is_released(),
+                "the gate must stay closed while ACK order is set"
+            );
+            order.push(event.event);
+            Ok(())
+        })
+        .expect("the deferred event must enqueue");
+
+        assert!(gate.is_released());
+        assert_eq!(order, ["run.started"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_api_ack_precedes_gateway_events_over_unix_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("api.sock");
+        let audit = AuditLog::with_path(dir.path().join("audit.log"));
+        let runner = crate::gateway::testutil::FakeRunner {
+            lines: vec!["partial".into()],
+            outcome: Ok(crate::gateway::testutil::ran_ok("final answer")),
+            ..Default::default()
+        };
+        let (gateway, gateway_handle) =
+            TriggerGateway::start(GatewayConfig::default(), Arc::new(runner), Some(audit));
+        let handler = Arc::new(DaemonLocalApiHandler {
+            dispatcher_agent: "dispatcher".into(),
+            gateway,
+        });
+        let server = crate::local_api::server::LocalApiServer::new(socket_path.clone(), handler);
+        let listener = server.bind().expect("test local API listener must bind");
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let server_task =
+            tokio::spawn(async move { server.run_bound(listener, shutdown_rx).await });
+
+        let mut client = LocalApiTestClient::connect(&socket_path).await;
+        client
+            .send(
+                r#"{"id":"message-1","method":"message.send","params":{"session_id":"session-1","text":"hello"}}"#,
+            )
+            .await;
+
+        // This is deliberately the first read: a run event before this frame
+        // means the socket contract has regressed, even if the run succeeds.
+        let accepted = client.recv().await;
+        assert_eq!(
+            accepted["id"], "message-1",
+            "accepted response must be the first frame, got {accepted}"
+        );
+        assert_eq!(accepted["result"]["accepted"], true);
+
+        let mut event_names = Vec::new();
+        loop {
+            let event = client.recv().await;
+            let name = event["event"]
+                .as_str()
+                .expect("post-ACK frame must be a server event")
+                .to_string();
+            event_names.push(name.clone());
+            match name.as_str() {
+                "run.started" => {
+                    assert_eq!(event["session_id"], "session-1");
+                    assert_eq!(event["agent"], "dispatcher");
+                }
+                "typing" => assert_eq!(event["session_id"], "session-1"),
+                "reply.delta" => {
+                    assert_eq!(event["session_id"], "session-1");
+                    assert_eq!(event["line"], "partial");
+                }
+                "reply" => {
+                    assert_eq!(event["session_id"], "session-1");
+                    assert_eq!(event["text"], "final answer");
+                    break;
+                }
+                other => panic!("unexpected local API event: {other}"),
+            }
+            assert!(
+                event_names.len() < 5,
+                "reply event must terminate the stream"
+            );
+        }
+        assert_eq!(
+            event_names,
+            ["run.started", "typing", "reply.delta", "reply"],
+            "all gateway events must follow the accepted response"
+        );
+
+        client
+            .send(r#"{"id":"status-1","method":"status.get"}"#)
+            .await;
+        let status = client.recv().await;
+        assert_eq!(status["id"], "status-1");
+        assert_eq!(status["result"]["daemon"], "ok");
+        assert_eq!(status["result"]["gateway"], "ok");
+
+        client
+            .send(r#"{"id":"commands-1","method":"commands.list"}"#)
+            .await;
+        let commands = client.recv().await;
+        assert_eq!(commands["id"], "commands-1");
+        assert!(commands["result"].is_array());
+
+        drop(client);
+        shutdown_tx
+            .send(())
+            .expect("local API shutdown receiver exists");
+        server_task
+            .await
+            .expect("local API task must not panic")
+            .expect("local API must shut down cleanly");
+        assert!(!socket_path.exists(), "shutdown must remove the socket");
+        gateway_handle.shutdown().await;
     }
 
     #[test]
@@ -2734,6 +3112,7 @@ mod tests {
             payload: None,
             actor: None,
             reply_to: None,
+            session_id: None,
         }
     }
 
@@ -2754,6 +3133,7 @@ mod tests {
         let env = trigger_env(&req(TriggerSource::Cli));
         assert!(get(&env, "AGENT_TRIGGER_ACTOR").is_none());
         assert!(get(&env, "AGENT_TRIGGER_REPLY_TO").is_none());
+        assert!(get(&env, "AGENT_SESSION_ID").is_none());
         assert!(get(&env, "AGENT_TRIGGER_PAYLOAD").is_none());
     }
 
@@ -2765,6 +3145,14 @@ mod tests {
         let env = trigger_env(&r);
         assert_eq!(get(&env, "AGENT_TRIGGER_ACTOR"), Some("123"));
         assert_eq!(get(&env, "AGENT_TRIGGER_REPLY_TO"), Some("456"));
+    }
+
+    #[test]
+    fn trigger_env_carries_session_id() {
+        let mut r = req(TriggerSource::Telegram);
+        r.session_id = Some("chat-42".into());
+        let env = trigger_env(&r);
+        assert_eq!(get(&env, "AGENT_SESSION_ID"), Some("chat-42"));
     }
 
     #[test]
@@ -2801,10 +3189,253 @@ mod tests {
         r.payload = Some(serde_json::json!({}));
         for (k, _) in trigger_env(&r) {
             assert!(
-                k.starts_with("AGENT_TRIGGER_"),
+                k.starts_with("AGENT_TRIGGER_") || k == "AGENT_SESSION_ID",
                 "unexpected key produced: {k}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn persistent_request_loss_consumes_attempt_and_is_terminal() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_name = format!("request-lost-regression-{}", std::process::id());
+        let agent_dir = root.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.sh"),
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+while IFS= read -r line; do
+  case "$line" in
+    *'"kind":"hello"'*) printf '%s\n' '{"v":1,"kind":"ready","ok":true}' ;;
+    *'"kind":"request"'*)
+      printf 'written\n' >> "$AGENT_HOME/side-effects"
+      exit 0
+      ;;
+  esac
+done
+"#,
+        )
+        .unwrap();
+        let manifest_path = agent_dir.join("agent.toml");
+        std::fs::write(
+            &manifest_path,
+            format!(
+                r#"[agent]
+name = "{agent_name}"
+timeout_seconds = 5
+
+[run]
+command = "bash"
+args = ["./agent.sh"]
+
+[lifecycle]
+mode = "persistent"
+startup_timeout_seconds = 1
+
+[defaults]
+# RequestLost is terminal even while retry budget remains.
+max_retries = 3
+retry_backoff_minutes = [0]
+
+[[schedules]]
+id = "daily"
+type = "cron"
+weekdays = [0, 1, 2, 3, 4, 5, 6]
+hours = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+minute = 0
+"#
+            ),
+        )
+        .unwrap();
+        let agent = DiscoveredAgent {
+            manifest: AgentManifest::load(&manifest_path).unwrap(),
+            dir: agent_dir.clone(),
+        };
+        let schedule = &agent.manifest.schedules[0];
+        let now = dt(2026, 5, 19, 12, 0);
+        let expected = expected_at(schedule, now, None).unwrap();
+        let state = StateStore::with_root(root.path().join("state"));
+        let audit = AuditLog::with_path(root.path().join("audit.log"));
+        let supervisor = Supervisor::with_grace(Duration::from_millis(50));
+        let plugins =
+            PluginClient::with_search_paths(Vec::new()).with_supervisor(supervisor.clone());
+        let pool = PersistentPool::new(supervisor);
+        let power_config = dotagent_core::power::PowerConfig::default();
+        let power = PowerGate::new(dotagent_core::power::PowerSource::Ac, &power_config);
+
+        assert!(
+            dispatch_one(
+                &agent,
+                schedule,
+                &state,
+                &audit,
+                &plugins,
+                Some(&pool),
+                power,
+                now,
+            )
+            .await
+        );
+
+        let window = state
+            .read_window(&agent_name, "default", expected)
+            .unwrap()
+            .expect("request loss must persist window state");
+        assert_eq!(window.attempts, 1);
+        assert_eq!(window.last_attempt_at, Some(now.timestamp()));
+        assert_eq!(window.last_attempt_exit_code, Some(REQUEST_LOST_EXIT_CODE));
+        assert!(window.given_up, "ambiguous delivery must be terminal");
+        assert!(window
+            .last_attempt_stderr
+            .as_deref()
+            .is_some_and(|s| s.contains("not retrying")));
+
+        let heartbeat = state
+            .read_heartbeat(&agent_name, "default")
+            .unwrap()
+            .expect("request loss must close heartbeat");
+        assert_eq!(heartbeat.exit_code, Some(REQUEST_LOST_EXIT_CODE));
+        assert!(!heartbeat.is_running());
+
+        assert!(
+            audit
+                .iter_entries()
+                .unwrap()
+                .into_iter()
+                .any(|entry| matches!(
+                    entry.event,
+                    AuditEvent::AgentGivenUp {
+                        attempts: 1,
+                        last_exit: REQUEST_LOST_EXIT_CODE,
+                        ..
+                    }
+                )),
+            "ambiguous delivery must emit given_up"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(agent_dir.join("side-effects"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "the written request must not be duplicated"
+        );
+        assert!(
+            !dispatch_one(
+                &agent,
+                schedule,
+                &state,
+                &audit,
+                &plugins,
+                Some(&pool),
+                power,
+                now,
+            )
+            .await,
+            "given_up must block a second dispatch"
+        );
+
+        pool.shutdown(None).await;
+    }
+
+    #[tokio::test]
+    async fn audit_append_failure_does_not_skip_window_accounting_or_success_hook() {
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = root.path().join("agent");
+        let plugin_dir = root.path().join("plugins");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("agent.sh"),
+            "#!/usr/bin/env bash\nprintf 'ran\\n'\n",
+        )
+        .unwrap();
+
+        let plugin = plugin_dir.join("dotagent-plugin-record");
+        std::fs::write(
+            &plugin,
+            r#"#!/bin/sh
+set -eu
+case "${1:-}" in
+  invoke)
+    cat >/dev/null
+    printf 'invoked\n' >> "$(dirname "$0")/invoked"
+    printf '{"ok":true}\n'
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&plugin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let agent_name = "audit-best-effort";
+        let manifest_path = agent_dir.join("agent.toml");
+        std::fs::write(
+            &manifest_path,
+            format!(
+                r#"[agent]
+name = "{agent_name}"
+timeout_seconds = 5
+
+[run]
+command = "bash"
+args = ["./agent.sh"]
+
+[[on_success]]
+plugin = "record"
+
+[[schedules]]
+id = "daily"
+type = "cron"
+weekdays = [0, 1, 2, 3, 4, 5, 6]
+hours = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+minute = 0
+"#
+            ),
+        )
+        .unwrap();
+        let agent = DiscoveredAgent {
+            manifest: AgentManifest::load(&manifest_path).unwrap(),
+            dir: agent_dir.clone(),
+        };
+        let schedule = &agent.manifest.schedules[0];
+        let now = dt(2026, 5, 19, 12, 0);
+        let expected = expected_at(schedule, now, None).unwrap();
+        let state = StateStore::with_root(root.path().join("state"));
+
+        // A directory at the audit path makes every append fail deterministically
+        // while leaving the runner, state store and hook plugin usable.
+        let audit_path = root.path().join("audit.log");
+        std::fs::create_dir(&audit_path).unwrap();
+        let audit = AuditLog::with_path(audit_path);
+        let supervisor = Supervisor::with_grace(Duration::from_millis(50));
+        let plugins =
+            PluginClient::with_search_paths(vec![plugin_dir.clone()]).with_supervisor(supervisor);
+        let power_config = dotagent_core::power::PowerConfig::default();
+        let power = PowerGate::new(dotagent_core::power::PowerSource::Ac, &power_config);
+
+        assert!(dispatch_one(&agent, schedule, &state, &audit, &plugins, None, power, now,).await);
+
+        let window = state
+            .read_window(agent_name, "default", expected)
+            .unwrap()
+            .expect("post-run window must be accounted");
+        assert_eq!(window.attempts, 1);
+        assert_eq!(window.last_attempt_exit_code, Some(0));
+        assert_eq!(
+            std::fs::read_to_string(plugin_dir.join("invoked"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "the success hook must still run after audit append failure"
+        );
     }
 
     fn inbound(user_id: i64) -> dotagent_notify::telegram_inbound::InboundMessage {
@@ -2909,6 +3540,7 @@ mod tests {
         assert_eq!(req.source, TriggerSource::Telegram);
         assert_eq!(req.actor.as_deref(), Some("7"));
         assert_eq!(req.reply_to.as_deref(), Some("999"));
+        assert_eq!(req.session_id.as_deref(), Some("999"));
     }
 
     #[test]
@@ -2916,6 +3548,42 @@ mod tests {
         let req = screen(&inbound(7), &cfg(vec![7]), &mut limiter(), &empty_catalog()).run();
         assert!(req.args.is_empty(), "body must travel in the payload only");
         assert_eq!(req.payload.unwrap()["text"], "how's disk?");
+    }
+
+    #[test]
+    fn screen_resolves_reply_to_run_by_the_inbound_numeric_chat_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dotagent_state::SentMessageStore::new(dir.path().join("sent.json"));
+        store
+            .record_for_chat(
+                "-1001234567890",
+                42,
+                dotagent_state::SentMessage {
+                    chat_id: None,
+                    agent: "agent".into(),
+                    schedule: "daily".into(),
+                    event: "given_up".into(),
+                    at: 1,
+                },
+            )
+            .unwrap();
+
+        let mut msg = inbound(7);
+        msg.chat_id = -1001234567890;
+        msg.reply_to_message_id = Some(42);
+        let payload = screen_with_store(
+            &msg,
+            &cfg(vec![7]),
+            &mut limiter(),
+            &empty_catalog(),
+            &store,
+        )
+        .run()
+        .payload
+        .unwrap();
+
+        assert_eq!(payload["reply_to_run"]["agent"], "agent");
+        assert_eq!(payload["reply_to_run"]["schedule"], "daily");
     }
 
     #[test]

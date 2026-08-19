@@ -18,7 +18,9 @@ vars e exit code). dotagent cuida de:
 7. **Health states** — `ok | degraded | failing | stale` por (agent, schedule)
 
 Saiba o que o dotagent **não** é: não é runtime de agents, não é SDK, não é
-proxy MCP, não é AI. É um scheduler + supervisor.
+proxy MCP, não é AI e não é conversation runtime. É scheduler + supervisor +
+trigger harness: o gateway aplica transporte/policy, mas não possui sessão,
+transcript ou LLM state.
 
 ## Documentos canônicos (leia ANTES de mexer)
 
@@ -35,6 +37,8 @@ proxy MCP, não é AI. É um scheduler + supervisor.
   subprocess + JSON stdio
 - [`docs/concepts/lifecycle.md`](docs/concepts/lifecycle.md) — `oneshot` vs `persistent`, e por que
   o idle timeout é o relógio do reaper reapontado
+- [`docs/reference/local-api.md`](docs/reference/local-api.md) — Unix-socket local client API,
+  gateway boundary e assistant-v1 delivery
 - [`docs/reference/persistent-protocol.md`](docs/reference/persistent-protocol.md) — JSON lines do
   agent que não morre
 - [`docs/security/threat-model.md`](docs/security/threat-model.md) — modelo de ameaças
@@ -50,7 +54,7 @@ schema e protocolo são contrato público.
 
 ```
 crates/                  # orchestrator (workspace de crates)
-  dotagent/              # CLI binary — entry point
+  dotagent/              # CLI binary — entry point + gateway/local UDS daemon wiring
   dotagent-core/         # types: Manifest, Schedule, Heartbeat, WindowState, Config
   dotagent-scheduler/    # funções PURAS — sem IO, sem clock, totalmente testável
   dotagent-runner/       # spawn + timeout + heartbeat lifecycle + env injection + pool de agents persistentes
@@ -98,6 +102,7 @@ docs/
 | Novo subcomando CLI | `crates/dotagent/src/commands/` |
 | Novo notifier built-in (driver) | `dotagent-notify/src/drivers/` |
 | Ingress (receber evento externo) | `dotagent-notify/src/<source>_inbound.rs` (transporte) + política no daemon |
+| Local client API / trigger gateway | `dotagent/src/local_api/` (UDS + JSON lines) + `dotagent/src/gateway/` (admission, FIFO, cap, delivery) |
 | Tipo do protocolo MCP | `dotagent-mcp/src/lib.rs` + `docs/reference/mcp.md` |
 | Memória de agent (outl) | `dotagent-memory/src/lib.rs` + `docs/concepts/memory.md` |
 | Modo de vida do processo (`[lifecycle]`) | `dotagent-core/src/lifecycle.rs` (schema) + `dotagent-runner/src/persistent.rs` (pool) + `docs/concepts/lifecycle.md` |

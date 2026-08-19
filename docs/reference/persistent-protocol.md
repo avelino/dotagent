@@ -73,6 +73,7 @@ answer.
   "deadline_seconds": 600,
   "trigger": {
     "source": "telegram",
+    "session_id": "chat-9_a",
     "actor": "123456789",
     "reply_to": "123456789",
     "payload": { "text": "how are the disks?", "chat_id": 12345 }
@@ -87,7 +88,7 @@ answer.
 |---|---|
 | `id` | Correlation handle. Echo it back. |
 | `deadline_seconds` | How long dotagent will wait. Bail first and say something useful — being killed mid-sentence says nothing. |
-| `trigger` | Present when a message or a tool call caused the run, absent when a clock did. Same shape as the `AGENT_TRIGGER_*` block a one-shot agent reads. |
+| `trigger` | Present when a message or a tool call caused the run, absent when a clock did. When present, it has `source` and optional `session_id`, `actor`, `reply_to`, and `payload` fields. |
 | `output` | Goes back to whoever asked. |
 | `ok` | Optional, defaults to `true`. |
 | `exit_code` | Optional. Defaults to `0` when `ok`, `1` otherwise. Recorded in the heartbeat and the audit log exactly like a one-shot exit code. |
@@ -126,10 +127,11 @@ this mode:
 | `AGENT_LIFECYCLE` | `persistent`. Absent for a one-shot run, so one script can support both. |
 | `AGENT_PERSIST_KEY` | Which slice this instance answers for — the resolved `[lifecycle] key`, or `default`. |
 
-**`AGENT_TRIGGER_*` is not set.** Those variables describe one message, and
-this process will see many; frozen at spawn, they would read as perfectly valid
-while being permanently stale. Trigger context arrives in the `trigger` field
-of each request instead.
+**`AGENT_TRIGGER_*` and `AGENT_SESSION_ID` are not defined in the persistent
+process environment.** Those values describe one message, and this process will
+see many; fixed at spawn, they would read as perfectly valid while being
+permanently stale. Trigger context, including the optional session id, arrives
+in the `trigger` field of each request instead.
 
 `AGENT_TMPDIR` belongs to the instance, not to a request — it survives between
 requests and is removed when the instance is recycled.
@@ -152,7 +154,7 @@ The protocol is plain text, so a pipe is enough:
 ```bash
 printf '%s\n%s\n' \
   '{"v":1,"kind":"hello","agent":"x","key":"default"}' \
-  '{"v":1,"kind":"request","id":"1","deadline_seconds":30,"trigger":{"source":"cli","payload":{"text":"hi"}}}' \
+  '{"v":1,"kind":"request","id":"1","deadline_seconds":30,"trigger":{"source":"cli","session_id":"manual-1","payload":{"text":"hi"}}}' \
   | bash ./agent.sh
 ```
 

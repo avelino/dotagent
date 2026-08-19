@@ -38,6 +38,7 @@
 * [Plugin protocol](reference/plugin-protocol.md)
 * [Persistent protocol](reference/persistent-protocol.md)
 * [MCP server](reference/mcp.md)
+* [Local client API](reference/local-api.md)
 * [Environment variables](reference/env-vars.md)
 * [Filesystem layout](reference/paths.md)
 

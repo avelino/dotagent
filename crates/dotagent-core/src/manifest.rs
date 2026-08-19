@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::assistant::ASSISTANT_PROTOCOL_V1;
 use crate::error::{Error, Result};
 use crate::lifecycle::LifecycleConfig;
 use crate::security::SecurityConfig;
@@ -83,6 +84,12 @@ pub struct RunConfig {
     /// Working directory, relative to the manifest directory. Default: `.`.
     #[serde(default)]
     pub working_dir: Option<PathBuf>,
+    /// Stdout protocol the agent speaks. `None` ⇒ plain run: stdout is
+    /// captured as the run's output tail. `assistant-v1` ⇒ each stdout line
+    /// is an [`crate::assistant::AssistantEvent`] streamed back to the client
+    /// that triggered the run.
+    #[serde(default)]
+    pub protocol: Option<String>,
 }
 
 /// Environment-variable injection rules.
@@ -244,6 +251,23 @@ impl AgentManifest {
         if self.run.command.is_empty() {
             return Err(Error::InvalidManifest("run.command is empty".into()));
         }
+        // An unknown protocol must fail at load, not mid-run: the daemon would
+        // otherwise try to parse a stream it has no reader for and hand the
+        // client silence.
+        if let Some(protocol) = &self.run.protocol {
+            if protocol != ASSISTANT_PROTOCOL_V1 {
+                return Err(Error::InvalidManifest(format!(
+                    "run.protocol: unsupported protocol {protocol:?} (supported: {ASSISTANT_PROTOCOL_V1})"
+                )));
+            }
+        }
+        if self.run.protocol.as_deref() == Some(ASSISTANT_PROTOCOL_V1)
+            && self.lifecycle.is_persistent()
+        {
+            return Err(Error::InvalidManifest(
+                "run.protocol = \"assistant-v1\" is incompatible with lifecycle.mode = \"persistent\"; use the persistent JSON-lines protocol instead".into(),
+            ));
+        }
         let mut ids = std::collections::HashSet::new();
         for sched in &self.schedules {
             let id = sched.id();
@@ -361,5 +385,39 @@ mod tests {
         let m =
             parse("[[schedules]]\nid = \"q\"\ntype = \"interval\"\ninterval_minutes = 90").unwrap();
         assert_eq!(m.schedules.len(), 1);
+    }
+
+    #[test]
+    fn the_assistant_protocol_is_accepted() {
+        let m = parse("protocol = \"assistant-v1\"").unwrap();
+        assert!(!m.lifecycle.is_persistent());
+        assert_eq!(
+            m.run.protocol.as_deref(),
+            Some(crate::assistant::ASSISTANT_PROTOCOL_V1)
+        );
+    }
+
+    #[test]
+    fn the_assistant_protocol_is_rejected_for_persistent_lifecycle() {
+        let err =
+            parse("protocol = \"assistant-v1\"\n[lifecycle]\nmode = \"persistent\"").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid manifest: run.protocol = \"assistant-v1\" is incompatible with lifecycle.mode = \"persistent\"; use the persistent JSON-lines protocol instead"
+        );
+    }
+
+    #[test]
+    fn an_unknown_protocol_fails_fast_at_load() {
+        let err = parse("protocol = \"assistant-v2\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("assistant-v2"), "{msg}");
+        assert!(msg.contains("assistant-v1"), "{msg}");
+    }
+
+    #[test]
+    fn no_protocol_declared_stays_none() {
+        let m = parse("").unwrap();
+        assert!(m.run.protocol.is_none());
     }
 }

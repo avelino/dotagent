@@ -642,9 +642,10 @@ dependencies = [
 
 [[package]]
 name = "dotagent"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "clap_complete",
@@ -673,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "dotagent-notify",
@@ -686,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-mcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -694,7 +695,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-memory"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "outl-actions",
@@ -705,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-notify"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -724,7 +725,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-plugin"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dirs",
  "dotagent-supervisor",
@@ -737,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-plugin-preflight-cmd"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -746,7 +747,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-plugin-preflight-warp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -755,7 +756,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-plugin-sink-file"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -764,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-plugin-sink-outl"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -776,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-plugin-sink-roam"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "dirs",
@@ -787,7 +788,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-runner"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -808,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-scheduler"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "dotagent-core",
@@ -817,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-secrets"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "tempfile",
  "thiserror 2.0.18",
@@ -826,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-state"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "dirs",
@@ -842,7 +843,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-supervisor"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "libc",
@@ -856,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-telemetry"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -879,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "dotagent-unit-gen"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "dirs",
  "thiserror 2.0.18",

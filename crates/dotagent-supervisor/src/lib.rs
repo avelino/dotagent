@@ -26,7 +26,7 @@ mod signal;
 
 use std::collections::HashMap;
 use std::process::Output;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -240,6 +240,54 @@ impl Inner {
     fn wake_all(&self) {
         self.wake.send_modify(|v| *v = v.wrapping_add(1));
     }
+
+    /// Claim a live process for a lifecycle owner that will kill it.
+    ///
+    /// The claim and the flag update happen under one lock acquisition. A
+    /// waiter that loses this race must only collect the child's status; the
+    /// claimant owns the signal and the lifecycle event.
+    fn claim(&self, id: ProcId) -> Option<KillClaim> {
+        let mut reg = self.registry.lock().expect("registry lock poisoned");
+        let entry = reg.get_mut(&id)?;
+        if entry.killed_by_reaper {
+            return None;
+        }
+        entry.killed_by_reaper = true;
+        Some(KillClaim {
+            id,
+            pgid: entry.pgid,
+            owner: entry.info_template.owner.clone(),
+            kind: entry.info_template.kind,
+        })
+    }
+
+    /// Finish a cancellation claim synchronously.
+    ///
+    /// Cancellation cannot await the normal TERM grace period: the owning
+    /// task is already being dropped. `killpg(SIGKILL)` is a non-blocking
+    /// syscall and preserves kill-tree semantics without leaving a cleanup
+    /// task detached behind it.
+    fn force_claimed(&self, claim: KillClaim) {
+        if let Some(pgid) = claim.pgid {
+            let _ = signal::killpg(pgid, signal::SIGKILL);
+        }
+        let elapsed = {
+            let mut reg = self.registry.lock().expect("registry lock poisoned");
+            reg.remove(&claim.id)
+                .map(|entry| entry.started_instant.elapsed())
+        };
+        let Some(elapsed) = elapsed else {
+            return;
+        };
+        self.wake_all();
+        self.emit(SupervisorEvent::Finished {
+            id: claim.id,
+            owner: claim.owner,
+            kind: claim.kind,
+            exit_code: None,
+            elapsed,
+        });
+    }
 }
 
 /// Internal registry record. Holds the data the reaper needs to enforce the
@@ -249,10 +297,23 @@ pub(crate) struct Entry {
     pub(crate) started_instant: Instant,
     pub(crate) pgid: Option<i32>,
     pub(crate) deadline: Duration,
-    /// `false` while the per-handle timeout owns the lifecycle. Set to `true`
-    /// by the reaper when it sends `SIGTERM` so the handle reports
-    /// `TimedOut` if it ever wakes up.
+    /// `false` while the waiting handle owns the lifecycle. Set to `true`
+    /// when the reaper, `terminate`, or cancellation cleanup claims the kill,
+    /// so the waiting handle does not kill or audit the process again. The
+    /// legacy field name is retained because the reaper uses it as its claim
+    /// guard; `reaper_owned` distinguishes who won that claim.
     pub(crate) killed_by_reaper: bool,
+    /// Shared with the handle so callers can still observe reaper ownership
+    /// after the reaper removes this entry from the registry.
+    pub(crate) reaper_owned: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct KillClaim {
+    id: ProcId,
+    pgid: Option<i32>,
+    owner: ProcessOwner,
+    kind: ProcessKind,
 }
 
 impl Supervisor {
@@ -330,6 +391,7 @@ impl Supervisor {
             pgid,
             command,
         };
+        let reaper_owned = Arc::new(AtomicBool::new(false));
 
         {
             let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
@@ -341,6 +403,7 @@ impl Supervisor {
                     pgid,
                     deadline: spec.deadline,
                     killed_by_reaper: false,
+                    reaper_owned: reaper_owned.clone(),
                 },
             );
         }
@@ -371,6 +434,7 @@ impl Supervisor {
             owner: spec.owner,
             supervisor: self.inner.clone(),
             started_instant,
+            reaper_owned,
         })
     }
 
@@ -420,40 +484,28 @@ impl Supervisor {
     ///
     /// No-op when the id is unknown or already claimed by the reaper.
     pub async fn terminate(&self, id: ProcId) {
-        let (pgid, owner, kind) = {
-            let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
-            match reg.get_mut(&id) {
-                Some(entry) if !entry.killed_by_reaper => {
-                    // Claim it the same way the reaper does, so a concurrent
-                    // sweep skips it and cannot double-emit.
-                    entry.killed_by_reaper = true;
-                    (
-                        entry.pgid,
-                        entry.info_template.owner.clone(),
-                        entry.info_template.kind,
-                    )
-                }
-                _ => return,
-            }
+        let Some(claim) = self.inner.claim(id) else {
+            return;
         };
-        if let Some(pgid) = pgid {
+        if let Some(pgid) = claim.pgid {
             let _ = signal::killpg(pgid, signal::SIGTERM);
             tokio::time::sleep(self.inner.grace).await;
             let _ = signal::killpg(pgid, signal::SIGKILL);
         }
         let elapsed = {
             let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
-            reg.remove(&id)
-                .map(|e| e.started_instant.elapsed())
-                .unwrap_or_default()
+            reg.remove(&id).map(|e| e.started_instant.elapsed())
+        };
+        let Some(elapsed) = elapsed else {
+            return;
         };
         // Same reason as `SupervisedHandle::deregister`: the reaper is asleep
         // on a deadline this entry may have owned.
         self.inner.wake_all();
         self.inner.emit(SupervisorEvent::Finished {
             id,
-            owner,
-            kind,
+            owner: claim.owner,
+            kind: claim.kind,
             exit_code: None,
             elapsed,
         });
@@ -643,6 +695,7 @@ pub struct SupervisedHandle {
     owner: ProcessOwner,
     supervisor: Arc<Inner>,
     started_instant: Instant,
+    reaper_owned: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SupervisedHandle {
@@ -652,6 +705,64 @@ impl std::fmt::Debug for SupervisedHandle {
             .field("label", &self.label)
             .field("deadline", &self.deadline)
             .finish_non_exhaustive()
+    }
+}
+
+/// Synchronous fallback for a wait future that is dropped while its child is
+/// still being awaited.
+///
+/// The guard lives inside `wait_status`/`wait_with_output`, after the child has
+/// been moved into the wait future. Its `Drop` runs before the child can be
+/// released by the canceled future, so the PGID is still owned by the child
+/// we spawned. It never sleeps or spawns a detached cleanup task.
+struct WaitCleanup {
+    supervisor: Arc<Inner>,
+    id: ProcId,
+    claim: Option<KillClaim>,
+    armed: bool,
+}
+
+impl WaitCleanup {
+    fn new(handle: &SupervisedHandle) -> Self {
+        Self {
+            supervisor: handle.supervisor.clone(),
+            id: handle.id,
+            claim: None,
+            armed: true,
+        }
+    }
+
+    /// Claim the kill for this waiter. `false` means another owner already
+    /// won the race and will perform the signal and audit.
+    fn claim(&mut self) -> bool {
+        if self.claim.is_some() {
+            return true;
+        }
+        let Some(claim) = self.supervisor.claim(self.id) else {
+            self.armed = false;
+            return false;
+        };
+        self.claim = Some(claim);
+        true
+    }
+
+    /// Mark the lifecycle complete. The process has already exited or the
+    /// caller has removed the claimed entry, so `Drop` must stay inert.
+    fn complete(&mut self) {
+        self.armed = false;
+        self.claim = None;
+    }
+}
+
+impl Drop for WaitCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let claim = self.claim.take().or_else(|| self.supervisor.claim(self.id));
+        if let Some(claim) = claim {
+            self.supervisor.force_claimed(claim);
+        }
     }
 }
 
@@ -697,6 +808,15 @@ impl SupervisedHandle {
         self.child.as_mut().and_then(|c| c.stderr.take())
     }
 
+    /// Whether the reaper claimed this process for a deadline kill.
+    ///
+    /// The flag remains available after the reaper removes the process from
+    /// the registry, which lets persistent request readers classify EOF as a
+    /// timeout instead of ambiguous delivery.
+    pub fn reaper_owns_deadline(&self) -> bool {
+        self.reaper_owned.load(Ordering::Acquire)
+    }
+
     /// Wait for exit, enforcing the deadline. Unlike `wait_with_output`, on
     /// timeout this method still returns `Ok((status, true))` after killing
     /// the process group — callers that drain stdio themselves rely on the
@@ -706,24 +826,25 @@ impl SupervisedHandle {
         let mut child = self.child.take().expect("child consumed only by wait");
         let deadline = self.deadline;
         let pid = child.id();
+        let mut cleanup = WaitCleanup::new(&self);
 
         match timeout(deadline, child.wait()).await {
             Ok(Ok(status)) => {
+                cleanup.complete();
                 let elapsed = self.started_instant.elapsed();
                 self.finish(status.code(), elapsed);
                 Ok((status, false))
             }
             Ok(Err(io_err)) => {
+                cleanup.complete();
                 let elapsed = self.started_instant.elapsed();
                 self.finish(None, elapsed);
                 Err(SupervisorError::Io(io_err))
             }
             Err(_) => {
-                // Race guard: if the reaper already won the deadline, it's
-                // already TERM/KILLed the group and emitted the audit event.
-                // Just collect the status and return without double-emit.
-                let reaper_owns = self.claim_handle_kill();
-                if reaper_owns {
+                // Race guard: if the reaper or another explicit terminator
+                // already claimed the lifecycle, just collect the status.
+                if !cleanup.claim() {
                     let status = child.wait().await?;
                     return Ok((status, true));
                 }
@@ -735,8 +856,9 @@ impl SupervisedHandle {
                     "subprocess deadline exceeded — SIGTERM → grace → SIGKILL"
                 );
                 self.kill_tree().await;
-                let status = child.wait().await?;
                 let elapsed = self.started_instant.elapsed();
+                self.deregister();
+                cleanup.complete();
                 self.supervisor.emit(SupervisorEvent::KilledTimeout {
                     id: self.id,
                     owner: self.owner.clone(),
@@ -744,7 +866,7 @@ impl SupervisedHandle {
                     elapsed,
                     deadline,
                 });
-                self.deregister();
+                let status = child.wait().await?;
                 Ok((status, true))
             }
         }
@@ -758,24 +880,27 @@ impl SupervisedHandle {
         let deadline = self.deadline;
         let label = self.label.clone();
         let pid = child.id();
+        let mut cleanup = WaitCleanup::new(&self);
 
         let res = timeout(deadline, child.wait_with_output()).await;
         let elapsed = self.started_instant.elapsed();
 
         match res {
             Ok(Ok(output)) => {
+                cleanup.complete();
                 self.finish(output.status.code(), elapsed);
                 Ok(output)
             }
             Ok(Err(io_err)) => {
+                cleanup.complete();
                 self.finish(None, elapsed);
                 Err(SupervisorError::Io(io_err))
             }
             Err(_elapsed_err) => {
-                // Race guard: if the reaper already owns the kill (it
-                // claimed the entry first), don't double-TERM/KILL or
-                // double-emit. The reaper has the audit event.
-                if self.claim_handle_kill() {
+                // Race guard: if the reaper or another explicit terminator
+                // already claimed the kill, don't double-TERM/KILL or
+                // double-emit. That owner has the lifecycle event.
+                if !cleanup.claim() {
                     return Err(SupervisorError::TimedOut {
                         label,
                         pid,
@@ -792,6 +917,8 @@ impl SupervisedHandle {
                 );
                 self.kill_tree().await;
                 let elapsed = self.started_instant.elapsed();
+                self.deregister();
+                cleanup.complete();
                 self.supervisor.emit(SupervisorEvent::KilledTimeout {
                     id: self.id,
                     owner: self.owner.clone(),
@@ -799,7 +926,6 @@ impl SupervisedHandle {
                     elapsed,
                     deadline,
                 });
-                self.deregister();
                 Err(SupervisorError::TimedOut {
                     label,
                     pid,
@@ -811,6 +937,24 @@ impl SupervisedHandle {
     }
 
     fn finish(&self, exit_code: Option<i32>, elapsed: Duration) {
+        let removed = {
+            let mut reg = self
+                .supervisor
+                .registry
+                .lock()
+                .expect("registry lock poisoned");
+            match reg.get(&self.id) {
+                Some(entry) if !entry.killed_by_reaper => {
+                    reg.remove(&self.id);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !removed {
+            return;
+        }
+        self.supervisor.wake_all();
         self.supervisor.emit(SupervisorEvent::Finished {
             id: self.id,
             owner: self.owner.clone(),
@@ -818,7 +962,6 @@ impl SupervisedHandle {
             exit_code,
             elapsed,
         });
-        self.deregister();
     }
 
     fn deregister(&self) {
@@ -836,21 +979,6 @@ impl SupervisedHandle {
         // ten-minute timer armed behind it, and "an idle daemon holds no
         // timers" stays false until that timer fires on nothing.
         self.supervisor.wake_all();
-    }
-
-    /// Returns `true` when the reaper has already claimed this entry (set
-    /// `killed_by_reaper`). In that case the handle MUST NOT kill/emit again
-    /// — the reaper holds the lifecycle. Returns `false` (without mutating)
-    /// when the handle still owns the kill.
-    fn claim_handle_kill(&self) -> bool {
-        let reg = self
-            .supervisor
-            .registry
-            .lock()
-            .expect("registry lock poisoned");
-        reg.get(&self.id)
-            .map(|e| e.killed_by_reaper)
-            .unwrap_or(true) // entry already removed by reaper → it owned
     }
 
     async fn kill_tree(&self) {
@@ -879,12 +1007,20 @@ impl Drop for SupervisedHandle {
         // Caller dropped without awaiting `wait_with_output` / `wait_status`.
         // Without this hook the entry would linger in the registry forever
         // and the reaper would later `killpg` the stored pgid — which the OS
-        // may have reused for an unrelated process by then. Removing the
-        // entry now (synchronous mutex, no .await) closes that hole. We
-        // still don't kill the child here: tokio drops it via the Child
-        // we held, and its background reaper waitpids it; the user opted
-        // out of supervised kill by dropping without await.
-        if self.child.is_some() {
+        // may have reused for an unrelated process by then. Remove an
+        // unclaimed entry now (synchronous mutex, no .await) to close that
+        // hole. A claimed entry stays for its owner to finish the kill and
+        // emit its one lifecycle event. We still don't kill the child here:
+        // tokio drops it via the Child we held, and its background reaper
+        // waitpids it; the user opted out of supervised kill without an owner.
+        let claimed = self
+            .supervisor
+            .registry
+            .lock()
+            .ok()
+            .and_then(|reg| reg.get(&self.id).map(|entry| entry.killed_by_reaper))
+            .unwrap_or(true);
+        if self.child.is_some() && !claimed {
             self.deregister();
         }
     }

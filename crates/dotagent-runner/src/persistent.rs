@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -32,13 +33,15 @@ use chrono::Local;
 use dotagent_core::audit::AuditEvent;
 use dotagent_state::{AuditLog, StateStore};
 use dotagent_supervisor::{ProcId, ProcessKind, ProcessOwner, SpawnSpec, Supervisor};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::protocol::{HelloFrame, InboundFrame, RequestFrame, TriggerFrame};
-use crate::{tail_lines, RunOutcome, RunSpec, RunnerError, TAIL_LINES, TIMED_OUT_EXIT_CODE};
+use crate::{
+    tail_lines, RequestLost, RunOutcome, RunSpec, RunnerError, TAIL_LINES, TIMED_OUT_EXIT_CODE,
+};
 
 /// Slice used when the manifest declares no `[lifecycle] key`.
 pub const DEFAULT_INSTANCE_KEY: &str = "default";
@@ -53,6 +56,11 @@ const MAX_KEY_LEN: usize = 64;
 
 /// How many stderr lines one instance keeps for the next `stderr_tail`.
 const STDERR_RING_LINES: usize = 500;
+
+/// No process exit status exists when a request was written but its response
+/// was lost. Keep the heartbeat's failure shape explicit instead of leaving it
+/// open or pretending the request succeeded.
+pub const REQUEST_LOST_EXIT_CODE: i32 = -1;
 
 /// Why an instance went away. The string lands in the audit log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,20 +147,60 @@ impl Drop for Instance {
     }
 }
 
-/// A slot in the pool. `None` means "this key has no live process right now" —
-/// the slot itself is created before the spawn so two concurrent requests for
-/// the same key queue on the same mutex instead of racing to spawn twice.
-type Slot = Arc<Mutex<Option<Instance>>>;
+/// Ownership state for one pool slot.
+///
+/// The state is deliberately separate from the process handle. `Starting` is
+/// a reservation made before the subprocess exists, and `Retiring` keeps the
+/// key owned while the supervisor's grace period is in progress. A stale
+/// request that still holds an `Arc` can therefore never mistake either state
+/// for permission to spawn a replacement.
+enum SlotState {
+    Starting,
+    Live(Box<Instance>),
+    Retiring,
+    Stopped,
+}
+
+struct SlotCell {
+    state: Mutex<SlotState>,
+}
+
+type Slot = Arc<SlotCell>;
+
+impl SlotCell {
+    fn starting() -> Slot {
+        Arc::new(Self {
+            state: Mutex::new(SlotState::Starting),
+        })
+    }
+
+    #[cfg(test)]
+    fn stopped() -> Slot {
+        Arc::new(Self {
+            state: Mutex::new(SlotState::Stopped),
+        })
+    }
+}
 
 struct SlotEntry {
     slot: Slot,
     last_used: Instant,
 }
 
+struct RetireOptions<'a> {
+    reason: RecycleReason,
+    audit: Option<&'a AuditLog>,
+    already_dead: bool,
+}
+
 /// Live persistent agents, keyed by `(agent, instance key)`.
 pub struct PersistentPool {
     supervisor: Supervisor,
     slots: Mutex<HashMap<(String, String), SlotEntry>>,
+    /// Serializes map allocation and eviction. Retirement must finish before
+    /// a replacement slot is inserted, otherwise `max_instances` is only a
+    /// best effort during the supervisor grace period.
+    allocation: Mutex<()>,
 }
 
 impl std::fmt::Debug for PersistentPool {
@@ -164,11 +212,12 @@ impl std::fmt::Debug for PersistentPool {
 /// How a request against a live instance ended.
 enum Exchange {
     Answered(RunOutcome),
-    /// The process was gone before the answer. Retryable exactly once, with a
-    /// fresh instance — an idle recycle landing between the deadline reset and
-    /// the write is a real race, and it should cost a respawn rather than a
-    /// dropped message.
-    Dead(String),
+    /// The process was gone before the request bytes were written. Retryable
+    /// exactly once, with a fresh instance.
+    DeadBeforeRequest(String),
+    /// The request was written, but no answer was received. The agent may have
+    /// performed a side effect, so retrying would be an unsafe duplicate.
+    RequestLost(RequestLost),
     /// The request outlived its deadline. Not retryable: the agent is
     /// presumably still working on it, and asking again would double the work.
     TimedOut,
@@ -179,24 +228,21 @@ impl PersistentPool {
         Self {
             supervisor,
             slots: Mutex::new(HashMap::new()),
+            allocation: Mutex::new(()),
         }
     }
 
-    /// Number of keys with a live process. Test and status affordance.
+    /// Number of pool-owned keys, including spawn and retirement reservations.
     pub async fn live_count(&self) -> usize {
         let slots = self.slots.lock().await;
-        let mut live = 0;
-        for entry in slots.values() {
-            if let Ok(guard) = entry.slot.try_lock() {
-                if guard.is_some() {
-                    live += 1;
-                }
-            } else {
-                // Locked means a request is in flight, which means it is live.
-                live += 1;
-            }
-        }
-        live
+        slots
+            .values()
+            .filter(|entry| match entry.slot.state.try_lock() {
+                Ok(guard) => !matches!(*guard, SlotState::Stopped),
+                // A locked cell is owned by a spawn, request, or retirement.
+                Err(_) => true,
+            })
+            .count()
     }
 
     /// Run one request against the agent's persistent instance, spawning it if
@@ -225,6 +271,32 @@ impl PersistentPool {
 
         let outcome = match result {
             Ok(outcome) => outcome,
+            Err(e @ RunnerError::RequestLost(_)) => {
+                // The request crossed the process boundary, so the heartbeat
+                // must not remain in the "running" state. The daemon handles
+                // the typed error as a terminal, counted failure and must not
+                // send the same request again.
+                if !spec.dry_run {
+                    let finish = Local::now();
+                    if let Err(finish_error) = crate::finish_heartbeat(
+                        state,
+                        &name,
+                        &slug,
+                        spec.args,
+                        &start,
+                        &finish,
+                        REQUEST_LOST_EXIT_CODE,
+                    ) {
+                        warn!(
+                            agent = %name,
+                            slug = %slug,
+                            error = %finish_error,
+                            "could not close heartbeat after persistent request loss"
+                        );
+                    }
+                }
+                return Err(e);
+            }
             Err(e) => {
                 // A spawn that never happened has no exit code to report. Mirror
                 // `run()`: propagate, leaving the started heartbeat open, which
@@ -259,9 +331,17 @@ impl PersistentPool {
         let mut last_error = String::new();
         for attempt in 0..2 {
             let slot = self.slot_for(spec, name, key, audit).await;
-            let mut guard = slot.lock().await;
+            let mut guard = slot.state.lock().await;
 
-            if guard.is_none() {
+            if matches!(*guard, SlotState::Stopped | SlotState::Retiring) {
+                // A request can retain an Arc to a slot after eviction or
+                // shutdown removed it from the map. Never spawn into that
+                // detached cell; reacquire the current map entry instead.
+                drop(guard);
+                continue;
+            }
+
+            if matches!(*guard, SlotState::Starting) {
                 match self.spawn_instance(spec, state, name, key).await {
                     Ok(inst) => {
                         let _ = audit.map(|log| {
@@ -272,46 +352,77 @@ impl PersistentPool {
                             })
                         });
                         info!(agent = %name, key = %key, pid = inst.pid, "persistent agent up");
-                        *guard = Some(inst);
+                        *guard = SlotState::Live(Box::new(inst));
                     }
                     Err(e) => {
                         // A process that cannot start is not a race worth
                         // retrying — the next attempt would fail identically.
+                        *guard = SlotState::Stopped;
                         drop(guard);
-                        self.forget_slot(name, key).await;
+                        self.forget_slot(name, key, &slot).await;
                         return Err(e);
                     }
                 }
             }
 
-            let inst = guard.as_mut().expect("just ensured");
+            let inst = match &mut *guard {
+                SlotState::Live(inst) => inst.as_mut(),
+                SlotState::Starting | SlotState::Retiring | SlotState::Stopped => {
+                    drop(guard);
+                    continue;
+                }
+            };
             match self.exchange(inst, spec).await {
                 Exchange::Answered(outcome) => {
                     let recycle = spec.manifest.lifecycle.max_invocations > 0
                         && inst.invocations >= spec.manifest.lifecycle.max_invocations;
                     let idle = Duration::from_secs(spec.manifest.lifecycle.idle_timeout_seconds);
                     let proc_id = inst.proc_id;
-                    let invocations = inst.invocations;
                     if recycle {
-                        let inst = guard.take().expect("live");
-                        drop(guard);
-                        self.retire(inst, name, key, RecycleReason::MaxInvocations, audit)
-                            .await;
-                        self.forget_slot(name, key).await;
+                        let inst = match std::mem::replace(&mut *guard, SlotState::Retiring) {
+                            SlotState::Live(inst) => inst,
+                            _ => unreachable!("the request owns a live slot"),
+                        };
+                        self.retire_held(
+                            name,
+                            key,
+                            &slot,
+                            guard,
+                            inst,
+                            RetireOptions {
+                                reason: RecycleReason::MaxInvocations,
+                                audit,
+                                already_dead: false,
+                            },
+                        )
+                        .await;
                     } else {
                         // Hand the reaper the idle clock. A false return means
                         // it already collected the process; the next request
                         // will spawn a new one, which is exactly right.
                         if !self.supervisor.retime(proc_id, idle) {
                             debug!(agent = %name, key = %key, "instance collected before going idle");
-                            let _ = guard.take();
-                            drop(guard);
-                            self.record_recycle(name, key, RecycleReason::Idle, invocations, audit);
-                            self.forget_slot(name, key).await;
+                            let inst = match std::mem::replace(&mut *guard, SlotState::Retiring) {
+                                SlotState::Live(inst) => inst,
+                                _ => unreachable!("the request owns a live slot"),
+                            };
+                            self.retire_held(
+                                name,
+                                key,
+                                &slot,
+                                guard,
+                                inst,
+                                RetireOptions {
+                                    reason: RecycleReason::Idle,
+                                    audit,
+                                    already_dead: true,
+                                },
+                            )
+                            .await;
                         } else {
                             drop(guard);
+                            self.touch(name, key).await;
                         }
-                        self.touch(name, key).await;
                     }
                     return Ok(outcome);
                 }
@@ -319,11 +430,23 @@ impl PersistentPool {
                     // Recycle rather than reuse: the instance is still working
                     // on a question nobody is waiting for anymore, and its next
                     // line would answer the wrong one.
-                    let inst = guard.take().expect("live");
-                    drop(guard);
-                    self.retire(inst, name, key, RecycleReason::Timeout, audit)
-                        .await;
-                    self.forget_slot(name, key).await;
+                    let inst = match std::mem::replace(&mut *guard, SlotState::Retiring) {
+                        SlotState::Live(inst) => inst,
+                        _ => unreachable!("the request owns a live slot"),
+                    };
+                    self.retire_held(
+                        name,
+                        key,
+                        &slot,
+                        guard,
+                        inst,
+                        RetireOptions {
+                            reason: RecycleReason::Timeout,
+                            audit,
+                            already_dead: false,
+                        },
+                    )
+                    .await;
                     warn!(agent = %name, key = %key, "persistent request timed out — recycled");
                     return Ok(RunOutcome {
                         exit_code: TIMED_OUT_EXIT_CODE,
@@ -338,12 +461,24 @@ impl PersistentPool {
                         stderr_truncated_lines: 0,
                     });
                 }
-                Exchange::Dead(why) => {
-                    let invocations = inst.invocations;
-                    let inst = guard.take().expect("live");
-                    drop(guard);
-                    self.retire_dead(inst, name, key, invocations, audit).await;
-                    self.forget_slot(name, key).await;
+                Exchange::DeadBeforeRequest(why) => {
+                    let inst = match std::mem::replace(&mut *guard, SlotState::Retiring) {
+                        SlotState::Live(inst) => inst,
+                        _ => unreachable!("the request owns a live slot"),
+                    };
+                    self.retire_held(
+                        name,
+                        key,
+                        &slot,
+                        guard,
+                        inst,
+                        RetireOptions {
+                            reason: RecycleReason::Crashed,
+                            audit,
+                            already_dead: true,
+                        },
+                    )
+                    .await;
                     last_error = why;
                     if attempt == 0 {
                         debug!(
@@ -352,6 +487,26 @@ impl PersistentPool {
                         );
                         continue;
                     }
+                }
+                Exchange::RequestLost(lost) => {
+                    let inst = match std::mem::replace(&mut *guard, SlotState::Retiring) {
+                        SlotState::Live(inst) => inst,
+                        _ => unreachable!("the request owns a live slot"),
+                    };
+                    self.retire_held(
+                        name,
+                        key,
+                        &slot,
+                        guard,
+                        inst,
+                        RetireOptions {
+                            reason: RecycleReason::Crashed,
+                            audit,
+                            already_dead: true,
+                        },
+                    )
+                    .await;
+                    return Err(RunnerError::RequestLost(lost));
                 }
             }
         }
@@ -363,12 +518,14 @@ impl PersistentPool {
     /// One request against a live instance.
     async fn exchange(&self, inst: &mut Instance, spec: &RunSpec<'_>) -> Exchange {
         if let Ok(Some(status)) = inst.handle.try_wait() {
-            return Exchange::Dead(format!("process already exited ({status})"));
+            return Exchange::DeadBeforeRequest(format!("process already exited ({status})"));
         }
 
         let deadline = Duration::from_secs(spec.manifest.agent.timeout_seconds);
         if !self.supervisor.retime(inst.proc_id, deadline) {
-            return Exchange::Dead("supervisor had already collected the process".into());
+            return Exchange::DeadBeforeRequest(
+                "supervisor had already collected the process".into(),
+            );
         }
 
         inst.seq += 1;
@@ -392,7 +549,11 @@ impl PersistentPool {
         let started = Instant::now();
 
         if let Err(e) = write_frame(&mut inst.stdin, &frame).await {
-            return Exchange::Dead(format!("write failed: {e}"));
+            return classify_write_failure(
+                e,
+                inst.handle.reaper_owns_deadline(),
+                started.elapsed(),
+            );
         }
 
         let answer = tokio::time::timeout(deadline, read_answer(&mut inst.stdout, &id)).await;
@@ -405,7 +566,9 @@ impl PersistentPool {
 
         match answer {
             Err(_) => Exchange::TimedOut,
-            Ok(Err(e)) => Exchange::Dead(e),
+            Ok(Err(_)) if inst.handle.reaper_owns_deadline() => Exchange::TimedOut,
+            Ok(Err(e)) => Exchange::RequestLost(RequestLost::new(e, started.elapsed())),
+            Ok(Ok(_)) if inst.handle.reaper_owns_deadline() => Exchange::TimedOut,
             Ok(Ok(frame)) => {
                 inst.invocations += 1;
                 let exit_code = frame.resolved_exit_code();
@@ -439,51 +602,63 @@ impl PersistentPool {
     ) -> Slot {
         let map_key = (name.to_string(), key.to_string());
 
-        // Everything that touches the map happens here, with no `.await`
-        // inside: terminating the evicted instance sleeps through the kill
-        // grace, and holding the map across that would stall every other key.
-        let (slot, victim) = {
-            let mut slots = self.slots.lock().await;
-            if let Some(entry) = slots.get_mut(&map_key) {
-                entry.last_used = Instant::now();
-                return entry.slot.clone();
-            }
-            // New key. Make room before adding, counting only this agent's
-            // slots — one chatty agent should not evict another's warm cache.
-            let max = spec.manifest.lifecycle.max_instances as usize;
-            let mine: Vec<_> = slots.keys().filter(|(a, _)| a == name).cloned().collect();
-            let victim = if mine.len() >= max {
+        // A replacement is not inserted until the victim is fully retired.
+        // This keeps the old key owned during the supervisor grace period and
+        // makes `max_instances` a hard ceiling, not a best effort.
+        let _allocation = self.allocation.lock().await;
+        loop {
+            let victim = {
+                let mut slots = self.slots.lock().await;
+
+                if let Some(entry) = slots.get_mut(&map_key) {
+                    let stopped = entry
+                        .slot
+                        .state
+                        .try_lock()
+                        .map(|state| matches!(*state, SlotState::Stopped))
+                        .unwrap_or(false);
+                    if stopped {
+                        slots.remove(&map_key);
+                    } else {
+                        entry.last_used = Instant::now();
+                        return entry.slot.clone();
+                    }
+                }
+
+                // New key. Make room before adding, counting reservations and
+                // retiring slots as occupied. The victim stays in the map
+                // until `retire_slot` finishes.
+                let max = spec.manifest.lifecycle.max_instances as usize;
+                let mine: Vec<_> = slots.keys().filter(|(a, _)| a == name).cloned().collect();
+                if mine.len() < max {
+                    let slot = SlotCell::starting();
+                    slots.insert(
+                        map_key.clone(),
+                        SlotEntry {
+                            slot: slot.clone(),
+                            last_used: Instant::now(),
+                        },
+                    );
+                    return slot;
+                }
+
                 mine.into_iter()
                     .min_by_key(|k| slots.get(k).map(|e| e.last_used))
-                    .and_then(|k| slots.remove(&k).map(|e| (k, e.slot)))
-            } else {
-                None
+                    .and_then(|k| slots.get(&k).map(|e| (k, e.slot.clone())))
             };
-            let slot: Slot = Arc::new(Mutex::new(None));
-            slots.insert(
-                map_key,
-                SlotEntry {
-                    slot: slot.clone(),
-                    last_used: Instant::now(),
-                },
-            );
-            (slot, victim)
-        };
 
-        if let Some((victim_key, victim_slot)) = victim {
-            let mut guard = victim_slot.lock().await;
-            if let Some(inst) = guard.take() {
-                self.retire(
-                    inst,
+            if let Some((victim_key, victim_slot)) = victim {
+                self.retire_slot(
                     &victim_key.0,
                     &victim_key.1,
+                    &victim_slot,
                     RecycleReason::Evicted,
                     audit,
+                    false,
                 )
                 .await;
             }
         }
-        slot
     }
 
     async fn spawn_instance(
@@ -559,7 +734,9 @@ impl PersistentPool {
         // already registered with the supervisor and nobody else holds it.
         let hello = HelloFrame::new(name, key, spec.schedule_id);
         let handshake = async {
-            write_frame(&mut stdin, &hello).await?;
+            write_frame(&mut stdin, &hello)
+                .await
+                .map_err(|e| e.to_string())?;
             loop {
                 match lines.next_line().await {
                     Ok(Some(line)) => match InboundFrame::parse(&line) {
@@ -635,6 +812,71 @@ impl PersistentPool {
         self.record_recycle(name, key, reason, invocations, audit);
     }
 
+    /// Retire an instance while retaining its slot mutex.
+    ///
+    /// The guard is intentionally held through the supervisor grace period.
+    /// A request that obtained the slot just before retirement then waits for
+    /// the old process to finish and sees `Stopped`; it cannot spawn into an
+    /// Arc that is no longer present in the pool map.
+    async fn retire_held(
+        &self,
+        name: &str,
+        key: &str,
+        slot: &Slot,
+        mut guard: tokio::sync::MutexGuard<'_, SlotState>,
+        inst: Box<Instance>,
+        options: RetireOptions<'_>,
+    ) {
+        if options.already_dead {
+            self.retire_dead(*inst, name, key, options.reason, options.audit)
+                .await;
+        } else {
+            self.retire(*inst, name, key, options.reason, options.audit)
+                .await;
+        }
+        *guard = SlotState::Stopped;
+        drop(guard);
+        self.forget_slot(name, key, slot).await;
+    }
+
+    /// Claim and retire whatever currently owns a slot.
+    async fn retire_slot(
+        &self,
+        name: &str,
+        key: &str,
+        slot: &Slot,
+        reason: RecycleReason,
+        audit: Option<&AuditLog>,
+        already_dead: bool,
+    ) {
+        let mut guard = slot.state.lock().await;
+        match std::mem::replace(&mut *guard, SlotState::Retiring) {
+            SlotState::Live(inst) => {
+                self.retire_held(
+                    name,
+                    key,
+                    slot,
+                    guard,
+                    inst,
+                    RetireOptions {
+                        reason,
+                        audit,
+                        already_dead,
+                    },
+                )
+                .await;
+            }
+            SlotState::Starting | SlotState::Retiring | SlotState::Stopped => {
+                // A reservation can be evicted or drained before its owner
+                // acquires the mutex. Marking it stopped makes that owner
+                // retry the map lookup instead of spawning an untracked child.
+                *guard = SlotState::Stopped;
+                drop(guard);
+                self.forget_slot(name, key, slot).await;
+            }
+        }
+    }
+
     /// Same, for an instance that is already dead. `terminate` is best effort:
     /// the reaper may have collected it, in which case it is a no-op.
     async fn retire_dead(
@@ -642,12 +884,13 @@ impl PersistentPool {
         inst: Instance,
         name: &str,
         key: &str,
-        invocations: u32,
+        reason: RecycleReason,
         audit: Option<&AuditLog>,
     ) {
+        let invocations = inst.invocations;
         self.supervisor.terminate(inst.proc_id).await;
         drop(inst);
-        self.record_recycle(name, key, RecycleReason::Crashed, invocations, audit);
+        self.record_recycle(name, key, reason, invocations, audit);
     }
 
     fn record_recycle(
@@ -679,9 +922,16 @@ impl PersistentPool {
         }
     }
 
-    async fn forget_slot(&self, name: &str, key: &str) {
+    async fn forget_slot(&self, name: &str, key: &str, slot: &Slot) {
         let mut slots = self.slots.lock().await;
-        slots.remove(&(name.to_string(), key.to_string()));
+        let map_key = (name.to_string(), key.to_string());
+        let is_current = slots
+            .get(&map_key)
+            .map(|entry| Arc::ptr_eq(&entry.slot, slot))
+            .unwrap_or(false);
+        if is_current {
+            slots.remove(&map_key);
+        }
     }
 
     /// Collect instances that died while nobody was looking.
@@ -710,19 +960,25 @@ impl PersistentPool {
     /// Drop every instance of one agent — used when its manifest changed and
     /// the live process no longer matches what is on disk.
     pub async fn forget_agent(&self, name: &str, audit: Option<&AuditLog>) {
+        let _allocation = self.allocation.lock().await;
         let mine: Vec<((String, String), Slot)> = {
-            let mut slots = self.slots.lock().await;
-            let keys: Vec<_> = slots.keys().filter(|(a, _)| a == name).cloned().collect();
-            keys.into_iter()
-                .filter_map(|k| slots.remove(&k).map(|e| (k, e.slot)))
+            let slots = self.slots.lock().await;
+            slots
+                .iter()
+                .filter(|((agent, _), _)| agent == name)
+                .map(|(key, entry)| (key.clone(), entry.slot.clone()))
                 .collect()
         };
         for (key, slot) in mine {
-            let mut guard = slot.lock().await;
-            if let Some(inst) = guard.take() {
-                self.retire(inst, &key.0, &key.1, RecycleReason::ConfigChanged, audit)
-                    .await;
-            }
+            self.retire_slot(
+                &key.0,
+                &key.1,
+                &slot,
+                RecycleReason::ConfigChanged,
+                audit,
+                false,
+            )
+            .await;
         }
     }
 
@@ -746,15 +1002,17 @@ impl PersistentPool {
     }
 
     async fn drain(&self, reason: RecycleReason, audit: Option<&AuditLog>) {
+        let _allocation = self.allocation.lock().await;
         let all: Vec<((String, String), Slot)> = {
-            let mut slots = self.slots.lock().await;
-            slots.drain().map(|(k, e)| (k, e.slot)).collect()
+            let slots = self.slots.lock().await;
+            slots
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.slot.clone()))
+                .collect()
         };
         for (key, slot) in all {
-            let mut guard = slot.lock().await;
-            if let Some(inst) = guard.take() {
-                self.retire(inst, &key.0, &key.1, reason, audit).await;
-            }
+            self.retire_slot(&key.0, &key.1, &slot, reason, audit, false)
+                .await;
         }
     }
 }
@@ -771,24 +1029,37 @@ impl PersistentPool {
 /// the whole decision makes that gap unrepresentable — hence no `.await` in
 /// here, and none allowed.
 ///
-/// A locked slot has a request in flight and is left alone.
+/// Starting and retiring slots are reservations owned by another lifecycle
+/// transition and are left alone. A locked live slot has a request in flight
+/// and is left alone as well.
 fn reap_dead(
     slots: &mut HashMap<(String, String), SlotEntry>,
 ) -> Vec<((String, String), Option<Instance>)> {
     let mut reaped = Vec::new();
     slots.retain(|key, entry| {
-        let Ok(mut guard) = entry.slot.try_lock() else {
+        let Ok(mut guard) = entry.slot.state.try_lock() else {
             return true;
         };
-        let exited = match guard.as_mut() {
-            Some(inst) => inst.handle.try_wait().ok().flatten().is_some(),
-            None => true,
-        };
-        if !exited {
-            return true;
+        match &mut *guard {
+            SlotState::Starting | SlotState::Retiring => true,
+            SlotState::Stopped => {
+                reaped.push((key.clone(), None));
+                false
+            }
+            SlotState::Live(inst) => {
+                let exited = inst.handle.try_wait().ok().flatten().is_some();
+                if !exited {
+                    return true;
+                }
+                let state = std::mem::replace(&mut *guard, SlotState::Stopped);
+                let instance = match state {
+                    SlotState::Live(inst) => Some(*inst),
+                    SlotState::Starting | SlotState::Retiring | SlotState::Stopped => None,
+                };
+                reaped.push((key.clone(), instance));
+                false
+            }
         }
-        reaped.push((key.clone(), guard.take()));
-        false
     });
     reaped
 }
@@ -870,14 +1141,78 @@ fn sanitize_key(raw: &str) -> String {
     }
 }
 
-async fn write_frame<T: serde::Serialize>(
-    stdin: &mut ChildStdin,
-    frame: &T,
-) -> std::result::Result<(), String> {
-    let mut line = serde_json::to_vec(frame).map_err(|e| e.to_string())?;
+#[derive(Debug)]
+struct FrameWriteError {
+    wrote_bytes: bool,
+    message: String,
+}
+
+fn classify_write_failure(
+    error: FrameWriteError,
+    reaper_owned: bool,
+    elapsed: Duration,
+) -> Exchange {
+    if reaper_owned {
+        return Exchange::TimedOut;
+    }
+    if error.wrote_bytes() {
+        return Exchange::RequestLost(RequestLost::new(
+            format!("write failed after request bytes were written: {error}"),
+            elapsed,
+        ));
+    }
+    Exchange::DeadBeforeRequest(format!(
+        "write failed before request bytes were written: {error}"
+    ))
+}
+
+impl FrameWriteError {
+    fn new(wrote_bytes: bool, message: impl Into<String>) -> Self {
+        Self {
+            wrote_bytes,
+            message: message.into(),
+        }
+    }
+
+    fn wrote_bytes(&self) -> bool {
+        self.wrote_bytes
+    }
+}
+
+impl fmt::Display for FrameWriteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+/// Write one complete protocol frame and retain whether the pipe accepted any
+/// bytes. A failure after a partial write is ambiguous delivery; a failure
+/// before the first byte is safe to retry with a fresh instance.
+async fn write_frame<T, W>(writer: &mut W, frame: &T) -> std::result::Result<(), FrameWriteError>
+where
+    T: serde::Serialize,
+    W: AsyncWrite + Unpin,
+{
+    let mut line = serde_json::to_vec(frame)
+        .map_err(|e| FrameWriteError::new(false, format!("serializing frame: {e}")))?;
     line.push(b'\n');
-    stdin.write_all(&line).await.map_err(|e| e.to_string())?;
-    stdin.flush().await.map_err(|e| e.to_string())
+    let mut written = 0;
+    while written < line.len() {
+        match writer.write(&line[written..]).await {
+            Ok(0) => {
+                return Err(FrameWriteError::new(
+                    written > 0,
+                    "write returned zero bytes",
+                ));
+            }
+            Ok(count) => written += count,
+            Err(e) => return Err(FrameWriteError::new(written > 0, e.to_string())),
+        }
+    }
+    writer
+        .flush()
+        .await
+        .map_err(|e| FrameWriteError::new(true, e.to_string()))
 }
 
 /// Read until the frame answering `id` shows up.
@@ -999,6 +1334,85 @@ mod tests {
         assert_eq!(RecycleReason::ConfigChanged.as_str(), "config_changed");
     }
 
+    struct FailingWriter {
+        accepted: usize,
+        fail_after: usize,
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.accepted >= self.fail_after {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed",
+                )));
+            }
+            let count = (self.fail_after - self.accepted).min(buf.len());
+            self.accepted += count;
+            std::task::Poll::Ready(Ok(count))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_frame_write_failure_before_any_byte_is_safe_to_retry() {
+        let mut writer = FailingWriter {
+            accepted: 0,
+            fail_after: 0,
+        };
+        let error = write_frame(&mut writer, &serde_json::json!({"kind": "request"}))
+            .await
+            .expect_err("the writer is closed");
+
+        assert!(!error.wrote_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_frame_write_failure_after_a_byte_is_ambiguous() {
+        let mut writer = FailingWriter {
+            accepted: 0,
+            fail_after: 1,
+        };
+        let error = write_frame(&mut writer, &serde_json::json!({"kind": "request"}))
+            .await
+            .expect_err("the writer closes after one byte");
+
+        assert!(error.wrote_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_partial_frame_write_becomes_request_lost() {
+        let mut writer = FailingWriter {
+            accepted: 0,
+            fail_after: 1,
+        };
+        let error = write_frame(&mut writer, &serde_json::json!({"kind": "request"}))
+            .await
+            .expect_err("the writer closes after one byte");
+
+        assert!(matches!(
+            classify_write_failure(error, false, Duration::from_secs(1)),
+            Exchange::RequestLost(_)
+        ));
+    }
+
     // --- which instance answers what ---
 
     fn manifest(toml_src: &str) -> dotagent_core::AgentManifest {
@@ -1106,21 +1520,25 @@ mode = "persistent"
 
     // --- sweeping ---
 
-    fn empty_slot() -> SlotEntry {
+    fn starting_slot() -> SlotEntry {
         SlotEntry {
-            slot: Arc::new(Mutex::new(None)),
+            slot: SlotCell::starting(),
+            last_used: Instant::now(),
+        }
+    }
+
+    fn stopped_slot() -> SlotEntry {
+        SlotEntry {
+            slot: SlotCell::stopped(),
             last_used: Instant::now(),
         }
     }
 
     #[tokio::test]
     async fn a_sweep_removes_exactly_what_it_reports() {
-        // Deciding under one hold of the map and deleting under a later one is
-        // what let a sweep remove a slot a concurrent dispatch had just filled.
-        // The signature is the fix; this pins the behaviour it has to keep.
         let mut slots: HashMap<(String, String), SlotEntry> = HashMap::new();
-        slots.insert(("a".into(), "gone".into()), empty_slot());
-        slots.insert(("a".into(), "also-gone".into()), empty_slot());
+        slots.insert(("a".into(), "gone".into()), stopped_slot());
+        slots.insert(("a".into(), "also-gone".into()), stopped_slot());
 
         let reaped = reap_dead(&mut slots);
 
@@ -1133,12 +1551,37 @@ mode = "persistent"
     }
 
     #[tokio::test]
-    async fn a_sweep_leaves_a_request_in_flight_alone() {
+    async fn a_sweep_leaves_a_spawn_reservation_alone() {
+        let pool = PersistentPool::new(Supervisor::with_grace(Duration::from_millis(50)));
+        pool.slots
+            .lock()
+            .await
+            .insert(("a".into(), "starting".into()), starting_slot());
+
+        pool.sweep(None).await;
+
+        assert!(
+            pool.slots
+                .lock()
+                .await
+                .contains_key(&("a".to_string(), "starting".to_string())),
+            "a reservation is not a dead process"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_leaves_a_locked_reservation_alone() {
         let mut slots: HashMap<(String, String), SlotEntry> = HashMap::new();
-        let busy = empty_slot();
-        let held = busy.slot.clone().lock_owned().await;
-        slots.insert(("a".into(), "busy".into()), busy);
-        slots.insert(("a".into(), "gone".into()), empty_slot());
+        let busy_slot = SlotCell::starting();
+        let held = busy_slot.state.lock().await;
+        slots.insert(
+            ("a".into(), "busy".into()),
+            SlotEntry {
+                slot: busy_slot.clone(),
+                last_used: Instant::now(),
+            },
+        );
+        slots.insert(("a".into(), "gone".into()), stopped_slot());
 
         let reaped = reap_dead(&mut slots);
 
@@ -1146,8 +1589,38 @@ mode = "persistent"
         assert_eq!(reaped[0].0, ("a".to_string(), "gone".to_string()));
         assert!(
             slots.contains_key(&("a".to_string(), "busy".to_string())),
-            "a locked slot is answering something — removing it would strand the instance"
+            "a locked reservation is owned by a dispatcher — removing it would strand the slot"
         );
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn forgetting_an_old_slot_does_not_remove_its_replacement() {
+        let pool = PersistentPool::new(Supervisor::with_grace(Duration::from_millis(50)));
+        let old_slot = SlotCell::starting();
+        let new_slot = SlotCell::starting();
+        let map_key = ("agent".to_string(), "key".to_string());
+
+        pool.slots.lock().await.insert(
+            map_key.clone(),
+            SlotEntry {
+                slot: new_slot.clone(),
+                last_used: Instant::now(),
+            },
+        );
+
+        pool.forget_slot("agent", "key", &old_slot).await;
+        {
+            let slots = pool.slots.lock().await;
+            assert!(
+                slots
+                    .get(&map_key)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.slot, &new_slot)),
+                "a late request from the old slot must not remove its replacement"
+            );
+        }
+
+        pool.forget_slot("agent", "key", &new_slot).await;
+        assert!(pool.slots.lock().await.is_empty());
     }
 }

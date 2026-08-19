@@ -225,8 +225,15 @@ stdout carries protocol only. All logging goes to stderr, so `RUST_LOG=debug dot
 Enabling an MCP client to reach dotagent means that client can run any installed agent. That is the point, and it is also the whole blast radius — worth stating plainly:
 
 - Over stdio the server inherits the trust of whatever spawned it. A local MCP client already runs as you.
-- There is no network listener. No port, no auth to configure, nothing reachable from another machine.
+- The `dotagent mcp` subcommand itself uses stdio only. It does not open a port
+  or provide a TCP/HTTP endpoint, and nothing from this MCP transport is
+  reachable from another machine.
 - The catalog is the boundary. An agent that is not installed cannot be run, and arguments never reach a shell.
+
+This statement is scoped to the MCP subcommand. A daemon may separately expose
+the user-local Unix-socket [Local Client API](local-api.md) at
+`$DOTAGENT_HOME/api.sock`; that API is not an MCP transport and has its own
+limits and threat model.
 
 See the [threat model](../security/threat-model.md).
 
@@ -248,5 +255,6 @@ A malformed manifest anywhere in the search path fails discovery, and `tools/lis
 ## See also
 
 - [Triggers](../concepts/triggers.md) — the general concept
+- [Local Client API](local-api.md) — the daemon's Unix-socket trigger transport
 - [Telegram](../concepts/telegram.md) — a chat front end built on this
 - [CLI](cli.md#mcp)

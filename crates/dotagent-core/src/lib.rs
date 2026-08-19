@@ -4,6 +4,7 @@
 //! defined here. Keeping it tiny and IO-free is intentional: deserialization,
 //! validation, and shape-of-data lives here, side effects live elsewhere.
 
+pub mod assistant;
 pub mod audit;
 pub mod command;
 pub mod config;
@@ -15,9 +16,11 @@ pub mod manifest;
 pub mod power;
 pub mod security;
 pub mod skill;
+pub mod slug;
 pub mod state;
 pub mod trigger;
 
+pub use assistant::{AssistantEvent, ASSISTANT_PROTOCOL_V1};
 pub use audit::{AuditEntry, AuditEvent, Severity, GENESIS_HASH};
 pub use command::{CommandManifest, COMMAND_EXT, NAMESPACE_SEP};
 pub use config::{

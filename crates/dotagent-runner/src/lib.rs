@@ -10,8 +10,10 @@ pub mod notifiers;
 pub mod persistent;
 pub mod protocol;
 
+use std::collections::VecDeque;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Local;
@@ -21,11 +23,30 @@ use dotagent_state::{slug_from_args, AuditLog, StateStore};
 use dotagent_supervisor::{ProcessKind, ProcessOwner, SpawnSpec, Supervisor, SupervisorError};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 use tokio::process::Command;
 use tracing::{info, warn};
 
 pub type Result<T> = std::result::Result<T, RunnerError>;
+
+/// Metadata for a persistent request whose delivery became ambiguous after
+/// crossing the process boundary.
+#[derive(Debug, Clone, Error)]
+#[error("persistent request may have been delivered; not retrying: {reason}")]
+pub struct RequestLost {
+    pub reason: String,
+    /// Elapsed wall-clock time measured by the exchange before it was lost.
+    pub duration_seconds: i64,
+}
+
+impl RequestLost {
+    pub(crate) fn new(reason: impl Into<String>, elapsed: Duration) -> Self {
+        Self {
+            reason: reason.into(),
+            duration_seconds: elapsed.as_secs() as i64,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RunnerError {
@@ -33,8 +54,12 @@ pub enum RunnerError {
     Io(#[from] std::io::Error),
     #[error("state: {0}")]
     State(#[from] dotagent_state::StateError),
+    #[error("audit: {0}")]
+    Audit(#[from] dotagent_state::AuditError),
     #[error("spawn failed: {0}")]
     Spawn(String),
+    #[error("{0}")]
+    RequestLost(#[source] RequestLost),
 }
 
 /// Outcome of a single agent run.
@@ -90,6 +115,39 @@ impl RunSpec<'_> {
     }
 }
 
+/// Callback invoked once per line of agent stdout, as the line is read from
+/// the pipe — while the process may still be running.
+///
+/// The runner owns no protocol here: it forwards the raw line (without its
+/// trailing newline) and nothing else. Callers that need to ship lines to a
+/// client should `try_send` into their own channel and drop on a full
+/// channel.
+///
+/// Contract:
+/// - **synchronous and fast**: called from the stdout reader task, so a slow
+///   callback delays tail capture and log tee for the whole run;
+/// - **must not panic**: a panic unwinds through the reader task and the run
+///   loses every stdout line after it;
+/// - errors the caller wants to handle (closed channel, slow consumer) are
+///   the caller's business — the runner ignores whatever happens inside.
+pub type StdoutLineTap = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Real-time streaming taps for a run.
+///
+/// Lives beside [`RunSpec`] instead of inside it only because every caller
+/// in `crates/dotagent` builds `RunSpec` with a struct literal — a new
+/// required field would break them all. A default `StreamOptions` behaves
+/// exactly like the buffered runner that came before streaming.
+///
+/// Persistent agents (response-frame protocol, see `protocol.rs`) do not
+/// honor taps yet — their output is not a plain stream. Taps apply to
+/// one-shot runs.
+#[derive(Clone, Default)]
+pub struct StreamOptions {
+    /// Tap for each stdout line, in arrival order.
+    pub on_stdout_line: Option<StdoutLineTap>,
+}
+
 // stdout_tail is consumed by:
 // - sink plugins (need the full Roam-formatted output — root + children)
 // - notify plugins (need a short summary)
@@ -142,6 +200,15 @@ pub async fn run_with_hooks(
     spec: RunSpec<'_>,
     ctx: &RunContext<'_>,
 ) -> Result<OrchestratedOutcome> {
+    run_with_hooks_streaming(spec, StreamOptions::default(), ctx).await
+}
+
+/// [`run_with_hooks`] with real-time stdout taps. See [`StreamOptions`].
+pub async fn run_with_hooks_streaming(
+    spec: RunSpec<'_>,
+    stream: StreamOptions,
+    ctx: &RunContext<'_>,
+) -> Result<OrchestratedOutcome> {
     // Hold on to references that outlive the `spec` move into `run()` below.
     let manifest_ref: &AgentManifest = spec.manifest;
     let schedule_id = spec.schedule_id.to_string();
@@ -187,25 +254,44 @@ pub async fn run_with_hooks(
     //    request to a process that is already up; everything else spawns.
     //    `dry_run` always takes the one-shot path — a dry run must not leave a
     //    live process behind, and there is nothing to deliver anyway.
-    let outcome = match ctx.persistent {
+    //    Persistent dispatch ignores `stream`: its output arrives as framed
+    //    responses, not as a plain stdout stream.
+    let run_result = match ctx.persistent {
         Some(pool) if manifest_ref.lifecycle.is_persistent() && !spec.dry_run => {
-            pool.dispatch(&spec, ctx.state, ctx.audit).await?
+            pool.dispatch(&spec, ctx.state, ctx.audit).await
         }
-        _ => run(spec, ctx.state, ctx.supervisor).await?,
+        _ => run_streaming(spec, stream, ctx.state, ctx.supervisor).await,
+    };
+
+    let outcome = match run_result {
+        Ok(outcome) => outcome,
+        Err(RunnerError::RequestLost(lost)) => {
+            append_agent_run_audit(
+                ctx.audit,
+                &manifest_ref.agent.name,
+                &schedule_id,
+                &args_slug,
+                &manifest_sha256,
+                persistent::REQUEST_LOST_EXIT_CODE,
+                lost.duration_seconds,
+                false,
+            );
+            return Err(RunnerError::RequestLost(lost));
+        }
+        Err(error) => return Err(error),
     };
 
     // 3) Audit
-    if let Some(log) = ctx.audit {
-        let _ = log.append(AuditEvent::AgentRun {
-            agent: manifest_ref.agent.name.clone(),
-            schedule: schedule_id.clone(),
-            slug: args_slug,
-            manifest_sha256,
-            exit_code: outcome.exit_code,
-            duration_seconds: outcome.duration_seconds,
-            timed_out: outcome.timed_out,
-        });
-    }
+    append_agent_run_audit(
+        ctx.audit,
+        &manifest_ref.agent.name,
+        &schedule_id,
+        &args_slug,
+        &manifest_sha256,
+        outcome.exit_code,
+        outcome.duration_seconds,
+        outcome.timed_out,
+    );
 
     // 4) on_success / on_failure (legacy plugin hooks) + built-in notifiers
     let (event, message) = if outcome.exit_code == 0 {
@@ -257,15 +343,59 @@ pub async fn run_with_hooks(
     Ok(OrchestratedOutcome::Ran(outcome))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn append_agent_run_audit(
+    audit: Option<&AuditLog>,
+    agent: &str,
+    schedule: &str,
+    slug: &str,
+    manifest_sha256: &str,
+    exit_code: i32,
+    duration_seconds: i64,
+    timed_out: bool,
+) {
+    let Some(log) = audit else { return };
+    if let Err(error) = log.append(AuditEvent::AgentRun {
+        agent: agent.to_string(),
+        schedule: schedule.to_string(),
+        slug: slug.to_string(),
+        manifest_sha256: manifest_sha256.to_string(),
+        exit_code,
+        duration_seconds,
+        timed_out,
+    }) {
+        warn!(
+            agent,
+            schedule,
+            slug,
+            exit_code,
+            duration_seconds,
+            timed_out,
+            error = %error,
+            "could not append agent_run audit event"
+        );
+    }
+}
+
 /// Run the agent with timeout, stdio capture, heartbeat lifecycle. Returns the
 /// outcome — the caller is responsible for deciding what notifications to
 /// emit.
 ///
 /// When `supervisor` is `None`, a one-shot supervisor is created for this
 /// call. Pass the daemon's singleton to make the agent visible in
-/// `dotagent status`/`doctor` and to share the kill-on-shutdown machinery.
+/// `dotagent status`/`doctor` and share the kill-on-shutdown machinery.
 pub async fn run(
     spec: RunSpec<'_>,
+    state: &StateStore,
+    supervisor: Option<&Supervisor>,
+) -> Result<RunOutcome> {
+    run_streaming(spec, StreamOptions::default(), state, supervisor).await
+}
+
+/// [`run`] with real-time stdout taps. See [`StreamOptions`].
+pub async fn run_streaming(
+    spec: RunSpec<'_>,
+    stream: StreamOptions,
     state: &StateStore,
     supervisor: Option<&Supervisor>,
 ) -> Result<RunOutcome> {
@@ -336,7 +466,7 @@ pub async fn run(
         .spawn_supervised(cmd, spawn_spec)
         .await
         .map_err(|e| RunnerError::Spawn(e.to_string()))?;
-    let mut stdout = handle.take_stdout().expect("piped stdout");
+    let stdout = handle.take_stdout().expect("piped stdout");
     let mut stderr = handle.take_stderr().expect("piped stderr");
 
     // Per-agent log file: tee everything stdout+stderr writes into
@@ -365,18 +495,47 @@ pub async fn run(
             slug
         );
     }
-    let log_for_stdout = log_file.as_ref().and_then(|f| f.try_clone().ok());
+    let mut log_for_stdout = log_file.as_ref().and_then(|f| f.try_clone().ok());
     let log_for_stderr = log_file;
 
     // Drain stdio in background tasks so the OS pipe buffer never fills up.
+    //
+    // Stdout is read line by line so a tap (if any) sees each line as it
+    // arrives instead of after exit. Retention is a ring buffer of the last
+    // TAIL_LINES lines plus a counter: the log tee above already persists
+    // everything to disk, so memory stays bounded no matter how chatty the
+    // agent is. (This is strictly better than the `read_to_string` it
+    // replaced, which held the entire stream in memory only to truncate it
+    // later.) Timeout semantics are untouched: the deadline and kill-tree
+    // live in the supervisor; this loop simply ends when the pipe closes.
+    let tap = stream.on_stdout_line;
     let stdout_task = tokio::spawn(async move {
-        let mut buf = String::new();
-        let _ = stdout.read_to_string(&mut buf).await;
-        if let Some(mut f) = log_for_stdout {
-            use std::io::Write;
-            let _ = f.write_all(buf.as_bytes());
+        let mut tail: VecDeque<String> = VecDeque::with_capacity(TAIL_LINES);
+        let mut total: usize = 0;
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        loop {
+            let line = match lines.next_line().await {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                Err(e) => {
+                    warn!(error = %e, "agent stdout read failed mid-run");
+                    break;
+                }
+            };
+            if let Some(f) = log_for_stdout.as_mut() {
+                use std::io::Write;
+                let _ = writeln!(f, "{line}");
+            }
+            if let Some(tap) = tap.as_ref() {
+                tap(&line);
+            }
+            if tail.len() == TAIL_LINES {
+                tail.pop_front();
+            }
+            tail.push_back(line);
+            total += 1;
         }
-        buf
+        (tail, total)
     });
     let stderr_task = tokio::spawn(async move {
         let mut buf = String::new();
@@ -395,7 +554,8 @@ pub async fn run(
         Err(e) => return Err(RunnerError::Spawn(e.to_string())),
     };
 
-    let stdout_buf = stdout_task.await.unwrap_or_default();
+    let (stdout_lines, stdout_total): (VecDeque<String>, usize) =
+        stdout_task.await.unwrap_or_default();
     let stderr_buf = stderr_task.await.unwrap_or_default();
 
     let finish = Local::now();
@@ -410,7 +570,11 @@ pub async fn run(
         finish_heartbeat(state, &name, &slug, spec.args, &start, &finish, exit_code)?;
     }
 
-    let (stdout_tail, stdout_truncated_lines) = tail_lines(&stdout_buf, TAIL_LINES);
+    // Same shape the old `tail_lines` produced: last TAIL_LINES lines joined
+    // by `\n` (a trailing newline in the stream does not survive), and how
+    // many lines were dropped.
+    let stdout_tail = stdout_lines.into_iter().collect::<Vec<_>>().join("\n");
+    let stdout_truncated_lines = stdout_total.saturating_sub(TAIL_LINES);
     let (stderr_tail, stderr_truncated_lines) = tail_lines(&stderr_buf, TAIL_LINES);
     Ok(RunOutcome {
         exit_code,
@@ -545,6 +709,7 @@ fn apply_env_for(
     if !inherit {
         cmd.env_clear();
     }
+    remove_inherited_trigger_env(cmd);
     // Skipped entirely when the manifest names any locale variable: `LC_CTYPE`
     // outranks `LANG`, so merely writing this first would not let a manifest
     // that says `LANG = "pt_BR.UTF-8"` win — it would silently lose the one
@@ -588,6 +753,21 @@ fn apply_env_for(
     }
     let argv_json = serde_json::to_string(spec.args).unwrap_or_else(|_| "[]".into());
     cmd.env("AGENT_ARGV", argv_json);
+}
+
+fn remove_inherited_trigger_env(cmd: &mut Command) {
+    remove_trigger_env(cmd, std::env::vars_os());
+}
+
+fn remove_trigger_env<I>(cmd: &mut Command, vars: I)
+where
+    I: IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    for (key, _) in vars {
+        if key.to_str().is_some_and(protocol::is_trigger_env) {
+            cmd.env_remove(key);
+        }
+    }
 }
 
 /// The locale to fall back to when the parent process names none.
@@ -724,6 +904,15 @@ command = "true"
             .into_iter()
             .find(|(k, _)| k == key)
             .map(|(_, v)| v)
+    }
+
+    fn env_change(cmd: &Command, key: &str) -> Option<Option<String>> {
+        cmd.as_std().get_envs().find_map(|(name, value)| {
+            if name.to_str()? != key {
+                return None;
+            }
+            Some(value.map(|value| value.to_string_lossy().into_owned()))
+        })
     }
 
     // --- locale: the `C` locale mangles every non-ASCII byte we inject ---
@@ -948,7 +1137,11 @@ LANG = "pt_BR.UTF-8"
     #[test]
     fn extra_env_reaches_the_command() {
         let m = minimal();
-        let extra = vec![("AGENT_TRIGGER_SOURCE".to_string(), "telegram".to_string())];
+        let extra = vec![
+            ("AGENT_TRIGGER_PAYLOAD".to_string(), "payload".to_string()),
+            ("AGENT_TRIGGER_SOURCE".to_string(), "telegram".to_string()),
+            ("AGENT_SESSION_ID".to_string(), "session".to_string()),
+        ];
         let spec = spec_with(&m, &[], None, &extra);
         let mut cmd = Command::new("true");
         apply_env(
@@ -961,9 +1154,49 @@ LANG = "pt_BR.UTF-8"
             Path::new("/tmp/hb.json"),
         );
         assert_eq!(
+            lookup(&cmd, "AGENT_TRIGGER_PAYLOAD").as_deref(),
+            Some("payload")
+        );
+        assert_eq!(
             lookup(&cmd, "AGENT_TRIGGER_SOURCE").as_deref(),
             Some("telegram")
         );
+        assert_eq!(lookup(&cmd, "AGENT_SESSION_ID").as_deref(), Some("session"));
+    }
+
+    #[test]
+    fn inherited_trigger_env_is_removed_without_touching_other_agent_env() {
+        let mut cmd = Command::new("true");
+        let inherited = [
+            ("AGENT_TRIGGER_PAYLOAD", "parent payload"),
+            ("AGENT_TRIGGER_SOURCE", "parent source"),
+            ("AGENT_SESSION_ID", "parent session"),
+            ("AGENT_NAME", "parent name"),
+        ];
+        for &(key, value) in &inherited {
+            cmd.env(key, value);
+        }
+
+        remove_trigger_env(
+            &mut cmd,
+            inherited
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into())),
+        );
+
+        assert_eq!(env_change(&cmd, "AGENT_TRIGGER_PAYLOAD"), Some(None));
+        assert_eq!(env_change(&cmd, "AGENT_TRIGGER_SOURCE"), Some(None));
+        assert_eq!(env_change(&cmd, "AGENT_SESSION_ID"), Some(None));
+        assert_eq!(
+            env_change(&cmd, "AGENT_NAME"),
+            Some(Some("parent name".to_string()))
+        );
+    }
+
+    #[test]
+    fn audit_errors_convert_to_runner_errors() {
+        let error = RunnerError::from(dotagent_state::AuditError::NoHome);
+        assert_eq!(error.to_string(), "audit: no home directory");
     }
 
     #[test]
