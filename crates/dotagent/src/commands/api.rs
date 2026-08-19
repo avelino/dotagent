@@ -16,12 +16,12 @@ const MAX_FRAME_BYTES: usize = 64 * 1024;
 
 /// Resolve the local API socket, honoring an explicit path before the shared
 /// dotagent home layout.
-pub(crate) fn resolve_socket_path(socket: Option<PathBuf>) -> PathBuf {
-    socket.unwrap_or_else(|| dotagent_state::paths::home().join("api.sock"))
+pub(crate) fn resolve_socket_path(socket: Option<String>) -> PathBuf {
+    socket.map(PathBuf::from).unwrap_or_else(|| dotagent_state::paths::home().join("api.sock"))
 }
 
 /// Bridge raw JSONL between stdin/stdout and the daemon's Unix socket.
-pub async fn run(socket: Option<PathBuf>) -> Result<()> {
+pub async fn run(socket: Option<String>) -> Result<()> {
     let socket_path = resolve_socket_path(socket);
     let stream = UnixStream::connect(&socket_path)
         .await
@@ -148,7 +148,10 @@ mod tests {
     #[test]
     fn explicit_socket_path_wins() {
         let path = PathBuf::from("/tmp/dotagent-test-api.sock");
-        assert_eq!(resolve_socket_path(Some(path.clone())), path);
+        assert_eq!(
+            resolve_socket_path(Some(path.to_string_lossy().into_owned())),
+            path
+        );
     }
 
     #[tokio::test]

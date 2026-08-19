@@ -4,7 +4,7 @@
 //! orchestration logic for `tick`, `status`, `daily-summary`, `run`, etc.
 //! lives in `commands/`.
 
-use std::{io::IsTerminal, path::PathBuf};
+use std::io::IsTerminal;
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
@@ -58,7 +58,7 @@ enum Command {
     Api {
         /// Unix socket path (default: `$DOTAGENT_HOME/api.sock`).
         #[arg(long)]
-        socket: Option<PathBuf>,
+        socket: Option<String>,
     },
 
     /// Print a textual health dashboard.
