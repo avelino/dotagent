@@ -1,0 +1,30 @@
+# follow-up-sweeper — the secretary's memory for what's due.
+#
+# A few times a day: scan memory TODOs for due/overdue items and ping once
+# per item per day (dedup file under state). No items due = silent exit 0.
+# The item itself is not marked done here — that's the consolidation pass
+# or a chat reply ("já fiz isso") upstream.
+
+[agent]
+name = "follow-up-sweeper"
+description = "Cobra pendências vencidas da memória, uma vez por dia por item."
+timeout_seconds = 120
+
+[run]
+command = "fish"
+args = ["/Users/avelino/dotfiles/modules/home-manager/dotagent/agents/follow-up-sweeper/agent.fish"]
+
+[defaults]
+max_retries = 1
+retry_backoff_minutes = [15]
+
+[[schedules]]
+id = "three-a-day"
+type = "interval"
+interval_minutes = 288
+
+[[notifiers]]
+driver = "telegram"
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+chat_id = "2813445"
+events = ["success", "given_up"]

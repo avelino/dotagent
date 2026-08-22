@@ -17,12 +17,15 @@ use dotagent_supervisor::Supervisor;
 use dotagent_unit_gen::GenContext;
 
 pub mod api;
+pub mod assistant_harness;
 pub mod audit;
 pub mod completions;
 pub mod daemon;
 pub mod daily_summary;
 pub mod list_agents;
 pub mod mcp;
+pub mod memory;
+pub mod memory_capture;
 pub mod output;
 pub mod status;
 pub mod utility;

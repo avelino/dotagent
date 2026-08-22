@@ -12,6 +12,7 @@ description = "Long-term memory for dotagent agents, stored in an embedded outl 
 [dependencies]
 outl-ws.workspace = true
 outl-actions.workspace = true
+outl-core.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 

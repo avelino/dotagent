@@ -650,6 +650,7 @@ dependencies = [
  "clap",
  "clap_complete",
  "dirs",
+ "dotagent-assistant",
  "dotagent-core",
  "dotagent-mcp",
  "dotagent-memory",
@@ -670,6 +671,20 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "dotagent-assistant"
+version = "0.5.0"
+dependencies = [
+ "chrono",
+ "dotagent-core",
+ "dotagent-memory",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -699,6 +714,7 @@ version = "0.5.0"
 dependencies = [
  "chrono",
  "outl-actions",
+ "outl-core",
  "outl-ws",
  "tempfile",
  "thiserror 2.0.18",

@@ -162,10 +162,67 @@ enum Command {
         shell: Shell,
     },
 
+    /// Read and curate the long-term memory workspace.
+    ///
+    /// The same store `dotagent mcp` exposes to agents, reachable without a
+    /// running daemon — so a consolidation pass can be a plain scheduled
+    /// agent instead of logic buried in the daemon.
+    ///
+    /// Examples:
+    ///   dotagent memory recall "databricks"
+    ///   dotagent memory recall --topic dotagent
+    ///   dotagent memory forget 01M0JRSXB6RAFTCJE1MENB5P5D
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
+
     /// (internal) Print discovered agent names, one per line. Used by the
     /// completion scripts emitted by `dotagent completions`.
     #[command(name = "_list-agents", hide = true)]
     ListAgents,
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCommand {
+    /// Search stored facts, best match first.
+    ///
+    /// Ranks by shared words, then recency. An empty query lists the most
+    /// recent facts. Each line starts with the id `forget` and `supersede`
+    /// take.
+    Recall {
+        /// What to search for. Omit to list recent facts.
+        #[arg(default_value = "")]
+        query: String,
+        /// Ask the graph instead: every fact linked to this subject.
+        #[arg(long, conflicts_with = "query")]
+        topic: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Emit JSON lines instead of the human-readable form.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Store a fact.
+    Remember {
+        text: String,
+        /// Subjects this fact belongs to. Repeatable.
+        #[arg(long = "topic")]
+        topics: Vec<String>,
+    },
+    /// Replace a fact with a corrected one, keeping the old one readable.
+    Supersede {
+        id: String,
+        text: String,
+        #[arg(long = "topic")]
+        topics: Vec<String>,
+    },
+    /// Delete a fact for good.
+    Forget { id: String },
+    /// List the subjects memory knows about.
+    Topics,
+    /// Report what the store holds: facts, topics, retired facts.
+    Stats,
 }
 
 #[derive(Subcommand, Debug)]
@@ -272,6 +329,21 @@ async fn main() -> Result<()> {
             commands::utility::run_now(name, schedule, format).await
         }
         Command::Mcp => commands::mcp::run().await,
+        Command::Memory { command } => match command {
+            MemoryCommand::Recall {
+                query,
+                topic,
+                limit,
+                json,
+            } => commands::memory::recall(&query, topic.as_deref(), limit, json),
+            MemoryCommand::Remember { text, topics } => commands::memory::remember(&text, &topics),
+            MemoryCommand::Supersede { id, text, topics } => {
+                commands::memory::supersede(&id, &text, &topics)
+            }
+            MemoryCommand::Forget { id } => commands::memory::forget(&id),
+            MemoryCommand::Topics => commands::memory::topics(),
+            MemoryCommand::Stats => commands::memory::stats(),
+        },
         Command::Completions { shell } => {
             let mut cmd = Cli::command();
             commands::completions::print(shell, &mut cmd);

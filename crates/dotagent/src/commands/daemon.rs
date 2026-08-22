@@ -45,10 +45,11 @@ use tokio::sync::{watch, Notify};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+use crate::commands::assistant_harness;
 use crate::discovery::{self, DiscoveredAgent};
 use crate::gateway::{
-    GatewayConfig, GatewayRunner, ReplySink, RunFuture, SubmitRejected, TelegramSink,
-    TriggerGateway,
+    AssistantSessionFrame, FinalizeFuture, GatewayConfig, GatewayRunner, ReplySink, RunFuture,
+    SubmitRejected, TelegramSink, TriggerGateway,
 };
 use crate::local_api::protocol::{error_code, MessageSendParams, ServerEvent};
 use crate::local_api::server::{EventSendError, EventTx, LocalApiHandler, PeerInfo, ResponseHook};
@@ -222,6 +223,7 @@ pub(crate) async fn run_triggered_streaming(
     audit: &AuditLog,
     plugins: &PluginClient,
     pool: Option<&PersistentPool>,
+    harness_env: Vec<(String, String)>,
 ) -> Result<OrchestratedOutcome> {
     let agent = discovery::find_by_name(&req.agent)
         .with_context(|| format!("trigger names unknown agent '{}'", req.agent))?;
@@ -240,7 +242,10 @@ pub(crate) async fn run_triggered_streaming(
 
     let manifest_sha256 = hash_manifest_file(&agent.dir.join("agent.toml")).ok();
     let slug = req.slug();
-    let extra_env = trigger_env(req);
+    let mut extra_env = trigger_env(req);
+    // Harness env comes after the trigger block: the AGENT_ASSISTANT_* vars
+    // are additive and must not be overridable by the trigger payload.
+    extra_env.extend(harness_env);
 
     info!(
         agent = %agent.manifest.agent.name,
@@ -302,13 +307,70 @@ impl GatewayRunner for GatewayRunnerAdapter {
             .unwrap_or(false)
     }
 
+    fn assistant_harness_env(&self, req: &TriggerRequest) -> Vec<(String, String)> {
+        let Ok(agent) = discovery::find_by_name(&req.agent) else {
+            return Vec::new();
+        };
+        if !assistant_harness::enabled(&agent.manifest) {
+            return Vec::new();
+        }
+        assistant_harness::harness_env(
+            &agent.manifest,
+            req,
+            &assistant_harness::HarnessDirs::from_defaults(),
+        )
+    }
+
+    fn assistant_finalize<'a>(
+        &'a self,
+        req: &'a TriggerRequest,
+        reply: String,
+        session: Option<AssistantSessionFrame>,
+    ) -> FinalizeFuture<'a> {
+        Box::pin(async move {
+            let Ok(agent) = discovery::find_by_name(&req.agent) else {
+                return reply;
+            };
+            let dirs = assistant_harness::HarnessDirs::from_defaults();
+            let outcome = assistant_harness::finalize(&agent.manifest, req, reply, session, &dirs);
+            if !outcome.memos.is_empty() {
+                // Off the reply path: the chat must not wait on the outl
+                // write, and a failed flush must not cost the turn.
+                let root = dirs.memory_root;
+                let memos = outcome.memos;
+                let provenance = outcome.provenance;
+                tokio::task::spawn_blocking(move || {
+                    let written = dotagent_assistant::flush_memos(&root, &memos, &provenance);
+                    if written < memos.len() {
+                        tracing::warn!(
+                            written,
+                            total = memos.len(),
+                            "assistant harness: some captured memos were not persisted"
+                        );
+                    }
+                });
+            }
+            outcome.reply
+        })
+    }
+
     fn run_trigger(&self, req: TriggerRequest, stream: StreamOptions) -> RunFuture {
         let state = self.state.clone();
         let audit = self.audit.clone();
         let plugins = self.plugins.clone();
         let pool = self.pool.clone();
+        let harness_env = self.assistant_harness_env(&req);
         Box::pin(async move {
-            run_triggered_streaming(&req, stream, &state, &audit, &plugins, Some(&pool)).await
+            run_triggered_streaming(
+                &req,
+                stream,
+                &state,
+                &audit,
+                &plugins,
+                Some(&pool),
+                harness_env,
+            )
+            .await
         })
     }
 }
@@ -2065,6 +2127,22 @@ async fn dispatch_one(
         dotagent_runner::OrchestratedOutcome::Ran(ref ro) => {
             window.last_attempt_exit_code = Some(ro.exit_code);
             window.last_attempt_stderr = Some(ro.stderr_tail.clone());
+
+            // What the run learned outlives it, when the manifest asked for
+            // that. Off the run's critical path: the exit code is already
+            // decided, and a memory write must not change it.
+            let memos = crate::commands::memory_capture::capture(
+                &agent.manifest,
+                &ro.stdout_tail,
+                ro.exit_code,
+            );
+            if !memos.is_empty() {
+                let root = dotagent_state::paths::memory_workspace_dir();
+                let name = agent.manifest.agent.name.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::commands::memory_capture::flush(&root, &name, &memos);
+                });
+            }
 
             if ro.exit_code == 0 && attempts_before > 0 {
                 // recovered after at least one failure

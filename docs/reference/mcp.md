@@ -61,20 +61,30 @@ subprocess.
 
 ## Memory tools
 
-Three more tools sit beside the agent catalog when `[memory]` is enabled
+Five more tools sit beside the agent catalog when `[memory]` is enabled
 (the default). They are served in-process — nothing is spawned:
 
 | Tool | Arguments | Behavior |
 |---|---|---|
-| `memory-remember` | `text`, `topics[]` | Store a durable fact, linked to its topics. |
-| `memory-recall` | `query` or `topic` | Search text, or return everything linked to a topic. |
+| `memory-remember` | `text`, `topics[]` | Store a durable fact, linked to its topics. Restating a fact already stored reinforces it instead of duplicating it. |
+| `memory-recall` | `query` or `topic`, `limit` | Rank facts by shared words then recency, or return everything linked to a topic. Each result leads with its id. |
 | `memory-topics` | — | List the subjects memory knows about. |
+| `memory-supersede` | `id`, `text`, `topics[]` | Replace a fact that stopped being true. The old one stays readable, stops being recalled. |
+| `memory-forget` | `id` | Delete a fact outright. |
+
+The ids in `memory-recall` output are what `memory-supersede` and
+`memory-forget` take — a model that finds a wrong fact can fix it in the next
+call instead of asking which one.
 
 Facts live in an [outl](https://github.com/avelino/outl) workspace you can open
 and edit. See [Memory](../concepts/memory.md) for what belongs in it and why
-recall is substring rather than semantic.
+ranking is lexical rather than semantic.
 
-Turn them off with `[memory] enabled = false`.
+The same verbs are available from a shell as
+[`dotagent memory`](cli.md#memory) — no daemon required, which is what lets a
+consolidation pass be an ordinary scheduled agent.
+
+Turn them off with `[memory] enabled = false` in `config.toml`.
 
 ## Remediation tools
 

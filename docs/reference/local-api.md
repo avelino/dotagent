@@ -274,10 +274,20 @@ The agent emits one JSON object per stdout line:
 ```
 
 The `delta` and `reply` fields are the assistant-v1 contract. `session` is
-optional bookkeeping supplied by the agent. The daemon ignores `session` for
-conversation ownership and persistence; it only uses `reply` when shaping the
-final delivery, while forwarding every raw stdout line as `reply.delta` to a
-local client.
+optional bookkeeping supplied by the agent. By default the daemon ignores
+`session` for conversation ownership and persistence; it only uses `reply`
+when shaping the final delivery, while forwarding every raw stdout line as
+`reply.delta` to a local client.
+
+When the manifest also declares `[assistant]`, the daemon stops ignoring
+`session`: the frame's `claude_session` pointer and `transcript_bytes` are
+recorded in the conversation registry (pointers, never transcript content),
+and the next trigger for the same session receives the pointer back as
+`AGENT_ASSISTANT_SESSION`. A `transcript_bytes` past the configured ceiling
+retires the pointer — the next trigger starts a fresh session. Trailing
+`MEMO:` capture lines are stripped from the delivered reply and flushed to
+the memory workspace. See
+[agent-spec](agent-spec.md#assistant-conversational-harness-opt-in).
 
 `assistant-v1` is the only currently supported value for `[run].protocol`.
 Unknown values are rejected while loading the manifest. The protocol does not

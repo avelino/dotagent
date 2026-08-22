@@ -14,6 +14,7 @@ members = [
   "crates/dotagent-supervisor",
   "crates/dotagent-telemetry",
   "crates/dotagent-unit-gen",
+  "crates/dotagent-assistant",
   "plugins/preflight-warp",
   "plugins/preflight-cmd",
   "plugins/sink-roam",
@@ -46,6 +47,7 @@ dotagent-secrets = { path = "crates/dotagent-secrets", version = "0.5.0" }
 dotagent-supervisor = { path = "crates/dotagent-supervisor", version = "0.5.0" }
 dotagent-telemetry = { path = "crates/dotagent-telemetry", version = "0.5.0" }
 dotagent-unit-gen = { path = "crates/dotagent-unit-gen", version = "0.5.0" }
+dotagent-assistant = { path = "crates/dotagent-assistant", version = "0.5.0" }
 
 # Async runtime
 tokio = { version = "1", features = [
@@ -110,9 +112,12 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 
 # outl, embedded as the memory backend. Beta line: the whole outl
-# workspace shares one version, so these two must move together.
+# workspace shares one version, so these three must move together.
+# outl-core comes in for `NodeId` and `PropValue`: memory addresses a fact by
+# its block id and stores provenance as block properties.
 outl-ws = "0.11.0-beta"
 outl-actions = "0.11.0-beta"
+outl-core = "0.11.0-beta"
 
 # Filesystem
 dirs = "6"

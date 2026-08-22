@@ -155,6 +155,83 @@ Two things change meaning in this mode:
 
 Full reasoning in [Lifecycle](../concepts/lifecycle.md).
 
+### `[assistant]` — conversational harness, opt-in
+
+Absent means none of this happens — a plain triggered run, byte for byte what
+every agent did before the section existed.
+
+Present, the daemon becomes the conversation's bookkeeper **for pointers,
+never transcripts**: it records which model session served the chat, which
+toolkit it ran under and how much transcript it produced, reinjects the
+pointer on the next trigger, retires it when the transcript outgrows the
+ceiling, and captures `MEMO:` lines from replies into the memory workspace.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Master switch — disable without deleting the block. |
+| `memory` | `true` | Recall stored facts before the run (`AGENT_ASSISTANT_MEMORY`) and persist `MEMO:` capture lines after it. Restating a fact already stored reinforces it rather than duplicating it. |
+| `transcript_bytes_max` | `409600` | Retirement ceiling. A session frame reporting more bumps the generation and clears the pointer. Must be > 0. |
+| `[[assistant.toolkit.servers]]` | *(empty)* | MCP servers the conversation runs with. Empty = the agent provisions its own. |
+
+Toolkit servers are `kind = "dotagent"` (the daemon's own MCP server),
+`kind = "http"` + `url`, or `kind = "stdio"` + `command`/`args`. Names must
+be unique — two servers mapping to the same `mcp.json` key are a load error,
+not a silent last-write-wins. The assembled config lands content-addressed at
+`state/assistant/toolkit-<hash>.json` (0600); the hash doubles as the
+session-invalidation key, so adding a server starts a fresh model session on
+the next message without any agent-side state.
+
+What the agent gets out of it: the four `AGENT_ASSISTANT_*` variables
+(see [env-vars](#environment-variables-dotagent-injects)), and the guarantee
+that trailing `MEMO: <fact> | topics: a, b` lines never reach the chat —
+they are stripped after the run and flushed to memory off the reply path.
+
+Full reasoning in [Telegram](../concepts/telegram.md) and
+[Local Client API](local-api.md).
+
+### `[memory]` — memory capture for a plain agent, opt-in
+
+The `[assistant]` harness above reads `MEMO:` lines out of a conversation
+reply. This section is the same capture for every other agent: a scheduled
+run that learns something durable prints it, and the fact outlives the run
+instead of scrolling past in a log.
+
+```toml
+[memory]
+capture = true
+topics = ["ops"]
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `capture` | `true` | Scan this agent's stdout for `MEMO:` lines. Writing the section at all is the opt-in; the field exists to switch it off without deleting the topics next to it. |
+| `topics` | *(empty)* | Topics added to every fact this agent files, on top of whatever the `MEMO:` line named. |
+
+Absent means the agent's output is never read for facts. That default is
+deliberate: most agents print status, not knowledge, and a store that absorbs
+status is a store whose recall returns status.
+
+Two more rules apply, and both exist to keep the store trustworthy:
+
+- **Successful runs only.** A failing run's output is a symptom. Filing
+  "could not reach the API" as durable means recalling it as true next month,
+  long after the outage ended.
+- **The assistant harness wins.** An agent that also declares
+  `[assistant]` with `memory = true` is skipped here, so the same fact is
+  never filed through two paths.
+
+Facts captured this way record the agent's name as provenance, so
+`dotagent memory recall --json` can tell you which run put a fact there.
+
+Unlike the assistant path, the `MEMO:` line is **not** stripped from the
+output. There is no chat to keep it out of — the line is part of the agent's
+log, and seeing what it filed is how you notice it filing the wrong things.
+
+> **Not the same `[memory]` as `config.toml`.** The daemon-level section of
+> that name says *where* the workspace lives and whether memory exists at
+> all ([config reference](../guides/config-reference.md#memory)). This one
+> says whether *this agent* writes to it.
+
 ### `[run].protocol` — assistant stdout
 
 The optional `protocol` field declares the stdout shape used by an assistant
@@ -355,8 +432,24 @@ additional context, applied *before* the block above so a payload can never rede
 
 `AGENT_SESSION_ID` is not a transcript or a Claude session id. It is an opaque
 key supplied by the trigger source. The local client API validates it against
-`^[A-Za-z0-9_-]{1,64}$`; the agent remains responsible for deciding whether to
-persist conversation state under that key. See [Local Client API](local-api.md).
+`^[A-Za-z0-9_-]{1,64}$`. Whether conversation state persists under that key is
+decided by the `[assistant]` harness (below) — without it, the agent remains
+responsible. See [Local Client API](local-api.md).
+
+Agents whose manifest declares `[assistant]` additionally receive, on
+triggered runs only:
+
+| Variable                      | Value                                                              |
+|-------------------------------|--------------------------------------------------------------------|
+| `AGENT_ASSISTANT_SESSION`     | recorded model session pointer, when one is valid for the chat      |
+| `AGENT_ASSISTANT_MCP_CONFIG`  | path to the assembled, content-addressed `mcp.json`                 |
+| `AGENT_ASSISTANT_TOOLKIT_HASH`| stable identity of the toolkit (changes ⇒ fresh session)            |
+| `AGENT_ASSISTANT_MEMORY`      | bounded block of recalled facts plus the topics already in use, when `[assistant].memory` is on |
+
+Each is omitted when it has nothing to say — no pointer recorded, no toolkit
+declared, no facts stored. A typical dispatcher resumes the model session
+with `claude --resume "$AGENT_ASSISTANT_SESSION"` and attaches the toolkit
+with `--mcp-config "$AGENT_ASSISTANT_MCP_CONFIG"`.
 
 ## Heartbeat & state
 

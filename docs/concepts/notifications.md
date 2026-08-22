@@ -243,6 +243,28 @@ ntfy's title cap applies to the **raw** text, before RFC 2047 encoding, because
 encoding multiplies: a 4-byte emoji becomes 12 characters of `=XX`, and the cap
 has to bite before the encoder runs rather than after.
 
+## Empty bodies
+
+The mirror image of the size limits: too *little* body is also a rejected
+request. Telegram answers an empty `sendMessage` with `400 Bad Request:
+message text is empty`, and the drivers that accept it deliver a blank line.
+
+What dotagent does depends on why the body is empty, and the two cases pull
+in opposite directions:
+
+| Event | Empty body | Why |
+|---|---|---|
+| `success` | nothing is sent | The agent had nothing to report. A sweeper that finds no follow-ups is *working* — the run is already in `dotagent status` and in the agent's log. |
+| everything else | body synthesized as `agent/schedule: event (no output)` | The state change **is** the news. Losing a `given_up` because the process died too fast to print anything is the worst outcome available. |
+
+A skipped `success` is logged at debug level, not warn — it is the expected
+outcome for an agent that reports by exception. The decision happens before
+any driver runs, so there is no `plugin_invoked` audit entry either: nothing
+was invoked.
+
+This is a floor, not a substitute for a good message. An agent that always
+prints something useful never reaches either branch.
+
 ## Secrets and credentials
 
 Every credential-bearing field accepts `${VAR}`, resolved at send time against

@@ -63,6 +63,8 @@ crates/                  # orchestrator (workspace de crates)
   dotagent-plugin/       # PluginClient (subprocess + JSON) — goes through supervisor
   dotagent-mcp/          # JSON-RPC 2.0 + MCP wire types (agents as tools) — sem IO
   dotagent-memory/       # memória de longo prazo (outl embutido: outl-ws + outl-actions)
+                         #   lib.rs=store, record.rs=fato+procedência, score.rs=ranking puro
+  dotagent-assistant/    # harness conversacional: conversation registry, memory hooks, toolkit provisioning
   dotagent-secrets/      # loader de secrets.env (crate própria pra evitar ciclo core → notify)
   dotagent-supervisor/   # subprocess lifecycle: deadlines, kill-tree (POSIX pgroup), live registry
   dotagent-telemetry/    # tracing + JSON file rotation + OTLP export + retention
@@ -104,7 +106,10 @@ docs/
 | Ingress (receber evento externo) | `dotagent-notify/src/<source>_inbound.rs` (transporte) + política no daemon |
 | Local client API / trigger gateway | `dotagent/src/local_api/` (UDS + JSON lines) + `dotagent/src/gateway/` (admission, FIFO, cap, delivery) |
 | Tipo do protocolo MCP | `dotagent-mcp/src/lib.rs` + `docs/reference/mcp.md` |
-| Memória de agent (outl) | `dotagent-memory/src/lib.rs` + `docs/concepts/memory.md` |
+| Memória de agent (outl) | `dotagent-memory/src/lib.rs` (store) + `record.rs` (shape do fato + props) + `score.rs` (ranking, **puro**) + `docs/concepts/memory.md` |
+| Captura de `MEMO:` de agent comum (`[memory]` no manifest) | `dotagent-core/src/manifest.rs` (schema) + `dotagent/src/commands/memory_capture.rs` + wiring em `daemon.rs` + `docs/reference/agent-spec.md` |
+| Verbos de memória na CLI (`dotagent memory`) | `dotagent/src/commands/memory.rs` + `docs/reference/cli.md` |
+| Harness conversacional (`[assistant]`: registry de ponteiros, MEMO capture, toolkit) | `dotagent-assistant/src/*` + wiring em `dotagent/src/commands/assistant_harness.rs` + `docs/reference/agent-spec.md` (seção `[assistant]`) |
 | Modo de vida do processo (`[lifecycle]`) | `dotagent-core/src/lifecycle.rs` (schema) + `dotagent-runner/src/persistent.rs` (pool) + `docs/concepts/lifecycle.md` |
 | Protocolo do agent persistente (JSON lines) | `dotagent-runner/src/protocol.rs` + `docs/reference/persistent-protocol.md` |
 | Skill (procedimento carregado sob demanda) | `dotagent-core/src/skill.rs` (parse) + `dotagent/src/skills.rs` (discovery + containment) + `docs/concepts/skills.md` |

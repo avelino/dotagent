@@ -7,6 +7,61 @@ adheres to [Semantic Versioning](https://semver.org/).
 Pre-1.0: minor bumps may include breaking changes; both `agent.toml`
 schema and the plugin protocol are flagged in each entry.
 
+## [Unreleased]
+
+### Added
+
+- **Ranked recall.** `memory-recall` scores facts by shared terms first and
+  recency second instead of asking whether the query was a substring of a
+  stored fact. It almost never was — a question like "o que ficou pendente do
+  databricks?" matched nothing — so recall silently degraded into "the last
+  few facts written", regardless of subject. Ranking is lexical, never
+  semantic: a fact competes only if it shares a real word, so a miss still
+  returns nothing rather than the closest thing.
+- **Dedup and supersede on the write path.** Restating a stored fact
+  reinforces it (`seen::` goes up, new topics merge in) instead of filing a
+  duplicate; a fact that stopped being true is marked `superseded-by::` and
+  stops being recalled while staying readable in its journal. New
+  `memory-supersede` and `memory-forget` tools, and `memory-recall` output
+  now leads with each fact's id so they are addressable.
+- **Provenance on every fact**, written as outl block properties
+  (`agent::`, `source::`, `session::`, `seen::`, `last-seen::`) under the
+  block rather than inside its text. One poisoned run's output can be found
+  and removed as a group.
+- **`[memory]` in `agent.toml`** — any agent, not just a conversational one,
+  can file facts by printing `MEMO: <fact> | topics: a, b` on stdout. Opt-in
+  per manifest and successful runs only. Topics declared in the section are
+  added to every fact the agent files.
+- **`dotagent memory`** — `recall`, `remember`, `supersede`, `forget`,
+  `topics` and `stats` from a shell, with no daemon required, so a
+  consolidation pass can be an ordinary scheduled agent instead of logic
+  buried in the daemon. `--json` emits one object per line, provenance
+  included.
+- **Accent and plural folding in recall.** Query and fact are normalized the
+  same way before they meet, so "pendência" finds a fact tagged `pendencias`
+  and "custos" finds "custo". Found against a real store, where the question
+  "tem alguma pendência com prazo?" returned nothing while the answer sat
+  there under a slug the agent had coined without the accent.
+- **Topic vocabulary in the recall block.** `AGENT_ASSISTANT_MEMORY` now ends
+  with the topics already in use, so an assistant tags a new fact with a name
+  the store already knows instead of coining `reunioes` next to `reuniao`.
+
+### Fixed
+
+- **A notification with an empty body is no longer sent as-is.** Telegram
+  rejects it (`400 message text is empty`), so an agent that reports by
+  exception — a sweeper with nothing to sweep — produced a failed notifier
+  on every clean run. `success` with no output now sends nothing; every
+  other event synthesizes `agent/schedule: event (no output)`, because a
+  state change still has to reach whoever is on the hook for it.
+- `memory-recall` accepted a `topic` argument in its schema and ignored it,
+  always running a text search.
+- "Most recent facts" sorted every page by slug, so a topic page whose name
+  started with a letter ranked ahead of every dated journal.
+- Recall handed the assistant each fact with its `[[topic]]` markup inline;
+  the injected block now carries the sentence, with topics rendered
+  separately.
+
 ## [0.5.0] - 2026-08-18
 
 ### Added

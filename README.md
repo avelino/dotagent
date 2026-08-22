@@ -132,6 +132,7 @@ events = ["given_up"]
 ```python
 # brief.py
 import os
+
 print(f"hello from {os.environ['AGENT_NAME']}")
 ```
 

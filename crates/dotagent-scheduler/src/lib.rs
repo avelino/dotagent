@@ -955,6 +955,8 @@ mod tests {
             },
             env: None,
             lifecycle: Default::default(),
+            assistant: None,
+            memory: None,
             defaults: ScheduleDefaults {
                 max_retries: Some(3),
                 retry_backoff_minutes: Some(vec![5, 15, 30]),

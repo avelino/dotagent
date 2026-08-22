@@ -142,12 +142,14 @@ Long-term memory for agents, stored in an embedded [outl](https://github.com/ave
 
 | Field | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | Expose `memory-remember` / `memory-recall` from `dotagent mcp`. |
+| `enabled` | `true` | Expose the `memory-*` tools from `dotagent mcp`. |
 | `workspace` | `""` | Workspace path. Empty resolves to `$DOTAGENT_HOME/outl`. |
 
 The default workspace is scaffolded when the daemon starts, so memory works without writing any config. A **configured** path is never scaffolded: a typo there must fail loudly rather than create an empty workspace nobody will look at. `dotagent doctor` reports which case you are in.
 
 Pointing this at a workspace you already use puts what an agent remembers next to your own notes, synced to your peers. Convenient, and also means an agent writes where you write.
+
+> **Not the same `[memory]` as `agent.toml`.** This section says *where* the workspace lives and whether memory exists at all. The per-agent section of that name says whether *that agent* writes to it — see [`[memory]` in the agent spec](../reference/agent-spec.md#memory--memory-capture-for-a-plain-agent-opt-in).
 
 Full behavior in [Memory](../concepts/memory.md).
 

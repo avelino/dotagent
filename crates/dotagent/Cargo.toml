@@ -20,6 +20,7 @@ dotagent-state.workspace = true
 dotagent-plugin.workspace = true
 dotagent-mcp.workspace = true
 dotagent-memory.workspace = true
+dotagent-assistant.workspace = true
 dotagent-notify.workspace = true
 dotagent-secrets.workspace = true
 dotagent-supervisor.workspace = true

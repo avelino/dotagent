@@ -83,6 +83,8 @@ What it does with the message is entirely up to it. [`examples/telegram-assistan
 
 dotagent itself interprets nothing. There is no model, no provider and no prompt in the daemon.
 
+A dispatcher that wants *continuity* declares `[assistant]` in its manifest: the daemon then keeps the conversation's pointers (model session id, toolkit hash, transcript size), reinjects them as `AGENT_ASSISTANT_*` on every trigger, retires sessions whose transcript outgrew the ceiling, and strips `MEMO:` capture lines from replies into the memory workspace. The chat transcript itself still never lives in the daemon. Schema in the [agent spec](../reference/agent-spec.md#assistant-conversational-harness-opt-in).
+
 ## Commands
 
 [Commands](commands.md) put a `/` menu in the chat. The daemon registers it with `setMyCommands` on start and every reload, scoped to each allowlisted chat rather than globally — the allowlist gates execution already, but a global menu would publish every command name to anyone who finds the bot.

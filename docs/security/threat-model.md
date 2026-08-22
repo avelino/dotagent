@@ -341,6 +341,47 @@ people use the bot, which is exactly the shape of a leak that ships.
 likes. dotagent isolates the *process*, not the filesystem — `[security]
 filesystem_writable` is still schema-only (V-deferred, below).
 
+### V16 — Assistant harness: registry and memory as new state
+
+`[assistant]` moves conversation bookkeeping into the daemon, which makes two
+new files interesting to an attacker with user-level access:
+
+**The registry** (`state/assistant/<source>-<session>.json`, 0600, atomic
+writes) holds pointers only — model session id, generation, toolkit hash,
+transcript size. It deliberately has no field that can hold chat text, so
+reading it yields "which session served chat X", never what was said. The
+deeper risk is *writing* it: a poisoned pointer makes the next reply resume
+an attacker-chosen model session. That is a same-user attack surface the
+premise already accepts (the attacker could edit the manifest and get
+arbitrary execution directly); the registry adds no privilege.
+
+**The memory workspace** (`outl/`) accumulates `MEMO:` facts — flushed from
+assistant replies, and from the stdout of any agent whose manifest declares
+`[memory]`. Trust boundary: the facts are *agent-produced text*, not attested
+input — a compromised or prompt-injected agent can poison its own memory
+with false facts that later color future replies. It cannot write another
+conversation's registry, and `memory-recall` output is bounded (2 KiB per
+turn), but "the assistant believes wrong things" is a real failure mode.
+
+Mitigations: the workspace is a plain outl graph the user can open, read and
+edit (a bad memory is visible and correctable by hand); every fact records
+which agent, source and session wrote it as block properties, so one poisoned
+run's output can be found and removed as a group; `dotagent memory forget`
+and `memory-supersede` make that correction a command rather than a
+hand-edit; and recall failure degrades to an empty block, never to a blocked
+conversation.
+
+Capture from a plain agent is **opt-in per manifest and successful runs
+only**. Both bounds are about trust rather than tidiness: an agent that never
+declared `[memory]` cannot write facts at all, and a failing run — the state
+an attacker is most likely to be able to force — cannot file its output as
+durable truth.
+
+**Not mitigated:** prompt injection through message content that ends up in
+a `MEMO:` line verbatim. The memory stores what the agent claimed. Recorded
+provenance narrows *which* run to distrust, and editing or forgetting the
+fact is the correction path — but nothing validates a claim at write time.
+
 ### V14 — Notifier credentials written to the daemon's own log
 
 V6 is about a *plugin* leaking secrets outward. This is the inverse, and it

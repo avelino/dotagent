@@ -399,24 +399,100 @@ fn memory_tools() -> Vec<Tool> {
         },
         Tool {
             name: "memory-recall".into(),
-            description: "Search stored facts by text. Returns matching memories, newest first. \
-                An empty query returns the most recent ones."
+            description: "Search stored facts. Ranks by shared words first and recency second, \
+                best match first. An empty query returns the most recent facts. Each result \
+                starts with an id you can pass to memory-forget or memory-supersede."
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Text to search for." },
+                    "query": { "type": "string", "description": "What to search for." },
                     "topic": {
                         "type": "string",
                         "description": "Instead of a text search, return every fact linked to \
-            this subject, gathered from all days."
+            this subject, gathered from all days. The better question when you know the \
+            subject: it asks the graph instead of guessing which words the fact used."
                     },
                     "limit": { "type": "integer", "description": "Default 10." }
                 },
                 "additionalProperties": false
             }),
         },
+        Tool {
+            name: "memory-supersede".into(),
+            description: "Replace a stored fact with a corrected one. Use this when something \
+                you remembered stopped being true — a preference that changed, a decision that \
+                was reversed. The old fact stays readable in its journal but stops coming back \
+                from recall, so you are never choosing between two answers. Get the id from \
+                memory-recall."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Id of the fact being replaced." },
+                    "text": { "type": "string", "description": "The corrected fact, in one sentence." },
+                    "topics": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Subjects the new fact belongs to."
+                    }
+                },
+                "required": ["id", "text"],
+                "additionalProperties": false
+            }),
+        },
+        Tool {
+            name: "memory-forget".into(),
+            description: "Delete a stored fact for good. For things that should never have been \
+                stored — noise, something private, something you got wrong. A fact that merely \
+                stopped being true wants memory-supersede instead, which keeps the history. \
+                Get the id from memory-recall."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Id of the fact to delete." }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+        },
     ]
+}
+
+/// Render recall results so each fact is addressable.
+///
+/// The id leads because the follow-up move — correcting a fact, deleting one
+/// — needs it, and a model that has to ask "which one?" spends a round trip
+/// on something the first answer could have carried.
+fn render_memories(hits: &[dotagent_memory::Memory]) -> String {
+    hits.iter()
+        .map(|m| {
+            let mut line = format!("[{}] ", m.id);
+            if !m.date.is_empty() {
+                line.push_str(&m.date);
+                line.push_str(": ");
+            }
+            line.push_str(&m.text);
+            if !m.topics.is_empty() {
+                line.push_str(&format!(" (topics: {})", m.topics.join(", ")));
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A string array argument, or empty when absent or the wrong shape.
+fn string_array(args: &serde_json::Value, key: &str) -> Vec<String> {
+    args.get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn memory_config() -> dotagent_core::config::MemoryConfig {
@@ -482,18 +558,11 @@ fn read_agent_logs(args: &serde_json::Value) -> CallToolResult {
     run_readonly(&["logs", agent, "-n", &lines])
 }
 
-/// Resolve the workspace and scaffold it if needed.
+/// Resolve the workspace and scaffold it if needed. Shared with
+/// `dotagent memory` so the CLI and the MCP server can never disagree about
+/// which workspace they are talking to.
 fn memory_store() -> Result<dotagent_memory::MemoryStore> {
-    let cfg = memory_config();
-    match cfg.workspace_override() {
-        // A configured path came from a human, so a typo must fail loudly
-        // rather than scaffold an empty workspace nobody will look at.
-        Some(path) => dotagent_memory::MemoryStore::open(path).map_err(Into::into),
-        None => dotagent_memory::MemoryStore::open_or_init(
-            dotagent_state::paths::memory_workspace_dir(),
-        )
-        .map_err(Into::into),
-    }
+    crate::commands::memory::store()
 }
 
 /// Run a memory tool. `None` means "not a memory tool".
@@ -522,7 +591,8 @@ fn call_memory(tool: &str, args: &serde_json::Value) -> Option<CallToolResult> {
             }
             return Some(run_readonly(&["inspect", &agent]));
         }
-        "memory-remember" | "memory-recall" | "memory-topics" => match memory_store() {
+        "memory-remember" | "memory-recall" | "memory-topics" | "memory-supersede"
+        | "memory-forget" => match memory_store() {
             Ok(s) => s,
             Err(e) => {
                 return Some(CallToolResult::text(
@@ -545,15 +615,7 @@ fn call_memory(tool: &str, args: &serde_json::Value) -> Option<CallToolResult> {
                 .get("text")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
-            let topics: Vec<String> = args
-                .get("topics")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let topics = string_array(args, "topics");
             match store.remember(text, &topics) {
                 Ok(m) => {
                     CallToolResult::text(format!("Remembered ({}): {}", m.date, m.text), false)
@@ -562,27 +624,56 @@ fn call_memory(tool: &str, args: &serde_json::Value) -> Option<CallToolResult> {
             }
         }
         "memory-recall" => {
-            let query = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default();
             let limit = args
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10)
                 .clamp(1, 50) as usize;
-            match store.recall(query, limit) {
+            // `topic` asks the graph; `query` guesses at words. When both
+            // are given the graph wins — it is the more precise question.
+            let topic = args
+                .get("topic")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|t| !t.is_empty());
+            let hits = match topic {
+                Some(topic) => store.recall_topic(topic).map(|mut hits| {
+                    hits.truncate(limit);
+                    hits
+                }),
+                None => store.recall(
+                    args.get("query")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default(),
+                    limit,
+                ),
+            };
+            match hits {
                 Ok(hits) if hits.is_empty() => {
                     CallToolResult::text("Nothing remembered about that.", false)
                 }
-                Ok(hits) => {
-                    let body: Vec<String> = hits
-                        .iter()
-                        .map(|m| format!("{}: {}", m.date, m.text))
-                        .collect();
-                    CallToolResult::text(body.join("\n"), false)
-                }
+                Ok(hits) => CallToolResult::text(render_memories(&hits), false),
                 Err(e) => CallToolResult::text(format!("Could not recall: {e}"), true),
+            }
+        }
+        "memory-supersede" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            let text = args
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let topics = string_array(args, "topics");
+            match store.supersede(id, text, &topics, &dotagent_memory::Provenance::default()) {
+                Ok(m) => CallToolResult::text(format!("Replaced. Now: {}", m.text), false),
+                Err(e) => CallToolResult::text(format!("Could not supersede: {e}"), true),
+            }
+        }
+        "memory-forget" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+            match store.forget(id) {
+                Ok(true) => CallToolResult::text("Forgotten.", false),
+                Ok(false) => CallToolResult::text(format!("No memory with id {id}."), true),
+                Err(e) => CallToolResult::text(format!("Could not forget: {e}"), true),
             }
         }
         _ => unreachable!("guarded above"),
@@ -1543,6 +1634,65 @@ remediation = "   "
         let result = read_skill_file(&serde_json::json!({ "skill": "x" }));
         let rendered = serde_json::to_string(&result).unwrap();
         assert!(rendered.contains(r#""isError":true"#), "{rendered}");
+    }
+
+    #[test]
+    fn recall_results_lead_with_an_addressable_id() {
+        // The follow-up move (correct it, delete it) needs the id; making
+        // the model ask "which one?" costs a round trip.
+        let hits = vec![dotagent_memory::Memory {
+            id: "01ABC".into(),
+            date: "2026-08-21".into(),
+            text: "prefere reunião depois das 14h".into(),
+            topics: vec!["agenda".into()],
+            provenance: Default::default(),
+            seen: 1,
+            superseded_by: None,
+        }];
+        assert_eq!(
+            render_memories(&hits),
+            "[01ABC] 2026-08-21: prefere reunião depois das 14h (topics: agenda)"
+        );
+    }
+
+    #[test]
+    fn a_fact_with_no_date_renders_without_an_empty_prefix() {
+        let hits = vec![dotagent_memory::Memory {
+            id: "01ABC".into(),
+            date: String::new(),
+            text: "fato numa página".into(),
+            topics: vec![],
+            provenance: Default::default(),
+            seen: 1,
+            superseded_by: None,
+        }];
+        assert_eq!(render_memories(&hits), "[01ABC] fato numa página");
+    }
+
+    #[test]
+    fn string_array_tolerates_absent_and_malformed_arguments() {
+        assert!(string_array(&serde_json::json!({}), "topics").is_empty());
+        assert!(string_array(&serde_json::json!({"topics": "x"}), "topics").is_empty());
+        assert_eq!(
+            string_array(&serde_json::json!({"topics": ["a", 2, "b"]}), "topics"),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_memory_catalog_offers_correction_as_well_as_capture() {
+        // A store you can only append to is one that accumulates
+        // contradictions the model then has to choose between.
+        let names: Vec<String> = memory_tools().into_iter().map(|t| t.name).collect();
+        for expected in [
+            "memory-remember",
+            "memory-recall",
+            "memory-topics",
+            "memory-supersede",
+            "memory-forget",
+        ] {
+            assert!(names.contains(&expected.to_string()), "{names:?}");
+        }
     }
 
     #[tokio::test]

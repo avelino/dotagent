@@ -1074,9 +1074,9 @@ the daemon — so they don't appear in `dotagent status`.
 
 ### Memory — facts that outlive the conversation
 
-`dotagent mcp` also exposes `memory-remember` and `memory-recall`,
-backed by an embedded outl workspace at `~/.config/dotagent/outl`
-(scaffolded on daemon start; override with `[memory] workspace`).
+`dotagent mcp` exposes five memory tools, backed by an embedded outl
+workspace at `~/.config/dotagent/outl` (scaffolded on daemon start;
+override with `[memory] workspace` in `config.toml`).
 
 Memory is NOT conversation history. History is what was just said;
 memory is what stays true next week — a preference, a decision, a
@@ -1089,17 +1089,42 @@ journal, is reachable both by date and by subject.
 
 - `memory-remember {text, topics[]}` — store, linked
 - `memory-recall {topic}` — everything linked to a subject (ask the graph)
-- `memory-recall {query}` — substring search (fallback, not semantic)
+- `memory-recall {query}` — ranked by shared words, then recency
 - `memory-topics {}` — what subjects exist; check before inventing a name
+- `memory-supersede {id, text, topics[]}` — a fact stopped being true
+- `memory-forget {id}` — a fact should never have been stored
+
+Recall results lead with an id; that id is what supersede and forget
+take. Ranking is lexical, never semantic: a fact competes only if it
+shares a real word with the question, so a miss returns nothing rather
+than the closest thing. An assistant states recall results as fact, and
+a confident near-miss is worse than silence.
+
+Restating a fact reinforces the stored one (`seen::` goes up) instead of
+filing a duplicate. Correcting one marks the old `superseded-by::` — it
+stays readable in its journal, stops being recalled.
+
+Every fact records provenance as block properties (`agent::`, `source::`,
+`session::`), so a poisoned run's output can be found and removed as a
+group.
 
 Reuse topic names. `dotagent` and `dot-agent` are two disconnected pages
-about the same thing, and both look incomplete.
+about the same thing, and both look incomplete. Agents under the
+`[assistant]` harness get the topics already in use appended to their
+memory block, so the vocabulary is in front of them while they write.
 
 Do not store what is already in the conversation, or anything the agent
 can look up on demand. A memory store full of noise makes recall return
 the wrong thing.
 
-Turn off with `[memory] enabled = false`.
+Any agent — not just a conversational one — can file facts by printing
+`MEMO: <fact> | topics: a, b` on stdout, if its manifest declares
+`[memory]`. Opt-in, and only on a successful run.
+
+The same verbs work from a shell without a daemon: `dotagent memory
+recall|remember|supersede|forget|topics|stats`.
+
+Turn the tools off with `[memory] enabled = false` in `config.toml`.
 
 ### Telegram ingress — talk to your agents from a chat
 

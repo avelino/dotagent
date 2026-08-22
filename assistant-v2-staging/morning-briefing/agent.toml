@@ -1,0 +1,33 @@
+# morning-briefing — the secretary's daily opening line.
+#
+# Weekday 07:30: agenda + open items from memory + overnight failures, one
+# telegram message on success (the briefing-buser pattern: notifier posts
+# the agent's stdout). Sources degrade individually — a dead calendar means
+# a briefing without the agenda section, not no briefing.
+
+[agent]
+name = "morning-briefing"
+description = "Briefing matinal: agenda, pendências da memória e falhas da noite."
+timeout_seconds = 300
+
+[run]
+command = "fish"
+args = ["/Users/avelino/dotfiles/modules/home-manager/dotagent/agents/morning-briefing/agent.fish"]
+
+[defaults]
+max_retries = 2
+retry_backoff_minutes = [10, 30]
+
+[[schedules]]
+id = "weekday-morning"
+type = "cron"
+weekdays = [1, 2, 3, 4, 5]
+hours = [7]
+minute = 30
+
+[[notifiers]]
+driver = "telegram"
+bot_token = "${TELEGRAM_BOT_TOKEN}"
+chat_id = "2813445"
+parse_mode = "MarkdownV2"
+events = ["success", "given_up"]

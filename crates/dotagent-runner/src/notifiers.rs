@@ -8,11 +8,47 @@
 //! Failure of an individual notifier does **not** propagate to the run's
 //! exit code — the run already happened. Errors are logged and audited.
 
+use std::borrow::Cow;
+
 use dotagent_core::{audit::AuditEvent, manifest::AgentManifest};
 use dotagent_notify::{NotifierConfig, NotifierEntry, NotifyContext, NotifyError};
 use dotagent_plugin::{InvokePayload, PluginClient, PluginKind};
 use dotagent_state::AuditLog;
 use tracing::{debug, warn};
+
+/// The body a notification should carry, or `None` to send nothing.
+///
+/// A notification with an empty body is not a notification — Telegram
+/// rejects it outright (400 `message text is empty`), and the drivers that
+/// accept it deliver a blank line. What to do about it depends on why the
+/// body is empty, and the two cases pull in opposite directions:
+///
+/// - **`success` with no output** is an agent that had nothing to report.
+///   A sweeper that finds no follow-ups is *working*. Sending "" three times
+///   a day is noise, and failing to send it is a warning in the daemon log
+///   three times a day. Say nothing — the run is already in `status` and in
+///   the agent's log.
+/// - **Every other event is a state change**, and the change itself is the
+///   news. `given_up` with an empty tail still has to reach whoever is on the
+///   hook for it, so the body is synthesized rather than dropped. Losing an
+///   alert because the process died too fast to print anything is the worst
+///   outcome available here.
+fn resolve_body<'a>(
+    agent: &str,
+    schedule: &str,
+    event: &str,
+    message: &'a str,
+) -> Option<Cow<'a, str>> {
+    if !message.trim().is_empty() {
+        return Some(Cow::Borrowed(message));
+    }
+    if event == "success" {
+        return None;
+    }
+    Some(Cow::Owned(format!(
+        "{agent}/{schedule}: {event} (no output)"
+    )))
+}
 
 /// Fire every `[[notifiers]]` entry that matches `event`. Plugin escape-hatch
 /// entries (`driver = "plugin"`) are dispatched through `PluginClient`; all
@@ -54,11 +90,20 @@ pub async fn fire_notifier_entries(
     plugins: Option<&PluginClient>,
     audit: Option<&AuditLog>,
 ) {
+    let Some(message) = resolve_body(agent, schedule_id, event, message) else {
+        debug!(
+            agent,
+            schedule = schedule_id,
+            event,
+            "notifier: nothing to say, skipping"
+        );
+        return;
+    };
     let ctx = NotifyContext {
         agent,
         schedule: schedule_id,
         event,
-        message,
+        message: &message,
     };
 
     for entry in entries {
@@ -78,7 +123,7 @@ pub async fn fire_notifier_entries(
                 agent: agent.to_string(),
                 schedule: schedule_id.to_string(),
                 event: event.into(),
-                message: Some(message.into()),
+                message: Some(message.to_string()),
                 config: p.config.clone(),
             };
             let ok = match client.invoke(&p.name, &payload).await {
@@ -284,5 +329,51 @@ mod tests {
         assert!(store
             .resolve_for_chat("@channel_username", send_result.message_id)
             .is_none());
+    }
+    // --- empty-body policy -------------------------------------------------
+
+    #[test]
+    fn a_body_that_has_content_passes_through_untouched() {
+        assert_eq!(
+            resolve_body("a", "s", "success", "all good").as_deref(),
+            Some("all good")
+        );
+    }
+
+    #[test]
+    fn success_with_no_output_says_nothing() {
+        // The live case: follow-up-sweeper finds no follow-ups three times a
+        // day, prints nothing, and Telegram rejected the empty send with a
+        // 400 every single time.
+        assert!(resolve_body("follow-up-sweeper", "three-a-day", "success", "").is_none());
+        assert!(resolve_body("a", "s", "success", "   \n\t ").is_none());
+    }
+
+    #[test]
+    fn a_failure_with_no_output_still_alerts() {
+        // Losing an alert because the process died too fast to print is the
+        // worst outcome available here.
+        for event in [
+            "attempt_failed",
+            "timed_out",
+            "given_up",
+            "stale",
+            "recovered",
+            "preflight",
+            "daily_summary",
+        ] {
+            let body = resolve_body("morning-briefing", "weekday-morning", event, "");
+            let body = body.expect("state changes must never be silenced");
+            assert!(body.contains("morning-briefing"), "{body}");
+            assert!(body.contains("weekday-morning"), "{body}");
+            assert!(body.contains(event), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_synthesized_body_is_never_empty() {
+        // Whatever it says, it must survive the transport that started this.
+        let body = resolve_body("", "", "given_up", "").expect("some body");
+        assert!(!body.trim().is_empty(), "{body:?}");
     }
 }

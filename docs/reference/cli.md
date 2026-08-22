@@ -29,6 +29,8 @@ clap-generated help.
 | [`inspect`](#inspect)      | Dump heartbeat + manifest hash + schedule state for one agent.        |
 | [`reload`](#reload)        | Send SIGHUP to the running daemon.                                    |
 | [`run-now`](#run-now)      | Force-run an agent immediately, ignoring schedule windows.            |
+| [`mcp`](#mcp)              | Serve every discovered agent as an MCP tool over stdio.               |
+| [`memory`](#memory)        | Read and curate the long-term memory workspace.                       |
 | [`completions`](#completions) | Print a shell completion script (bash / zsh / fish / elvish / powershell). |
 
 ---
@@ -763,7 +765,7 @@ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | dotagent mcp
 The catalog is not only agents: `skill-*` tools carry the procedures found
 under `~/.config/dotagent/skills/` and `~/.claude/skills/`, `command-get` and
 `command-list` resolve the commands under `~/.config/dotagent/commands/`, and
-`memory-*` tools appear when `[memory]` is on. See
+the five `memory-*` tools appear when `[memory]` is on. See
 [Skills](../concepts/skills.md) and [Commands](../concepts/commands.md).
 
 Agents run in **this** process, like `run-now` — not through the daemon — so
@@ -775,6 +777,62 @@ stdout carries protocol only; logging goes to stderr, so `RUST_LOG=debug
 dotagent mcp` stays safe to run under a client.
 
 Full protocol reference: [MCP server](mcp.md).
+
+---
+
+## `memory`
+
+Read and curate the long-term memory workspace — the same store `dotagent
+mcp` exposes to agents, reachable from a shell and **without a running
+daemon**. That last part is the point: consolidating a day's raw facts into
+durable ones is a job an agent should be able to do on a schedule, and it can
+only do that if the verbs exist outside the daemon process.
+
+```bash
+dotagent memory recall [QUERY] [--topic <TOPIC>] [--limit <N>] [--json]
+dotagent memory remember <TEXT> [--topic <TOPIC>]...
+dotagent memory supersede <ID> <TEXT> [--topic <TOPIC>]...
+dotagent memory forget <ID>
+dotagent memory topics
+dotagent memory stats
+```
+
+`recall` ranks by shared words first and recency second; an empty query lists
+the most recent facts. `--topic` asks the graph instead — every fact linked
+to that subject, which is the better question when you know the subject.
+
+**Example** — find a fact, then correct it:
+
+```bash
+dotagent memory recall "reunião"
+# → [01M0JSC92RBJFXKAX25JX34M2Q] 2026-08-21: prefere reunião depois das 14h (agenda, reuniao) ×2
+
+dotagent memory supersede 01M0JSC92RBJFXKAX25JX34M2Q "prefere reunião só de manhã" --topic agenda
+# → Replaced [01M0JSCG3ETZ65MX9Q05DYNP0D]: prefere reunião só de manhã
+```
+
+Every line leads with the fact's id, because the follow-up move takes it. The
+`×2` suffix means the fact was stated more than once — restating a fact
+reinforces the one already stored rather than filing a copy.
+
+`supersede` keeps the old fact readable in its journal and stops recalling
+it; `forget` deletes outright. Correcting something that changed wants the
+first; removing something that should never have been stored wants the
+second.
+
+`stats` reports what the store holds:
+
+```bash
+dotagent memory stats
+# → facts:      2
+#   reinforced: 1
+#   superseded: 0
+#   topics:     4
+```
+
+`--json` emits one JSON object per line, provenance included, for scripting.
+
+Full reference: [Memory](../concepts/memory.md).
 
 ---
 

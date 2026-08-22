@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, warn};
 
 use super::sink::{ReplySink, SinkFuture};
-use super::{ConversationKey, GatewayRunner, WorkerSlot};
+use super::{AssistantSessionFrame, ConversationKey, GatewayRunner, WorkerSlot};
 
 /// How long the delta pump gets to drain buffered lines after the runner
 /// returns. The tap normally dies with the runner's stream; a badly behaved
@@ -42,14 +42,14 @@ pub(super) struct Job {
 /// When enabled, protocol detection says the run "spoke the protocol" the
 /// moment **any** line parses as an [`AssistantEvent`]. The final reply is the
 /// **last** `reply` frame; a run that parsed frames but never sent one falls
-/// back to raw stdout. `session` frames are parsed (they count for detection)
-/// and otherwise ignored — the gateway is a harness and does not persist
-/// assistant sessions.
+/// back to raw stdout. `session` frames count for detection and are captured
+/// for the runner's harness — the gateway itself persists nothing.
 #[derive(Default)]
 struct ReplyShaper {
     enabled: bool,
     saw_protocol: bool,
     last_reply: Option<String>,
+    session_frame: Option<AssistantSessionFrame>,
 }
 
 impl ReplyShaper {
@@ -66,8 +66,18 @@ impl ReplyShaper {
         }
         if let Some(event) = assistant::parse_line(line) {
             self.saw_protocol = true;
-            if let AssistantEvent::Reply { text } = event {
-                self.last_reply = Some(text);
+            match event {
+                AssistantEvent::Reply { text } => self.last_reply = Some(text),
+                AssistantEvent::Session {
+                    claude_session,
+                    transcript_bytes,
+                } => {
+                    self.session_frame = Some(AssistantSessionFrame {
+                        claude_session,
+                        transcript_bytes,
+                    })
+                }
+                AssistantEvent::Delta { .. } => {}
             }
         }
     }
@@ -438,15 +448,24 @@ impl ConversationWorker {
         }
 
         // Scope the lock so the guard is provably gone before the await.
-        let reply = {
+        let (reply, session_frame) = {
             let shaper = shaper.lock().expect("reply shaper poisoned");
             debug!(
                 protocol = shaper.saw_protocol,
                 "gateway: shaping final reply"
             );
-            shape_final_reply(&req.agent, outcome, &shaper)
+            (
+                shape_final_reply(&req.agent, outcome, &shaper),
+                shaper.session_frame.clone(),
+            )
         };
         delta_stats.report(&req);
+        // Harness pass (MEMO strip, session-pointer persistence) before the
+        // reply leaves the daemon — the sink must never see bookkeeping.
+        let reply = self
+            .runner
+            .assistant_finalize(&req, reply, session_frame)
+            .await;
         if !await_sink_or_force(sink.reply(session.as_deref(), &reply), &mut force_shutdown).await {
             children.abort_and_join().await;
             return ProcessResult::ForcedShutdown;

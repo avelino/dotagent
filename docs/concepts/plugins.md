@@ -388,6 +388,7 @@ fn main() -> anyhow::Result<()> {
 ```python
 #!/usr/bin/env python3
 """dotagent-plugin-notify-discord — Python implementation."""
+
 import json
 import sys
 import urllib.request
@@ -395,17 +396,21 @@ import urllib.request
 verb = sys.argv[1] if len(sys.argv) > 1 else ""
 
 if verb == "info":
-    print(json.dumps({
-        "name": "notify-discord",
-        "version": "0.1.0",
-        "kinds": ["notify"],
-        "platforms": ["darwin", "linux"],
-        "schema": {
-            "type": "object",
-            "required": ["webhook_url"],
-            "properties": {"webhook_url": {"type": "string"}},
-        },
-    }))
+    print(
+        json.dumps(
+            {
+                "name": "notify-discord",
+                "version": "0.1.0",
+                "kinds": ["notify"],
+                "platforms": ["darwin", "linux"],
+                "schema": {
+                    "type": "object",
+                    "required": ["webhook_url"],
+                    "properties": {"webhook_url": {"type": "string"}},
+                },
+            }
+        )
+    )
 elif verb == "validate":
     cfg = json.load(sys.stdin)
     ok = cfg.get("webhook_url", "").startswith("https://")
@@ -415,7 +420,8 @@ elif verb == "invoke":
     url = payload["config"]["webhook_url"]
     msg = payload.get("message", "")
     req = urllib.request.Request(
-        url, data=json.dumps({"content": msg}).encode(),
+        url,
+        data=json.dumps({"content": msg}).encode(),
         headers={"Content-Type": "application/json"},
     )
     try:

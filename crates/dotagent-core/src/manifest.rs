@@ -31,6 +31,14 @@ pub struct AgentManifest {
     /// had before this section existed.
     #[serde(default)]
     pub lifecycle: LifecycleConfig,
+    /// Conversational-assistant harness opt-in. Absent = plain runs, byte
+    /// for byte what every agent did before this section existed.
+    #[serde(default)]
+    pub assistant: Option<AssistantConfig>,
+    /// Long-term memory for a plain (non-assistant) agent. Absent = the
+    /// agent's output is never read for facts.
+    #[serde(default)]
+    pub memory: Option<AgentMemoryConfig>,
     #[serde(default)]
     pub defaults: ScheduleDefaults,
     #[serde(default, rename = "schedules")]
@@ -103,6 +111,124 @@ pub struct EnvConfig {
 
 fn default_inherit() -> bool {
     true
+}
+
+/// Opt-in conversational-assistant harness (`[assistant]`).
+///
+/// Present = the daemon keeps conversation pointers for this agent's
+/// triggered runs (model session id, toolkit hash, transcript size),
+/// reinjects them on the next trigger, and captures `MEMO:` lines from
+/// replies into the memory workspace. Absent = none of that happens.
+///
+/// Pointers, never transcripts: the daemon records which model session
+/// served a conversation, never what was said.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantConfig {
+    /// Master switch inside the section — disable the harness without
+    /// deleting the block.
+    #[serde(default = "default_assistant_enabled")]
+    pub enabled: bool,
+    /// Recall stored facts before each run and capture `MEMO:` lines from
+    /// replies into the memory workspace.
+    #[serde(default = "default_assistant_memory")]
+    pub memory: bool,
+    /// Transcript retirement ceiling in bytes. `None` = the daemon default
+    /// (`dotagent-assistant::registry::DEFAULT_TRANSCRIPT_BYTES_MAX`).
+    #[serde(default)]
+    pub transcript_bytes_max: Option<u64>,
+    #[serde(default)]
+    pub toolkit: AssistantToolkit,
+}
+
+fn default_assistant_enabled() -> bool {
+    true
+}
+
+fn default_assistant_memory() -> bool {
+    true
+}
+
+/// Opt-in memory capture for an ordinary agent (`[memory]`).
+///
+/// The assistant harness already reads `MEMO:` lines out of a reply. This is
+/// the same capture for every other agent: a scheduled run that learns
+/// something durable prints `MEMO: <fact> | topics: a, b` and the daemon
+/// files it, with the agent's name recorded as provenance.
+///
+/// Off unless declared, because most agents are not writing facts — they are
+/// printing status, and a store that absorbs status is a store whose recall
+/// returns status.
+///
+/// ```toml
+/// [memory]
+/// capture = true
+/// topics = ["ops"]   # added to every fact this agent files
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentMemoryConfig {
+    /// Scan this agent's stdout for `MEMO:` lines.
+    #[serde(default = "default_capture")]
+    pub capture: bool,
+    /// Topics added to every fact this agent files, on top of whatever the
+    /// `MEMO:` line named. A cost agent tagging everything `ops` means its
+    /// facts stay findable as a group without the agent restating it on
+    /// every line.
+    #[serde(default)]
+    pub topics: Vec<String>,
+}
+
+fn default_capture() -> bool {
+    true
+}
+
+impl Default for AgentMemoryConfig {
+    fn default() -> Self {
+        Self {
+            capture: true,
+            topics: Vec::new(),
+        }
+    }
+}
+
+impl AgentMemoryConfig {
+    /// Whether the daemon should read this agent's output for facts.
+    pub fn captures(&self) -> bool {
+        self.capture
+    }
+}
+
+/// The MCP servers a conversation's model client runs with.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AssistantToolkit {
+    /// Empty = the agent provisions its own toolkit (compatibility with
+    /// agents that predate the harness).
+    #[serde(default)]
+    pub servers: Vec<ToolkitServer>,
+}
+
+/// One MCP server in an `[assistant]` toolkit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolkitServer {
+    /// The daemon's own MCP server (`dotagent mcp`).
+    Dotagent,
+    /// An external HTTP MCP endpoint (e.g. the local proxy).
+    Http { url: String },
+    /// An external stdio MCP server.
+    Stdio { command: String, args: Vec<String> },
+}
+
+impl ToolkitServer {
+    /// The server's key inside the assembled `mcp.json`. Doubles as the
+    /// sort key for byte-stable assembly and as the duplicate-detection
+    /// key at validation time.
+    pub fn name(&self) -> &str {
+        match self {
+            ToolkitServer::Dotagent => "dotagent",
+            ToolkitServer::Http { .. } => "mcp",
+            ToolkitServer::Stdio { .. } => "stdio",
+        }
+    }
 }
 
 /// Agent-wide defaults applied to schedules that don't override them.
@@ -268,6 +394,26 @@ impl AgentManifest {
                 "run.protocol = \"assistant-v1\" is incompatible with lifecycle.mode = \"persistent\"; use the persistent JSON-lines protocol instead".into(),
             ));
         }
+        if let Some(assistant) = &self.assistant {
+            // A zero ceiling would retire the session on every frame — the
+            // harness would amnesia-loop the conversation.
+            if assistant.transcript_bytes_max == Some(0) {
+                return Err(Error::InvalidManifest(
+                    "assistant.transcript_bytes_max must be greater than 0".into(),
+                ));
+            }
+            // Two servers under the same mcp.json key cannot coexist; the
+            // JSON object would silently keep only the last one.
+            let mut names = std::collections::HashSet::new();
+            for server in &assistant.toolkit.servers {
+                if !names.insert(server.name()) {
+                    return Err(Error::InvalidManifest(format!(
+                        "assistant.toolkit.servers: duplicate MCP server name '{}'",
+                        server.name()
+                    )));
+                }
+            }
+        }
         let mut ids = std::collections::HashSet::new();
         for sched in &self.schedules {
             let id = sched.id();
@@ -419,5 +565,101 @@ mod tests {
     fn no_protocol_declared_stays_none() {
         let m = parse("").unwrap();
         assert!(m.run.protocol.is_none());
+    }
+
+    #[test]
+    fn a_manifest_without_memory_section_stays_none() {
+        // Most agents print status, not facts. Reading their output for
+        // memories by default would fill the store with status.
+        assert!(parse("").unwrap().memory.is_none());
+    }
+
+    #[test]
+    fn a_bare_memory_section_captures() {
+        let m = parse("[memory]").unwrap().memory.expect("section present");
+        assert!(m.capture);
+        assert!(m.topics.is_empty());
+    }
+
+    #[test]
+    fn memory_capture_can_be_disabled_while_keeping_the_section() {
+        let m = parse("[memory]\ncapture = false\ntopics = [\"ops\"]")
+            .unwrap()
+            .memory
+            .expect("section present");
+        assert!(!m.capture);
+        assert_eq!(m.topics, vec!["ops".to_string()]);
+    }
+
+    #[test]
+    fn a_manifest_without_assistant_section_stays_none() {
+        let m = parse("").unwrap();
+        assert!(m.assistant.is_none());
+    }
+
+    #[test]
+    fn a_minimal_assistant_section_gets_defaults() {
+        let m = parse("[assistant]").unwrap();
+        let a = m.assistant.expect("section present");
+        assert!(a.enabled);
+        assert!(a.memory);
+        assert_eq!(a.transcript_bytes_max, None);
+        assert!(a.toolkit.servers.is_empty());
+    }
+
+    #[test]
+    fn an_explicit_assistant_section_parses() {
+        let m = parse(
+            "[assistant]\nenabled = false\nmemory = false\ntranscript_bytes_max = 1024\n\
+             [[assistant.toolkit.servers]]\nkind = \"dotagent\"\n\
+             [[assistant.toolkit.servers]]\nkind = \"http\"\nurl = \"http://127.0.0.1:7333/mcp\"\n",
+        )
+        .unwrap();
+        let a = m.assistant.expect("section present");
+        assert!(!a.enabled);
+        assert!(!a.memory);
+        assert_eq!(a.transcript_bytes_max, Some(1024));
+        assert_eq!(a.toolkit.servers.len(), 2);
+        assert_eq!(a.toolkit.servers[0], ToolkitServer::Dotagent);
+        assert_eq!(
+            a.toolkit.servers[1],
+            ToolkitServer::Http {
+                url: "http://127.0.0.1:7333/mcp".into()
+            }
+        );
+    }
+
+    #[test]
+    fn stdio_toolkit_server_carries_command_and_args() {
+        let m = parse(
+            "[[assistant.toolkit.servers]]\nkind = \"stdio\"\ncommand = \"mcp\"\nargs = [\"serve\"]\n",
+        )
+        .unwrap();
+        let a = m.assistant.expect("section present");
+        assert_eq!(
+            a.toolkit.servers[0],
+            ToolkitServer::Stdio {
+                command: "mcp".into(),
+                args: vec!["serve".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn duplicate_toolkit_server_names_are_rejected() {
+        let err = parse(
+            "[[assistant.toolkit.servers]]\nkind = \"http\"\nurl = \"http://a/mcp\"\n\
+             [[assistant.toolkit.servers]]\nkind = \"http\"\nurl = \"http://b/mcp\"\n",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate MCP server name 'mcp'"), "{msg}");
+    }
+
+    #[test]
+    fn zero_transcript_ceiling_is_rejected() {
+        let err = parse("[assistant]\ntranscript_bytes_max = 0\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("transcript_bytes_max"), "{msg}");
     }
 }

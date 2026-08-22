@@ -1,0 +1,61 @@
+# telegram-assistant v2 — thin dispatcher on the daemon's assistant harness.
+#
+# What moved into the daemon (dotagent with the [assistant] harness):
+#   - session continuity: AGENT_ASSISTANT_SESSION carries the recorded claude
+#     session pointer; the daemon retires it when the transcript outgrows
+#     the ceiling. No more uuid5/generation markers here.
+#   - toolkit provisioning: AGENT_ASSISTANT_MCP_CONFIG is the assembled,
+#     content-addressed mcp.json. No more port probing.
+#   - memory recall + capture: AGENT_ASSISTANT_MEMORY arrives before the run;
+#     trailing MEMO: lines are stripped from the reply and persisted after.
+#     memory.py is gone.
+#
+# Requires the rebuilt daemon. On an older daemon the [assistant] section is
+# ignored and agent.sh fails loudly ("harness env missing") instead of
+# silently losing the session.
+#
+# Runs because a message arrived, never on a clock: no [[schedules]].
+# Wiring lives in ../../config.toml ([telegram] section): one bot means one
+# getUpdates consumer, so token + allowlist are daemon-level.
+
+[agent]
+name = "telegram-assistant"
+description = "Roteia mensagem recebida no Telegram pro agent que resolve ela."
+# Nothing scheduled to monitor — health is "did the reply arrive".
+monitor = false
+# Covers the model call plus whichever agent it picks. The script's own
+# timeout fires first so failures read as "claude exited 142".
+timeout_seconds = 600
+
+[run]
+command = "bash"
+args = [
+  "/Users/avelino/dotfiles/modules/home-manager/dotagent/agents/telegram-assistant/agent.sh",
+]
+# stdout is a stream of assistant-v1 JSON frames (delta/reply/session); the
+# daemon shapes delivery (deltas to local clients, final reply to the chat).
+protocol = "assistant-v1"
+
+[env.extra]
+TELEGRAM_ASSISTANT_MODEL = "sonnet"
+TELEGRAM_ASSISTANT_CLAUDE_TIMEOUT = "540"
+
+[assistant]
+memory = true
+# 400 KiB — the measured knee where replies degrade from seconds to tens of
+# seconds. The daemon bumps the generation and clears the pointer past it.
+transcript_bytes_max = 409600
+
+[[assistant.toolkit.servers]]
+kind = "dotagent"
+
+# The local proxy's narrow instance (launchd, always up): dotagent catalog +
+# personal servers, no ai-memory (two memories in one toolkit is a documented
+# bug) and no buser_* while talking to Avelino.
+[[assistant.toolkit.servers]]
+kind = "http"
+url = "http://127.0.0.1:7333/mcp"
+
+# No [[notifiers]] on purpose. A failure here already surfaces in the chat —
+# the daemon sends this agent's output back to whoever asked, including the
+# error text. A telegram notifier would double-post.

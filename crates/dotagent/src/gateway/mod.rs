@@ -83,6 +83,20 @@ const FORCE_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// The future returned by [`GatewayRunner::run_trigger`].
 pub type RunFuture = Pin<Box<dyn Future<Output = anyhow::Result<OrchestratedOutcome>> + Send>>;
 
+/// The future returned by [`GatewayRunner::assistant_finalize`].
+pub type FinalizeFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
+
+/// The bookkeeping frame an assistant run may emit at most once: which
+/// model session did the work, and how much transcript it produced.
+///
+/// Captured by the reply shaper and handed to the runner's harness so the
+/// daemon can persist the pointer — the gateway itself keeps nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssistantSessionFrame {
+    pub claude_session: String,
+    pub transcript_bytes: u64,
+}
+
 /// The gateway's executor: run one trigger, report the outcome.
 ///
 /// Injected so the gateway is testable without a filesystem or subprocess —
@@ -102,6 +116,25 @@ pub trait GatewayRunner: Send + Sync {
     /// reply shaping. Plain agents may emit JSON as ordinary stdout.
     fn uses_assistant_protocol(&self, _req: &TriggerRequest) -> bool {
         false
+    }
+
+    /// Extra environment for the agent process when its manifest opts into
+    /// the `[assistant]` harness (session pointer, toolkit config, memory
+    /// block). Empty for plain agents — nothing is injected, nothing runs.
+    fn assistant_harness_env(&self, _req: &TriggerRequest) -> Vec<(String, String)> {
+        Vec::new()
+    }
+
+    /// Post-run harness over the terminal reply: strip `MEMO:` capture
+    /// lines, persist the session pointer reported by the run. Returns the
+    /// reply to deliver. Default: pass-through unchanged.
+    fn assistant_finalize<'a>(
+        &'a self,
+        _req: &'a TriggerRequest,
+        reply: String,
+        _session: Option<AssistantSessionFrame>,
+    ) -> FinalizeFuture<'a> {
+        Box::pin(async move { reply })
     }
 }
 

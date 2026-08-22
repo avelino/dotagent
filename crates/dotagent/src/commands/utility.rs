@@ -223,6 +223,24 @@ pub async fn run_now(agent_name: String, schedule: Option<String>, format: Forma
     )
     .await?;
     let duration = (Local::now() - started).num_seconds();
+
+    // A forced run is a real run — it fires sinks and writes the audit log,
+    // so what it learned is worth keeping too. `dotagent run` deliberately
+    // does neither, and does not file facts either: writing durable memory
+    // from a debugging session is the same mistake as publishing from one.
+    if let dotagent_runner::OrchestratedOutcome::Ran(ref ro) = outcome {
+        let memos = crate::commands::memory_capture::capture(
+            &agent.manifest,
+            &ro.stdout_tail,
+            ro.exit_code,
+        );
+        crate::commands::memory_capture::flush(
+            &dotagent_state::paths::memory_workspace_dir(),
+            &agent.manifest.agent.name,
+            &memos,
+        );
+    }
+
     render_outcome(&agent_name, sched.id(), &outcome, duration, format);
     Ok(())
 }
