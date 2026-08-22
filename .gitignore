@@ -21,3 +21,12 @@ Thumbs.db
 .envrc.local
 .direnv/
 *.log
+
+# Python bytecode from the agent helper scripts
+__pycache__/
+*.py[cod]
+
+# Personal machine staging: absolute /Users/... paths, a real Telegram chat_id
+# and prompts written for one person. The publishable version of these agents
+# is examples/telegram-assistant/, which carries no personal data.
+assistant-v2-staging/
