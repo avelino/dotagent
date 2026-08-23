@@ -163,6 +163,47 @@ are argv, a command's are whatever the sender typed after the name.
 
 See [Commands](../concepts/commands.md).
 
+## OS tools
+
+Present only when `[os]` is enabled **and** carries a non-empty `allow` list.
+With the section off, these two names are absent from `tools/list` — a client
+sees no such capability rather than one that refuses.
+
+| Tool | Arguments | Does |
+|---|---|---|
+| `os-list` | none | The allowed binaries, and for each whether the whole binary or only certain subcommands |
+| `os-run` | `bin`, `args` | Runs one allowed binary, returns its output |
+
+### Named binaries
+
+Each `[[os.tool]]` in `config.toml` publishes one more entry, `os-<bin>` plus
+any fixed arguments (`os-outl`, `os-kubectl-get`), carrying the operator's
+description. They exist for discovery: `os-run` can already reach the same
+binary, but nothing in the catalog says what it is for.
+
+Their schema exposes only `args`, appended after the fixed ones. A model
+cannot replace what the operator pinned, which is what makes `kubectl get` a
+publishable read-only view of a binary that can also delete.
+
+`os-run` is the only tool here that lets the model supply arguments. The
+operator declares which binaries may run; the model composes the invocation
+within that. The allowlist is enforced before the process is spawned, so the
+schema is a hint to the model and never the control.
+
+Refusals name the machine's config rather than the assistant's judgment, so an
+assistant relaying one does not sound like it decided:
+
+```
+`sh` is not allowed here. Call os-list for what is, and tell whoever asked
+that it is the machine's config that says no — not you.
+```
+
+Output is capped at 8 KB. Invocations run under the supervisor with the
+configured deadline and are audited at `Critical`. See
+[`guides/config-reference.md`](../guides/config-reference.md#os) for the
+allowlist syntax and [`security/threat-model.md`](../security/threat-model.md)
+V17 for what it does and does not bound.
+
 ## Tool naming
 
 MCP restricts tool names to `[a-zA-Z0-9_-]`, which agent names are not bound by. Each agent becomes `run-<sanitized-name>`:

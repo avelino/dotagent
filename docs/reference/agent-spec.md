@@ -232,6 +232,83 @@ log, and seeing what it filed is how you notice it filing the wrong things.
 > all ([config reference](../guides/config-reference.md#memory)). This one
 > says whether *this agent* writes to it.
 
+#### `[assistant.extractor]` — capturing what the model did not volunteer
+
+Without it, memory exists only when the dispatcher's own prompt tells the
+model to end replies with `MEMO:` lines and the model complies. Both are
+outside the daemon. Swap the dispatcher for one whose prompt never mentions
+`MEMO`, or let a model finish a long conversation without one, and the store
+stops growing — with no error anywhere, because nothing failed. Silence is the
+failure mode.
+
+```toml
+[assistant.extractor]
+command = "bash"
+args = ["/path/to/extract-memory.sh"]
+timeout_seconds = 45
+```
+
+After a reply is delivered, the daemon hands the turn to this command on
+stdin as one JSON object and files whatever `MEMO:` lines come back:
+
+```json
+{"message": "…", "reply": "…", "source": "telegram", "session": "chat-9"}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `command` | *(required)* | Program to run. argv, never a shell |
+| `args` | `[]` | Arguments |
+| `timeout_seconds` | `45` | Wall-clock ceiling |
+
+Stdout is read with the same parser as the reply path — one format, two
+producers — so an extractor is written against syntax already documented.
+
+**It runs off the reply path.** The answer has already reached the chat by the
+time this starts, so a slow extractor costs nobody a wait, and a broken one
+costs a turn's memory rather than the turn.
+
+**The model's own `MEMO:` lines stay a shortcut, not a requirement.** When it
+volunteers one, the daemon keeps it: the model has the turn in context and it
+costs nothing. When it does not, the extractor is the net. Both sources merge,
+and restating a fact reinforces it rather than duplicating it.
+
+**Why a declared command rather than inference in the daemon.** dotagent is
+not an AI runtime ([architecture](../concepts/architecture.md)). The daemon
+decides *when* to extract and what to do with the result; the judgment runs in
+a process the operator named, supervised and deadlined like everything else.
+
+#### What a dispatcher can run on the machine
+
+Nothing, unless `[os]` is configured in `config.toml`. That section is
+daemon-level rather than per-agent for the same reason `[telegram]` is: one
+machine has one answer about which binaries are reachable, and a manifest that
+could widen it would make every manifest a security boundary.
+
+When it is on, a dispatcher gains two tools — `os-list` and `os-run` — and the
+conversation gains the `!` prefix. They are not the same door:
+
+| | who chooses | what guards it |
+|---|---|---|
+| `os-run` | the model | `[os] allow`, and `confirm`-class commands are **refused outright**: a model may not answer its own confirmation |
+| `!rm -r /tmp/x` | the sender, typed | `[os] allow`, then a `!!` reply for `confirm`-class commands |
+
+A model composes from whatever entered its context, so a forwarded message can
+steer it. A typed line cannot be steered by content at all — which is why the
+confirmation belongs to the person and `os-run` cannot supply it. When the
+model wants something on the confirm list, the tool answers by telling it to
+ask the person to type the line.
+
+Beyond those two, `[[os.tool]]` entries publish individual binaries as named
+tools with a description, so the dispatcher can tell that `outl` exists and
+what it is for without being told in a prompt. They run under the same policy;
+a fixed `args` prefix cannot be replaced by the model.
+
+The dispatcher never sees a `!` message. It is screened out before the
+trigger is built, so there is no turn, no session and nothing stored — see
+[`../concepts/telegram.md`](../concepts/telegram.md#running-a-command-yourself)
+and [`../guides/config-reference.md`](../guides/config-reference.md#os).
+
 ### `[run].protocol` — assistant stdout
 
 The optional `protocol` field declares the stdout shape used by an assistant

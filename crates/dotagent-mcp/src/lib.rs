@@ -297,6 +297,70 @@ pub fn command_list_input_schema() -> serde_json::Value {
     })
 }
 
+/// JSON Schema for `os-run`.
+///
+/// Unlike every other tool here, this one lets the model supply arguments: the
+/// operator declares which binaries may run, not every invocation they might
+/// want. The allowlist is what keeps that bounded, and it is enforced before
+/// the process is spawned rather than described here — a schema is a hint to
+/// the model, never a control.
+pub fn os_run_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "bin": {
+                "type": "string",
+                "description": "Binary name, exactly as `os-list` reports it. A path is refused; \
+    resolution happens through PATH."
+            },
+            "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Arguments, one per element. Never interpreted by a shell, so \
+    `|`, `&&` and `$(…)` are literal text and accomplish nothing."
+            }
+        },
+        "required": ["bin"],
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for a named `os-<bin>` tool.
+///
+/// Only the arguments the model still gets to choose. The fixed ones are
+/// already spent, and describing them as parameters would invite the model to
+/// repeat them.
+pub fn os_tool_input_schema(bin: &str, fixed: &[String]) -> serde_json::Value {
+    let prefix = if fixed.is_empty() {
+        bin.to_string()
+    } else {
+        format!("{bin} {}", fixed.join(" "))
+    };
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "args": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": format!(
+                    "Arguments appended after `{prefix}`, one per element. Never interpreted \
+    by a shell."
+                )
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for `os-list`: no arguments.
+pub fn os_list_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    })
+}
+
 /// JSON Schema for `remediate-<agent>-<plugin>`: no arguments.
 ///
 /// The command is fixed by the manifest. Taking arguments would be the model

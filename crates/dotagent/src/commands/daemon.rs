@@ -333,21 +333,63 @@ impl GatewayRunner for GatewayRunnerAdapter {
             };
             let dirs = assistant_harness::HarnessDirs::from_defaults();
             let outcome = assistant_harness::finalize(&agent.manifest, req, reply, session, &dirs);
-            if !outcome.memos.is_empty() {
-                // Off the reply path: the chat must not wait on the outl
-                // write, and a failed flush must not cost the turn.
-                let root = dirs.memory_root;
-                let memos = outcome.memos;
-                let provenance = outcome.provenance;
-                tokio::task::spawn_blocking(move || {
-                    let written = dotagent_assistant::flush_memos(&root, &memos, &provenance);
-                    if written < memos.len() {
-                        tracing::warn!(
-                            written,
-                            total = memos.len(),
-                            "assistant harness: some captured memos were not persisted"
-                        );
+
+            // The extractor runs here rather than inside `finalize` because
+            // everything past this point is off the reply path: the answer is
+            // already shaped, so a model call to decide what to remember
+            // costs nobody a wait. It also runs whether or not the dispatcher
+            // volunteered anything — being the net is the entire point.
+            let extractor = agent
+                .manifest
+                .assistant
+                .as_ref()
+                .filter(|a| a.enabled && a.memory)
+                .and_then(|a| a.extractor.clone());
+            let turn_message = req
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("text"))
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let source = req.source.to_string();
+            let session = req.session_id.clone();
+            let root = dirs.memory_root;
+            let provenance = outcome.provenance;
+            let volunteered = outcome.memos;
+            let reply_for_extract = outcome.reply.clone();
+
+            if extractor.is_some() || !volunteered.is_empty() {
+                tokio::spawn(async move {
+                    let extracted = match extractor {
+                        Some(cfg) => {
+                            crate::commands::memory_extract::extract(
+                                &cfg,
+                                &turn_message,
+                                &reply_for_extract,
+                                &source,
+                                session.as_deref(),
+                            )
+                            .await
+                        }
+                        None => Vec::new(),
+                    };
+                    let memos = crate::commands::memory_extract::merge(volunteered, extracted);
+                    if memos.is_empty() {
+                        return;
                     }
+                    // spawn_blocking for the write: the outl store is
+                    // synchronous and must not block the async runtime.
+                    tokio::task::spawn_blocking(move || {
+                        let written = dotagent_assistant::flush_memos(&root, &memos, &provenance);
+                        if written < memos.len() {
+                            tracing::warn!(
+                                written,
+                                total = memos.len(),
+                                "assistant harness: some captured memos were not persisted"
+                            );
+                        }
+                    });
                 });
             }
             outcome.reply
@@ -550,6 +592,27 @@ impl LocalApiHandler for DaemonLocalApiHandler {
     ) -> std::result::Result<Option<ResponseHook>, crate::local_api::protocol::ServerError> {
         params.validate()?;
         let session_id = params.effective_session_id().to_string();
+
+        // Same prefix, same allowlist, same audit entry as over Telegram. A
+        // typed command means the same thing whichever socket carried it, and
+        // a second implementation here would be a second policy eventually.
+        if crate::os_exec::is_confirmation(&params.text) {
+            let text = handle_confirmation(&session_id).await;
+            let _ = events.send(&crate::local_api::protocol::ServerEvent::reply(
+                session_id.clone(),
+                text,
+            ));
+            return Ok(None);
+        }
+        if let Some((bin, args)) = crate::os_exec::parse_bang(&params.text) {
+            let text = handle_typed_command(&session_id, &bin, &args).await;
+            let _ = events.send(&crate::local_api::protocol::ServerEvent::reply(
+                session_id.clone(),
+                text,
+            ));
+            return Ok(None);
+        }
+
         let req = TriggerRequest {
             source: TriggerSource::Local,
             agent: self.dispatcher_agent.clone(),
@@ -778,6 +841,40 @@ fn spawn_telegram_ingress(
                             warn!(error = %e, "could not answer a catalog question");
                         }
                     }
+                    Screened::Bang { bin, args } => {
+                        // No model call and no session: the sender typed the
+                        // command, so there is nothing to interpret and
+                        // nothing to remember. Errors go back raw for the
+                        // same reason — a paraphrased exit code is worse
+                        // than the exit code.
+                        let text =
+                            handle_typed_command(&msg.chat_id.to_string(), &bin, &args).await;
+                        if let Err(e) = dotagent_notify::telegram_inbound::reply(
+                            &cfg.bot_token,
+                            msg.chat_id,
+                            Some(msg.message_id),
+                            &text,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "could not deliver a ! result");
+                        }
+                    }
+                    Screened::Confirm => {
+                        // The chat id keys the parked command, so `!!` can
+                        // only ever release what was asked in this chat.
+                        let text = handle_confirmation(&msg.chat_id.to_string()).await;
+                        if let Err(e) = dotagent_notify::telegram_inbound::reply(
+                            &cfg.bot_token,
+                            msg.chat_id,
+                            Some(msg.message_id),
+                            &text,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "could not deliver a !! result");
+                        }
+                    }
                     Screened::Run(req) => {
                         let sink = Arc::new(TelegramSink::new(
                             cfg.bot_token.clone(),
@@ -908,6 +1005,18 @@ enum Screened {
     /// as discovering manifests, while resolving a command to its body stays
     /// with the dispatcher, over `command-get`.
     Answer(String),
+    /// A `!` line: run this binary, do not involve the dispatcher.
+    ///
+    /// The point of the prefix is that no model sees it. A typed command is
+    /// exact, and routing it through an assistant would mean something that
+    /// paraphrases deciding what the person meant. The allowlist still
+    /// applies — see `os_exec` for why a typed line is not the looser case.
+    Bang {
+        bin: String,
+        args: Vec<String>,
+    },
+    /// `!!` — run what this conversation parked, if anything.
+    Confirm,
     Reject(&'static str),
 }
 
@@ -929,6 +1038,8 @@ impl Screened {
         match self {
             Screened::Run(r) => *r,
             Screened::Answer(t) => panic!("expected a run, got an answer: {t}"),
+            Screened::Bang { bin, .. } => panic!("expected a run, got a bang: {bin}"),
+            Screened::Confirm => panic!("expected a run, got a confirmation"),
             Screened::Reject(r) => panic!("expected a run, got a rejection: {r}"),
         }
     }
@@ -946,6 +1057,52 @@ impl Screened {
 /// allowlist is the only thing standing between a bot token and local
 /// execution, and it should be testable without a network. The command catalog
 /// arrives as an argument for the same reason.
+/// Commands parked waiting for `!!`, shared by every inbound path.
+///
+/// A `OnceLock` rather than a field because both the Telegram loop and the
+/// local API handler need the same map, and a second map would mean a `!!`
+/// confirming nothing in the channel it was typed in.
+static CONFIRMATIONS: std::sync::OnceLock<crate::os_exec::Confirmations> =
+    std::sync::OnceLock::new();
+
+fn confirmations() -> &'static crate::os_exec::Confirmations {
+    CONFIRMATIONS.get_or_init(crate::os_exec::Confirmations::default)
+}
+
+/// Resolve a typed line into the text to answer with, running it when the
+/// policy allows and parking it when the policy asks first.
+///
+/// Shared by Telegram and the local socket: the same line means the same
+/// thing whichever transport carried it.
+async fn handle_typed_command(session: &str, bin: &str, args: &[String]) -> String {
+    let cfg = crate::os_exec::config();
+    match cfg.decide(bin, args) {
+        dotagent_core::config::OsDecision::Deny => crate::os_exec::refusal_typed(bin),
+        dotagent_core::config::OsDecision::Confirm => {
+            confirmations().park(session, bin, args);
+            crate::os_exec::confirmation_prompt(bin, args, cfg.confirm_ttl_seconds)
+        }
+        dotagent_core::config::OsDecision::Allow => {
+            crate::os_exec::run_allowed(&cfg, bin, args, crate::os_exec::refusal_typed)
+                .await
+                .text
+        }
+    }
+}
+
+/// Answer `!!`: run whatever this conversation had parked.
+async fn handle_confirmation(session: &str) -> String {
+    let cfg = crate::os_exec::config();
+    match confirmations().take(session, cfg.confirm_ttl_seconds) {
+        Some((bin, args)) => {
+            crate::os_exec::run_allowed(&cfg, &bin, &args, crate::os_exec::refusal_typed)
+                .await
+                .text
+        }
+        None => "Nothing is waiting for confirmation here (or it expired).".to_string(),
+    }
+}
+
 fn screen(
     msg: &dotagent_notify::telegram_inbound::InboundMessage,
     cfg: &dotagent_core::TelegramIngressConfig,
@@ -969,6 +1126,15 @@ fn screen_with_store(
     }
     if !limiter.check(msg.user_id) {
         return Screened::Reject("rate limit exceeded");
+    }
+
+    // After the allowlist and the rate limit, before anything that involves
+    // the dispatcher: a `!` line is not a conversation turn.
+    if crate::os_exec::is_confirmation(&msg.text) {
+        return Screened::Confirm;
+    }
+    if let Some((bin, args)) = crate::os_exec::parse_bang(&msg.text) {
+        return Screened::Bang { bin, args };
     }
 
     // Lexical only: `/name args` is Telegram wire syntax, the same class of
@@ -3557,6 +3723,100 @@ minute = 0
 
     // --- screen(): the allowlist is the only thing between a leaked bot
     // token and local execution. Deny cases dominate on purpose. ---
+
+    // --- `!`: a typed command skips the dispatcher, never the screening. ---
+
+    fn bang(user_id: i64, text: &str) -> dotagent_notify::telegram_inbound::InboundMessage {
+        let mut m = inbound(user_id);
+        m.text = text.into();
+        m
+    }
+
+    #[test]
+    fn a_bang_line_becomes_a_bang_not_a_run() {
+        let out = screen(
+            &bang(7, "!ls -la"),
+            &cfg(vec![7]),
+            &mut limiter(),
+            &empty_catalog(),
+        );
+        match out {
+            Screened::Bang { bin, args } => {
+                assert_eq!(bin, "ls");
+                assert_eq!(args, vec!["-la".to_string()]);
+            }
+            _ => panic!("expected a bang"),
+        }
+    }
+
+    #[test]
+    fn a_double_bang_is_a_confirmation_not_a_command_named_bang() {
+        assert!(matches!(
+            screen(
+                &bang(7, "!!"),
+                &cfg(vec![7]),
+                &mut limiter(),
+                &empty_catalog()
+            ),
+            Screened::Confirm
+        ));
+    }
+
+    #[test]
+    fn an_unlisted_user_cannot_confirm_either() {
+        assert!(screen(
+            &bang(7, "!!"),
+            &cfg(vec![1, 2]),
+            &mut limiter(),
+            &empty_catalog()
+        )
+        .is_rejected());
+    }
+
+    #[test]
+    fn an_unlisted_user_cannot_reach_the_bang_path() {
+        // The prefix is a routing decision, not an authentication one. If it
+        // were read before the allowlist, `!` would be a hole straight past it.
+        assert!(screen(
+            &bang(7, "!ls"),
+            &cfg(vec![1, 2]),
+            &mut limiter(),
+            &empty_catalog()
+        )
+        .is_rejected());
+    }
+
+    #[test]
+    fn the_rate_limit_still_applies_to_bang_lines() {
+        let mut lim = dotagent_notify::telegram_inbound::RateLimiter::new(1);
+        let c = cfg(vec![7]);
+        assert!(!screen(&bang(7, "!ls"), &c, &mut lim, &empty_catalog()).is_rejected());
+        assert!(screen(&bang(7, "!ls"), &c, &mut lim, &empty_catalog()).is_rejected());
+    }
+
+    #[test]
+    fn a_message_merely_containing_a_bang_is_an_ordinary_turn() {
+        assert!(screen(
+            &bang(7, "what does ! do?"),
+            &cfg(vec![7]),
+            &mut limiter(),
+            &empty_catalog()
+        )
+        .is_run());
+    }
+
+    #[test]
+    fn a_slash_command_is_not_swallowed_by_the_bang_path() {
+        assert!(!matches!(
+            screen(
+                &bang(7, "/standup"),
+                &cfg(vec![7]),
+                &mut limiter(),
+                &empty_catalog()
+            ),
+            Screened::Bang { .. }
+        ));
+    }
 
     #[test]
     fn screen_refuses_an_unlisted_user() {

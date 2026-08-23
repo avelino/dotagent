@@ -104,6 +104,7 @@ docs/
 | Novo subcomando CLI | `crates/dotagent/src/commands/` |
 | Novo notifier built-in (driver) | `dotagent-notify/src/drivers/` |
 | Ingress (receber evento externo) | `dotagent-notify/src/<source>_inbound.rs` (transporte) + política no daemon |
+| Rodar binário do OS (`[os]`, `os-run`, prefixo `!`) | `dotagent-core/src/config.rs` (allowlist, pura) + `dotagent/src/os_exec.rs` (parse do `!`, spawn, audit) + wiring em `commands/mcp.rs` e `commands/daemon.rs` + `docs/security/threat-model.md` V17 |
 | Local client API / trigger gateway | `dotagent/src/local_api/` (UDS + JSON lines) + `dotagent/src/gateway/` (admission, FIFO, cap, delivery) |
 | Tipo do protocolo MCP | `dotagent-mcp/src/lib.rs` + `docs/reference/mcp.md` |
 | Memória de agent (outl) | `dotagent-memory/src/lib.rs` (store) + `record.rs` (shape do fato + props) + `score.rs` (ranking, **puro**) + `docs/concepts/memory.md` |

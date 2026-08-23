@@ -160,6 +160,7 @@ fn tools_list() -> Result<serde_json::Value> {
     tools.extend(memory_tools());
     tools.extend(skill_tools());
     tools.extend(command_tools());
+    tools.extend(os_tools());
 
     serde_json::to_value(ToolsListResult { tools }).context("serializing tool list")
 }
@@ -292,6 +293,138 @@ fn skills_enabled() -> bool {
         .unwrap_or_default()
         .skills
         .enabled
+}
+
+/// OS tools. Present only when `[os]` is on **and** carries an allowlist.
+///
+/// Absent is the default. A catalog that does not list `os-run` is a catalog
+/// where no chat message can start a process, which is a stronger statement
+/// than a tool that exists and refuses.
+fn os_tools() -> Vec<Tool> {
+    let cfg = crate::os_exec::config();
+    if !cfg.is_active() {
+        return Vec::new();
+    }
+    vec![
+        Tool {
+            name: "os-list".into(),
+            description: "The installed binaries this machine allows, and for each one whether \
+                the whole binary is available or only certain subcommands. Check here before \
+                os-run: a binary that is installed is not necessarily allowed."
+                .into(),
+            input_schema: dotagent_mcp::os_list_input_schema(),
+        },
+        Tool {
+            name: "os-run".into(),
+            description: "Run one allowed binary and return what it printed. Arguments go \
+                straight to the program, never through a shell, so pipes and redirects are \
+                literal text. Refused unless the operator listed it. Prefer a named os-* \
+                tool when one exists — it says what the binary is for."
+                .into(),
+            input_schema: dotagent_mcp::os_run_input_schema(),
+        },
+    ]
+    .into_iter()
+    .chain(cfg.tools.iter().map(|t| Tool {
+        name: t.tool_name(),
+        // The operator's sentence, verbatim. dotagent does not know what
+        // `outl` is for and inventing a description would be guessing at the
+        // one thing this entry exists to supply.
+        description: t.description.clone(),
+        input_schema: dotagent_mcp::os_tool_input_schema(&t.bin, &t.args),
+    }))
+    .collect()
+}
+
+async fn call_os(tool: &str, args: &serde_json::Value) -> Option<CallToolResult> {
+    match tool {
+        "os-list" => Some(os_list()),
+        "os-run" => Some(os_run(args).await),
+        _ => os_named_tool(tool, args).await,
+    }
+}
+
+/// A binary the operator published under its own name.
+///
+/// The fixed arguments come from the manifest and the rest from the model,
+/// then the pair goes through the same policy as everything else — a named
+/// tool is a nicer front door, not a second set of rules.
+async fn os_named_tool(tool: &str, raw: &serde_json::Value) -> Option<CallToolResult> {
+    let cfg = crate::os_exec::config();
+    let declared = cfg.tools.iter().find(|t| t.tool_name() == tool)?;
+    let argv = declared.argv(&string_array(raw, "args"));
+
+    if cfg.decide(&declared.bin, &argv) == dotagent_core::config::OsDecision::Confirm {
+        return Some(CallToolResult::text(
+            format!(
+                "`{}` needs a person to confirm it. Tell whoever asked to send \
+                 `!{} {}` themselves — you cannot confirm on their behalf.",
+                declared.bin,
+                declared.bin,
+                argv.join(" ")
+            ),
+            true,
+        ));
+    }
+
+    let outcome =
+        crate::os_exec::run_allowed(&cfg, &declared.bin, &argv, crate::os_exec::refusal).await;
+    Some(CallToolResult::text(outcome.text, outcome.is_error))
+}
+
+fn os_list() -> CallToolResult {
+    let cfg = crate::os_exec::config();
+    if !cfg.is_active() {
+        return CallToolResult::text("No binaries are allowed on this machine.", true);
+    }
+    if cfg.is_wildcard() {
+        return CallToolResult::text(
+            "Every installed binary is allowed. Resolution goes through PATH, and a path is \
+             still refused where a name belongs.",
+            false,
+        );
+    }
+    let mut lines = Vec::with_capacity(cfg.allow.len());
+    for entry in &cfg.allow {
+        let mut tokens = entry.split_whitespace();
+        match (tokens.next(), tokens.collect::<Vec<_>>()) {
+            (Some(bin), scope) if scope.is_empty() => lines.push(format!("{bin} (any subcommand)")),
+            (Some(bin), scope) => lines.push(format!("{bin} {} (only)", scope.join(" "))),
+            (None, _) => {}
+        }
+    }
+    CallToolResult::text(lines.join("\n"), false)
+}
+
+/// The allowlist, the spawn and the audit entry all live in `os_exec`, shared
+/// with the `!` path. Two callers enforcing the same policy separately is how
+/// they end up enforcing different ones.
+async fn os_run(raw: &serde_json::Value) -> CallToolResult {
+    let bin = raw.get("bin").and_then(|v| v.as_str()).unwrap_or_default();
+    let args = string_array(raw, "args");
+    let cfg = crate::os_exec::config();
+
+    // A model cannot answer its own confirmation. The prompt exists so a
+    // person decides, and a tool that let the caller both ask and agree would
+    // be a confirmation in name only — so this path refuses and says who has
+    // to type it.
+    if cfg.decide(bin, &args) == dotagent_core::config::OsDecision::Confirm {
+        return CallToolResult::text(
+            format!(
+                "`{bin}` needs a person to confirm it. Tell whoever asked to send \
+                 `!{bin}{}` themselves — you cannot confirm on their behalf.",
+                if args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", args.join(" "))
+                }
+            ),
+            true,
+        );
+    }
+
+    let outcome = crate::os_exec::run_allowed(&cfg, bin, &args, crate::os_exec::refusal).await;
+    CallToolResult::text(outcome.text, outcome.is_error)
 }
 
 /// Introspection tools. Always available — reading a log has nothing to do
@@ -1225,6 +1358,14 @@ async fn tools_call(id: serde_json::Value, params: Option<serde_json::Value>) ->
 
     // A declared remediation runs a command, not an agent.
     if let Some(result) = call_remediation(&call.name).await {
+        return match serde_json::to_value(result) {
+            Ok(v) => JsonRpcResponse::ok(id, v),
+            Err(e) => JsonRpcResponse::err(id, error_code::INTERNAL_ERROR, e.to_string()),
+        };
+    }
+
+    // An allowed binary is not an agent either.
+    if let Some(result) = call_os(&call.name, &raw_args).await {
         return match serde_json::to_value(result) {
             Ok(v) => JsonRpcResponse::ok(id, v),
             Err(e) => JsonRpcResponse::err(id, error_code::INTERNAL_ERROR, e.to_string()),

@@ -424,6 +424,94 @@ blip. Nothing was compromised to cause it; the notifier just had a bad day.
 `${VAR}` path exists so this never has to happen; `doctor` does not currently
 flag literals that look like credentials.
 
+### V17 — Installed binaries reachable from a chat message
+
+`[os]` lets an assistant run binaries that are already on the machine. It is
+the widest inbound path in this document, and the only one where the operator
+declares what *may* run while a model chooses the arguments. Everything else
+here either fixes the whole command in a manifest (V12) or ships the code
+being run inside the repo (V10).
+
+The honest framing: an allowlist of whole binaries is not a sandbox. `git log`
+cannot write to the repo, but `git` with the right flags can run a pager, and
+a binary that takes a `--exec` style flag will do what that flag says. What
+the allowlist buys is that the set of programs is finite, declared, and
+auditable — not that every invocation inside it is harmless.
+
+**Mitigations:**
+- **Off by default, and empty by default when on.** `enabled = true` with no
+  `allow` list runs nothing. Reaching "on" by accident is a state that should
+  do nothing rather than everything.
+- **The catalog is the boundary**, as everywhere else: with `[os]` off, the
+  `os-run` and `os-list` tools are absent from `tools/list`, so a client sees
+  no such capability rather than one that refuses.
+- **Whole-token matching.** `kubectl get` admits `kubectl get pods` and
+  refuses `kubectl delete` and `kubectl getsecrets`. Granularity is per entry,
+  so a binary that only reads can be listed bare and one that can change
+  production can be pinned to its safe subcommands.
+- **A name, never a path.** `/bin/sh`, `./sh` and anything carrying `..` are
+  refused before the list is consulted, so a path cannot impersonate a listed
+  name. Resolution goes through `PATH`.
+- **argv, not a shell.** Arguments reach the program as a token list. `|`,
+  `&&` and `$(…)` in an argument are literal characters, the same rule as V5.
+- **Supervised**, with the configured deadline and kill-tree on expiry.
+- **Audited** as `os_command_invoked` at `Critical`, recording the binary and
+  **the full argument list** — the half that no manifest declared.
+
+**The `!` prefix.** A message starting with `!` is run directly: `!rg foo`
+spawns `rg` with one argument and never reaches the dispatcher. It is the same
+policy through a different door, and it is *narrower* than the model's door in
+the way that matters — a typed line cannot be steered by content, so the
+prompt-injection surface that makes `os-run` risky does not exist here.
+
+- **Screened first.** The prefix is read after the Telegram allowlist and the
+  rate limit, never before. Reading it earlier would make `!` a way past both.
+- **The same `[os] allow` list.** A typed line is not trusted further than a
+  chosen one, because the allowlist authenticates an account and not a person
+  (V8): a stolen session types `!` just as well. Without this, one compromised
+  session would go from "runs what the operator allowed" to "unrestricted
+  shell".
+- **No session, no model, no memory.** Nothing is stored and no reply is
+  paraphrased. Errors come back raw, which is the point of typing it yourself.
+- **Not a shell.** Quotes group an argument; `|`, `&&`, `;` and `$(…)` are
+  ordinary characters in an argument list. `!ls; rm x` asks for a binary
+  literally named `ls;` and fails to find it.
+
+**`deny` and `confirm`.** `deny` refuses always and beats `allow`, `*`
+included — a list that could be widened past its own refusals would not be
+one. `confirm` runs only after a person answers `!!` in the same conversation,
+and it defaults to a non-empty list precisely because `allow = ["*"]` with no
+brake is the configuration people reach for first.
+
+Matching is per binary rather than per pattern. `confirm = ["rm"]` covers
+`rm -rf /`, `rm -r -f /`, `rm -fr /` and `rm --recursive --force /`; a textual
+`"rm -rf"` would cover the first and miss three. The shells are on the default
+list for the same reason: with `*`, `sh -c` reaches every binary a
+binary-name guard would otherwise catch.
+
+**A model may not confirm.** `os-run` refuses anything on the `confirm` list
+outright and tells the caller to have the person type it. The confirmation
+exists so a human decides; a tool that could both request and grant it would
+be theatre. This is the one asymmetry between the two doors, and it is the
+point of having two.
+
+Confirmations are held in memory, one slot per conversation, with a TTL. A
+restart forgets them, which fails closed: the cost is retyping a command, not
+a `!!` from yesterday landing on a machine whose operator has moved on.
+
+**`allow = ["*"]`** admits every binary on `PATH`. It is a supported
+configuration and it is the widest one: with a shell in reach, the mitigations
+above stop bounding *what* runs and bound only *who can ask* and *what gets
+recorded*. The inbound channel's own gate (Telegram's `allowed_user_ids`, the
+socket's uid check) becomes the whole boundary, and `doctor` says so on every
+run rather than letting it be configured once and forgotten.
+
+**Residual risk, stated plainly:** an allowlisted binary is trusted with
+whatever that binary can do. Listing `kubectl` bare on a machine with
+production credentials means a chat message can reach production. That is a
+choice the operator makes per entry, which is why the granularity exists and
+why the default is an empty list.
+
 ### V15 — Local Unix-socket API
 
 The daemon can expose a local client API at `$DOTAGENT_HOME/api.sock` when

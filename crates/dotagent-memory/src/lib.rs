@@ -352,8 +352,14 @@ impl MemoryStore {
     /// gathers under it — the graph silently has holes. Each page is
     /// projected right away: creating it only in the op log leaves a page the
     /// CRDT knows about and the desktop app does not.
+    /// Create a page for each topic, skipping days.
+    ///
+    /// A linked date resolves to a journal, which the workspace already owns.
+    /// Creating a `pages/2026-08-24.md` beside `journals/2026-08-24.md` would
+    /// leave two pages answering to the same name, and the backlink would
+    /// land on the empty one.
     fn ensure_topic_pages(&self, ctx: &mut outl_ws::WsCtx, topics: &[String]) -> Result<()> {
-        for slug in topics {
+        for slug in topics.iter().filter(|s| !is_journal_slug(s)) {
             let topic_id = page::open_or_create(
                 &mut ctx.workspace,
                 &ctx.hlc,
@@ -872,6 +878,38 @@ mod tests {
             .remember("fato", &["roam".into(), "Roam".into(), "roam".into()])
             .unwrap();
         assert_eq!(m.topics, vec!["roam".to_string()]);
+    }
+
+    #[test]
+    fn a_dated_fact_links_the_day_without_creating_a_page_for_it() {
+        let (dir, store) = store();
+        store
+            .remember("TODO até 2026-08-24: abrir a issue", &["pendencias".into()])
+            .unwrap();
+
+        // The link is in the file, so the journal for that day backlinks here.
+        let today = dir
+            .path()
+            .join("journals")
+            .join(format!("{}.md", today_slug()));
+        let body = std::fs::read_to_string(&today).unwrap();
+        assert!(
+            body.contains("[[2026-08-24]]"),
+            "the date should be linked: {body}"
+        );
+
+        // …and no page was created to compete with that journal.
+        let stray = dir.path().join("pages").join("2026-08-24.md");
+        assert!(!stray.exists(), "a day must not also become a topic page");
+
+        // The statement still reads as a sentence on the way back out.
+        let facts = store.recall("issue", 10).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert!(
+            facts[0].text.contains("2026-08-24"),
+            "the date must survive the round trip: {}",
+            facts[0].text
+        );
     }
 
     #[test]

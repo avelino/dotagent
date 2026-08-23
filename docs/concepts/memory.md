@@ -132,10 +132,34 @@ Three doors, all landing in the same workspace:
 | Writer | How | Provenance recorded |
 |---|---|---|
 | A conversational agent | `MEMO:` lines in its reply, captured by the `[assistant]` harness | agent, source, session |
+| The same agent, when it forgets | `[assistant.extractor]` — a command the daemon runs over the turn after the reply goes out | agent, source, session |
 | Any other agent | `MEMO:` lines on stdout, when its manifest declares `[memory]` | agent, `source:: schedule` |
 | Anything holding the tools | `memory-remember` over MCP, or `dotagent memory remember` | agent |
 
-The second door is the one that makes the store grow on its own: a scheduled agent that learns something durable prints `MEMO: <fact> | topics: a, b` and the daemon files it. Opt-in per manifest, and only on a successful run — see [`[memory]` in the agent spec](../reference/agent-spec.md#memory--memory-capture-for-a-plain-agent-opt-in).
+Dates in a fact are linked on the way in. `TODO até 2026-08-24: abrir a
+issue` is stored as `TODO até [[2026-08-24]]: abrir a issue`, so the day's
+journal backlinks to the pendency and asking "what is due Monday" is a
+backlink walk rather than a text search. Only ISO dates, because that is the
+slug a daily page carries; a date already in brackets is left alone, so
+re-rendering a fact never nests them. The link is added by the store, not
+asked of a model — a rule that depends on whichever model wrote the fact
+remembering the syntax is not a rule.
+
+A linked day is a link, never a topic page: the journal for that date already
+exists, and creating a `pages/2026-08-24.md` beside it would leave two pages
+answering to one name with the backlink landing on the empty one.
+
+The second door is what keeps the first from being a single point of failure.
+`MEMO:` capture works only when the dispatcher's prompt asks for it *and* the
+model complies, and neither is something the daemon controls: a model that
+finishes a conversation without emitting a line leaves no error behind, just a
+journal that did not grow. Declaring an
+[`[assistant.extractor]`](../reference/agent-spec.md#assistantextractor--capturing-what-the-model-did-not-volunteer)
+moves the decision to a command the operator names, run by the daemon after
+every turn. The model's own lines remain a shortcut worth taking; they stop
+being the only way in.
+
+The third door is the one that makes the store grow on its own: a scheduled agent that learns something durable prints `MEMO: <fact> | topics: a, b` and the daemon files it. Opt-in per manifest, and only on a successful run — see [`[memory]` in the agent spec](../reference/agent-spec.md#memory--memory-capture-for-a-plain-agent-opt-in).
 
 Opt-in rather than automatic because most agents print status, not knowledge. A store that absorbs status is a store whose recall returns status, and then the assistant answers from it.
 

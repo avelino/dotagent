@@ -14,6 +14,7 @@ mod commands;
 mod discovery;
 mod gateway;
 mod local_api;
+mod os_exec;
 mod power;
 mod skills;
 mod slash;

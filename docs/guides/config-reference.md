@@ -526,6 +526,180 @@ per-vendor recipes (Honeycomb, Tempo, Jaeger, Datadog).
 
 ---
 
+## `[os]`
+
+Installed binaries an assistant may run. **Off by default, and empty by
+default even when on** — the only section here that starts closed.
+
+```toml
+[os]
+enabled = true
+allow = ["rg", "outl", "kubectl get", "gh pr list"]
+timeout_seconds = 60
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Expose the `os-run` / `os-list` tools |
+| `allow` | `[]` | What may run. Empty runs nothing, even when enabled |
+| `timeout_seconds` | `60` | Wall-clock ceiling for one invocation |
+
+### Naming a binary so the model knows it exists
+
+`os-run` makes every allowed binary reachable. Reachable is not discoverable:
+a model has to already know `outl` exists and guess what it is for. An
+`[[os.tool]]` entry publishes one under its own name, with a description:
+
+```toml
+[[os.tool]]
+bin = "outl"
+description = "Personal outliner: search notes, read a page by slug, read a daily journal."
+
+[[os.tool]]
+bin = "kubectl"
+args = ["get"]
+description = "Read Kubernetes objects: pods, deployments, nodes. Read-only."
+```
+
+That publishes `os-outl` and `os-kubectl-get`. The description is the whole
+point — a name without one is what `os-run` already offers.
+
+`args` fixes the leading arguments. The model appends to them and cannot
+replace them, so `kubectl get` is a read-only view of a binary that can also
+delete: asking that tool for `delete pods` runs `kubectl get delete pods`,
+which fails as it should. Two entries for one binary with different fixed
+arguments get distinct names and never collide.
+
+**Keep the list short.** A normal machine has around a thousand executables on
+`PATH`; a tool each would bury the catalog and push the useful ones behind
+tool search. Name the ones that come up by name in conversation and let the
+rest fall through to `os-run`.
+
+Named tools obey the same policy as everything else: `deny` refuses them, and
+a `confirm`-class binary is refused with a note to have the person type it.
+`doctor` reports an entry whose binary `allow` does not admit, one with an
+empty description, and two entries that would resolve to the same name.
+
+### Asking before it acts
+
+`allow` says what may run. Two more lists say how:
+
+```toml
+[os]
+allow = ["*"]
+deny = ["shutdown", "reboot"]          # never, whoever asks
+confirm = ["rm", "dd", "sh", "bash"]   # only after a person says yes
+confirm_ttl_seconds = 120
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `deny` | `[]` | Refused always. Beats `allow`, including `*` |
+| `confirm` | *(see below)* | Runs only after a `!!` reply |
+| `confirm_ttl_seconds` | `120` | How long a parked command stays answerable |
+
+**`confirm` does not default to empty.** With `allow = ["*"]` an empty one
+would mean a chat message can repartition a disk with nothing in between, so
+the default covers the destructive classics — `rm`, `rmdir`, `dd`, `mkfs`,
+`shred`, `diskutil`, `fdisk`, `parted`, `shutdown`, `reboot`, `halt` — and the
+shells: `sh`, `bash`, `zsh`, `fish`, `dash`, `ksh`.
+
+The shells are the entry that makes the rest mean anything. A guard on `rm`
+that lets `sh -c 'rm -rf /'` through guards nothing. Set `confirm = []` to opt
+out deliberately.
+
+The flow:
+
+```
+!rm -r /tmp/x
+    This will run:
+
+        rm -r /tmp/x
+
+    Send `!!` to confirm. It expires in 120s.
+!!
+    `rm` exited 0 and printed nothing.
+```
+
+One slot per conversation, so `!!` can only ever release the last thing *that*
+chat parked. Pending confirmations live in memory: a daemon restart forgets
+them, which fails in the safe direction.
+
+**A model cannot confirm.** When `os-run` asks for something on the `confirm`
+list, it is refused and told to have the person type the line. A tool that
+could both ask and agree would be a confirmation in name only.
+
+Matching is per binary, not per pattern, which is what makes it hold:
+`confirm = ["rm"]` catches `rm -rf /`, `rm -r -f /`, `rm -fr /` and
+`rm --recursive --force /` alike, where a textual `"rm -rf"` would catch one
+of the four.
+
+### Opening the whole machine
+
+A single entry `*` allows every binary on `PATH`, a shell included:
+
+```toml
+[os]
+enabled = true
+allow = ["*"]
+```
+
+Prefer this over enumerating `PATH`. An enumerated list goes stale the next
+time something is installed, and reading four hundred names suggests a
+decision was made about each one — `*` says what is true.
+
+What it means concretely: anyone who can send a message can run what the
+daemon's user can run. Whatever guards the inbound channel (the Telegram
+`allowed_user_ids`, the socket's uid check) is now guarding the machine rather
+than the agent catalog. `doctor` prints a warning on every run while this is
+set, and each invocation is still audited with its full argument list.
+
+A path is refused even here: `/bin/sh` is not a name, and `sh` is what runs.
+
+### Granularity is per entry
+
+An entry is a binary name, optionally followed by the leading arguments that
+must match:
+
+- `rg` allows the binary and every argument it takes.
+- `kubectl get` allows that subcommand only. `kubectl delete` is refused by
+  the catalog, not by the cluster.
+
+Matching is on whole tokens, so `kubectl get` never admits
+`kubectl getsecrets`. Choose bare for binaries that only read, and pin the
+subcommand for anything that can change something you care about.
+
+### Two ways to reach it
+
+The allowlist is one policy with two doors:
+
+- **`os-run`**, where an assistant decided a binary would help.
+- **`!` in a message**, where you typed the command yourself. `!rg foo src`
+  runs it directly: no model, no session, nothing stored, and errors come back
+  raw. Works over Telegram and over the local socket (`dotagent api`).
+
+The prefix is read after the Telegram allowlist and rate limit, and obeys the
+same `allow` list — a stolen session types `!` as easily as you do.
+
+Quotes group an argument (`!rg "hello world"`). Nothing else from a shell
+applies: `!ls; rm x` looks for a binary named `ls;`.
+
+### What it does not do
+
+The allowlist bounds *which programs* run, not what each one is capable of.
+A binary listed bare is trusted with everything it can do, and some read-ish
+commands can still execute things through their own flags. Listing `kubectl`
+bare on a machine holding production credentials means a chat message reaches
+production.
+
+Arguments never touch a shell. `os-run` spawns the program with an argument
+list, so `|`, `&&` and `$(…)` are literal characters. A path is refused where
+a name is expected, so `/bin/sh` cannot stand in for a listed `sh`.
+
+Every invocation is audited as `os_command_invoked` at `Critical`, recording
+the binary and the full argument list. See
+[`security/threat-model.md`](../security/threat-model.md) V17.
+
 ## What's NOT in `config.toml`
 
 | Concern                                | Where instead                                                                  |

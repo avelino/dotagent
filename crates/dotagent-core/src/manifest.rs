@@ -138,6 +138,49 @@ pub struct AssistantConfig {
     pub transcript_bytes_max: Option<u64>,
     #[serde(default)]
     pub toolkit: AssistantToolkit,
+    /// How the daemon captures facts on its own, instead of waiting for the
+    /// model to volunteer them.
+    #[serde(default)]
+    pub extractor: Option<AssistantExtractor>,
+}
+
+/// A command the daemon runs after each turn to decide what was worth
+/// keeping.
+///
+/// Without one, memory exists only when the dispatcher's own prompt tells it
+/// to end replies with `MEMO:` lines — which makes the memory of the whole
+/// machine a property of one agent's prompt file. Swap the dispatcher for one
+/// whose prompt never mentions `MEMO`, and the store quietly stops growing
+/// with no error anywhere.
+///
+/// The extractor moves that decision to something the operator declares. The
+/// daemon does not judge the conversation itself: it decides *when* to
+/// extract, runs a supervised process, and files what comes back. Inference
+/// stays outside, which is what keeps "dotagent is not an AI runtime" true.
+///
+/// ```toml
+/// [assistant.extractor]
+/// command = "bash"
+/// args = ["/path/to/extract.sh"]
+/// ```
+///
+/// The turn arrives on stdin as one JSON object (`message`, `reply`,
+/// `source`, `session`), and stdout is read with the same `MEMO:` parser the
+/// reply path uses. One format, two producers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantExtractor {
+    /// Program to run. argv, never a shell.
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Wall-clock ceiling. Kept short on purpose: this sits between a reply
+    /// being ready and the reply being delivered.
+    #[serde(default = "default_extractor_timeout")]
+    pub timeout_seconds: u64,
+}
+
+fn default_extractor_timeout() -> u64 {
+    45
 }
 
 fn default_assistant_enabled() -> bool {

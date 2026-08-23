@@ -74,6 +74,262 @@ pub struct Config {
     pub daily_summary: DailySummaryConfig,
     #[serde(default)]
     pub power: crate::power::PowerConfig,
+    #[serde(default)]
+    pub os: OsConfig,
+}
+
+/// Installed binaries an assistant may run.
+///
+/// **Off by default, and empty by default even when on.** Everything else in
+/// this file describes what dotagent does on its own schedule; this describes
+/// what someone in a chat window can make it do to the machine. The two are
+/// not equally reversible, so this one starts closed and the operator opens
+/// it deliberately.
+///
+/// ```toml
+/// [os]
+/// enabled = true
+/// allow = ["outl", "rg", "kubectl get", "gh pr"]
+/// timeout_seconds = 60
+/// ```
+///
+/// An entry is a binary name, optionally followed by the leading arguments
+/// that must match. A bare `outl` allows the binary and every subcommand it
+/// has. `kubectl get` allows that subcommand and nothing else, so a request
+/// for `kubectl delete` is refused by the catalog rather than by the cluster.
+///
+/// Choose the granularity per binary: whole-binary for the ones that only
+/// read, subcommand for the ones that can change something you care about.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OsConfig {
+    /// Expose the `os-run` / `os-list` tools from `dotagent mcp`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// What may run. Empty means nothing runs, even with `enabled = true`,
+    /// because "on with no list" is a state an operator reaches by accident
+    /// and it should do nothing rather than everything.
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Never runs, whoever asks and however the allowlist reads. Checked
+    /// first, so it also overrides `*`.
+    #[serde(default)]
+    pub deny: Vec<String>,
+    /// Runs only after a person confirms it in a following message.
+    ///
+    /// The default is not empty: with `allow = ["*"]` an empty one would mean
+    /// a chat message can repartition the disk with nothing in between. A
+    /// shell is on the list because a shell is every other entry — a `rm`
+    /// guard that lets `sh -c 'rm -rf /'` through guards nothing.
+    ///
+    /// Set it to `[]` to opt out deliberately.
+    #[serde(default = "default_os_confirm")]
+    pub confirm: Vec<String>,
+    /// How long a pending confirmation stays answerable.
+    #[serde(default = "default_os_confirm_ttl_seconds")]
+    pub confirm_ttl_seconds: u64,
+    /// Binaries worth a tool of their own, with a description the model reads.
+    ///
+    /// `os-run` makes every allowed binary reachable, but reachable is not
+    /// discoverable: a model has to already know `outl` exists and what it is
+    /// for. An entry here becomes its own MCP tool, so the binary shows up in
+    /// the catalog with a sentence explaining when to reach for it.
+    ///
+    /// Curated on purpose, and small on purpose. `allow = ["*"]` covers
+    /// roughly a thousand executables on a normal machine; a tool each would
+    /// bury the catalog and push the useful ones behind tool search. Declare
+    /// the handful worth naming, and leave the rest to `os-run`.
+    #[serde(default, rename = "tool")]
+    pub tools: Vec<OsToolConfig>,
+    /// Wall-clock ceiling for one invocation.
+    #[serde(default = "default_os_timeout_seconds")]
+    pub timeout_seconds: u64,
+}
+
+/// One binary published as its own MCP tool.
+///
+/// ```toml
+/// [[os.tool]]
+/// bin = "kubectl"
+/// args = ["get"]
+/// description = "Read Kubernetes objects in the current context."
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OsToolConfig {
+    /// Binary name. Must be admitted by `allow`, or the tool is published and
+    /// then refuses — `doctor` reports that as a misconfiguration.
+    pub bin: String,
+    /// Leading arguments fixed by the operator. The model appends to these,
+    /// so `args = ["get"]` publishes a read-only view of `kubectl` without
+    /// letting the model reach `delete` through the same tool.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// What it is for, in the model's words. This is the entire reason the
+    /// entry exists: a name without one is what `os-run` already offers.
+    pub description: String,
+}
+
+impl OsToolConfig {
+    /// MCP tool name: `os-<bin>` plus any fixed arguments.
+    ///
+    /// `kubectl` + `["get"]` becomes `os-kubectl-get`, so two entries for the
+    /// same binary with different fixed arguments do not collide.
+    pub fn tool_name(&self) -> String {
+        let mut parts = vec![self.bin.as_str()];
+        parts.extend(self.args.iter().map(|s| s.as_str()));
+        let joined = parts.join("-");
+        let sanitized: String = joined
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        format!("os-{sanitized}")
+    }
+
+    /// Full argv for an invocation: the fixed arguments, then the model's.
+    pub fn argv(&self, extra: &[String]) -> Vec<String> {
+        let mut argv = self.args.clone();
+        argv.extend_from_slice(extra);
+        argv
+    }
+}
+
+/// What the policy says about one invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsDecision {
+    /// Run it.
+    Allow,
+    /// Run it only after a person says so.
+    Confirm,
+    /// Do not run it.
+    Deny,
+}
+
+impl Default for OsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow: Vec::new(),
+            deny: Vec::new(),
+            confirm: default_os_confirm(),
+            confirm_ttl_seconds: default_os_confirm_ttl_seconds(),
+            tools: Vec::new(),
+            timeout_seconds: default_os_timeout_seconds(),
+        }
+    }
+}
+
+fn default_os_timeout_seconds() -> u64 {
+    60
+}
+
+fn default_os_confirm_ttl_seconds() -> u64 {
+    120
+}
+
+/// Binaries that ask before they act.
+///
+/// Two groups. The destructive ones are here because the mistake is not
+/// recoverable, not because they are exotic. The shells are here because
+/// naming them is the only way a list of binaries means anything: everything
+/// else on this list is reachable through `sh -c`.
+fn default_os_confirm() -> Vec<String> {
+    [
+        "sh", "bash", "zsh", "fish", "dash", "ksh", "rm", "rmdir", "dd", "mkfs", "shred",
+        "diskutil", "fdisk", "parted", "shutdown", "reboot", "halt",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+impl OsConfig {
+    /// Is there anything to expose? Off, or on with an empty list, is nothing.
+    pub fn is_active(&self) -> bool {
+        self.enabled && !self.allow.is_empty()
+    }
+
+    /// What the policy says about running `bin` with `args`.
+    ///
+    /// Order is deny, then confirm, then allow. Deny wins over `*` and over
+    /// an explicit entry, because a list that can be widened past its own
+    /// refusals is not a refusal.
+    pub fn decide(&self, bin: &str, args: &[String]) -> OsDecision {
+        if !self.is_active() || !is_bare_binary_name(bin) {
+            return OsDecision::Deny;
+        }
+        if matches_any(&self.deny, bin, args) {
+            return OsDecision::Deny;
+        }
+        if !self.permits(bin, args) {
+            return OsDecision::Deny;
+        }
+        if matches_any(&self.confirm, bin, args) {
+            return OsDecision::Confirm;
+        }
+        OsDecision::Allow
+    }
+
+    /// Is `bin` on the allowlist at all?
+    ///
+    /// Private on purpose: it answers half the question. `deny` and `confirm`
+    /// are invisible here, so a caller reaching for this instead of
+    /// [`Self::decide`] would run a denied command believing it had checked.
+    ///
+    /// Matching is on whole tokens, never substrings: an entry `kubectl get`
+    /// does not admit `kubectl getsecrets`. `bin` must be a bare name, so a
+    /// path can never stand in for a listed one (`/bin/sh`, `./sh`, and a
+    /// name carrying `..` are all refused before the list is consulted).
+    fn permits(&self, bin: &str, args: &[String]) -> bool {
+        self.is_active()
+            && is_bare_binary_name(bin)
+            && (self.is_wildcard() || matches_any(&self.allow, bin, args))
+    }
+
+    /// Does the list open the whole machine? Used by `doctor` and `os-list`,
+    /// which describe the policy rather than enforce it.
+    pub fn is_wildcard(&self) -> bool {
+        self.allow
+            .iter()
+            .any(|e| e.split_whitespace().next() == Some(WILDCARD))
+    }
+}
+
+/// Does any entry in `list` cover this invocation?
+///
+/// Shared by `deny` and `confirm` so the three lists cannot drift into three
+/// different matching rules. `*` is deliberately **not** special here: a
+/// wildcard means "allow everything", and reading it as "deny everything" or
+/// "confirm everything" would make one character mean three opposite things.
+fn matches_any(list: &[String], bin: &str, args: &[String]) -> bool {
+    list.iter().any(|entry| {
+        let mut tokens = entry.split_whitespace();
+        match tokens.next() {
+            Some(head) if head == bin => tokens
+                .enumerate()
+                .all(|(i, want)| args.get(i).is_some_and(|got| got == want)),
+            _ => false,
+        }
+    })
+}
+
+/// The entry that admits every installed binary.
+const WILDCARD: &str = "*";
+
+/// A name, not a path. Rejects separators, `..`, empty, and leading dashes
+/// (a binary named `--flag` would be read as an option by whatever it is
+/// handed to).
+fn is_bare_binary_name(bin: &str) -> bool {
+    !bin.is_empty()
+        && !bin.starts_with('-')
+        && bin != ".."
+        && !bin.contains('/')
+        && !bin.contains('\\')
+        && !bin.contains('\0')
 }
 
 /// End-of-day health summary — when it goes out, and to whom.
@@ -545,6 +801,368 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+
+    fn os(allow: &[&str]) -> OsConfig {
+        OsConfig {
+            enabled: true,
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            ..OsConfig::default()
+        }
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn os_is_off_and_empty_by_default() {
+        let c = OsConfig::default();
+        assert!(!c.enabled);
+        assert!(c.allow.is_empty());
+        assert!(!c.is_active());
+        assert!(!c.permits("rg", &argv(&["x"])));
+    }
+
+    #[test]
+    fn os_absent_from_config_file_stays_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[logging]\nlevel = \"debug\"\n").unwrap();
+        let c = Config::load(&p).unwrap();
+        assert!(!c.os.is_active());
+    }
+
+    fn os_full(allow: &[&str], deny: &[&str], confirm: &[&str]) -> OsConfig {
+        OsConfig {
+            enabled: true,
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            confirm: confirm.iter().map(|s| s.to_string()).collect(),
+            ..OsConfig::default()
+        }
+    }
+
+    #[test]
+    fn confirm_is_not_empty_by_default() {
+        // The wildcard plus an empty confirm list would mean a chat message
+        // can wipe a disk with nothing in between.
+        let c = OsConfig::default();
+        assert!(!c.confirm.is_empty());
+        for expected in ["sh", "bash", "rm", "dd", "mkfs"] {
+            assert!(
+                c.confirm.iter().any(|e| e == expected),
+                "missing {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_beats_the_wildcard() {
+        let c = os_full(&["*"], &["rm"], &[]);
+        assert_eq!(c.decide("rm", &argv(&["-rf", "/"])), OsDecision::Deny);
+        assert_eq!(c.decide("rg", &argv(&["x"])), OsDecision::Allow);
+    }
+
+    #[test]
+    fn deny_beats_an_explicit_allow_entry() {
+        let c = os_full(&["kubectl get", "kubectl delete"], &["kubectl delete"], &[]);
+        assert_eq!(
+            c.decide("kubectl", &argv(&["get", "pods"])),
+            OsDecision::Allow
+        );
+        assert_eq!(
+            c.decide("kubectl", &argv(&["delete", "pods"])),
+            OsDecision::Deny
+        );
+    }
+
+    #[test]
+    fn a_destructive_binary_asks_first() {
+        let c = os_full(&["*"], &[], &["rm", "dd"]);
+        assert_eq!(
+            c.decide("rm", &argv(&["-rf", "/tmp/x"])),
+            OsDecision::Confirm
+        );
+        assert_eq!(
+            c.decide("dd", &argv(&["if=/dev/zero"])),
+            OsDecision::Confirm
+        );
+        assert_eq!(c.decide("rg", &argv(&["x"])), OsDecision::Allow);
+    }
+
+    #[test]
+    fn a_shell_asks_first_which_is_what_makes_the_list_mean_anything() {
+        // Without this, `sh -c 'rm -rf /'` walks past every entry above.
+        let c = OsConfig {
+            enabled: true,
+            allow: vec!["*".to_string()],
+            ..OsConfig::default()
+        };
+        assert_eq!(
+            c.decide("sh", &argv(&["-c", "rm -rf /"])),
+            OsDecision::Confirm
+        );
+        assert_eq!(c.decide("bash", &argv(&["-c", "x"])), OsDecision::Confirm);
+        assert_eq!(c.decide("zsh", &argv(&[])), OsDecision::Confirm);
+    }
+
+    #[test]
+    fn rm_asks_first_in_every_spelling_because_the_binary_is_the_match() {
+        // A textual pattern like "rm -rf" would miss all of these.
+        let c = os_full(&["*"], &[], &["rm"]);
+        for spelling in [
+            vec!["-rf", "/"],
+            vec!["-r", "-f", "/"],
+            vec!["-fr", "/"],
+            vec!["--recursive", "--force", "/"],
+            vec!["/tmp/one-file"],
+        ] {
+            let args: Vec<String> = spelling.iter().map(|s| s.to_string()).collect();
+            assert_eq!(c.decide("rm", &args), OsDecision::Confirm, "{spelling:?}");
+        }
+    }
+
+    #[test]
+    fn an_unlisted_binary_is_denied_not_merely_unconfirmed() {
+        let c = os_full(&["rg"], &[], &["rm"]);
+        assert_eq!(c.decide("rm", &argv(&["x"])), OsDecision::Deny);
+    }
+
+    #[test]
+    fn a_wildcard_in_deny_does_not_deny_everything() {
+        // `*` means "allow everything". Reading it as a deny-all here would
+        // make one character mean two opposite things depending on the field.
+        let c = os_full(&["*"], &["*"], &[]);
+        assert_eq!(c.decide("rg", &argv(&["x"])), OsDecision::Allow);
+    }
+
+    #[test]
+    fn everything_is_denied_while_the_section_is_off() {
+        let mut c = os_full(&["*"], &[], &[]);
+        c.enabled = false;
+        assert_eq!(c.decide("rg", &argv(&[])), OsDecision::Deny);
+    }
+
+    #[test]
+    fn a_path_is_denied_before_any_list_is_consulted() {
+        let c = os_full(&["*"], &[], &[]);
+        assert_eq!(c.decide("/bin/sh", &argv(&[])), OsDecision::Deny);
+        assert_eq!(c.decide("../sh", &argv(&[])), OsDecision::Deny);
+    }
+
+    fn tool(bin: &str, args: &[&str], desc: &str) -> OsToolConfig {
+        OsToolConfig {
+            bin: bin.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            description: desc.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_tool_name_is_derived_from_the_binary_and_its_fixed_arguments() {
+        assert_eq!(tool("outl", &[], "x").tool_name(), "os-outl");
+        assert_eq!(tool("kubectl", &["get"], "x").tool_name(), "os-kubectl-get");
+        assert_eq!(
+            tool("gh", &["pr", "list"], "x").tool_name(),
+            "os-gh-pr-list"
+        );
+    }
+
+    #[test]
+    fn two_views_of_one_binary_get_distinct_names() {
+        // The whole point of fixing arguments is publishing a narrow view. If
+        // both views collided on a name, only one would ever resolve.
+        assert_ne!(
+            tool("kubectl", &["get"], "x").tool_name(),
+            tool("kubectl", &["logs"], "x").tool_name()
+        );
+    }
+
+    #[test]
+    fn a_tool_name_survives_a_binary_mcp_would_reject() {
+        // MCP tool names are restricted; a binary name is not.
+        let t = tool("foo.bar", &["a/b"], "x");
+        assert_eq!(t.tool_name(), "os-foo-bar-a-b");
+        assert!(t
+            .tool_name()
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn argv_puts_the_fixed_arguments_first() {
+        let t = tool("kubectl", &["get"], "x");
+        assert_eq!(
+            t.argv(&["pods".to_string(), "-A".to_string()]),
+            vec!["get", "pods", "-A"]
+        );
+        assert_eq!(t.argv(&[]), vec!["get"]);
+    }
+
+    #[test]
+    fn a_fixed_argument_cannot_be_escaped_by_the_model() {
+        // `kubectl get` publishes a read path. Whatever the model appends,
+        // `get` stays the subcommand — the policy still sees `kubectl get …`.
+        let t = tool("kubectl", &["get"], "x");
+        let line = t.argv(&["delete".to_string(), "pods".to_string()]);
+        assert_eq!(line[0], "get");
+        let c = os_full(&["kubectl get"], &[], &[]);
+        assert_eq!(c.decide("kubectl", &line), OsDecision::Allow);
+        // and a real delete is still refused
+        assert_eq!(
+            c.decide("kubectl", &argv(&["delete", "pods"])),
+            OsDecision::Deny
+        );
+    }
+
+    #[test]
+    fn tools_default_to_none() {
+        assert!(OsConfig::default().tools.is_empty());
+    }
+
+    #[test]
+    fn the_wildcard_admits_every_installed_binary() {
+        let c = os(&["*"]);
+        assert!(c.is_wildcard());
+        assert!(c.permits("rg", &argv(&["x"])));
+        assert!(c.permits("kubectl", &argv(&["delete", "pods"])));
+        assert!(c.permits("sh", &argv(&["-c", "id"])));
+    }
+
+    #[test]
+    fn the_wildcard_still_refuses_a_path() {
+        // Wide open is about which *names* resolve through PATH, not about
+        // accepting a path where a name belongs. `/bin/sh` stays refused and
+        // `sh` is what runs.
+        let c = os(&["*"]);
+        assert!(!c.permits("/bin/sh", &argv(&[])));
+        assert!(!c.permits("./x", &argv(&[])));
+        assert!(!c.permits("../x", &argv(&[])));
+        assert!(!c.permits("", &argv(&[])));
+    }
+
+    #[test]
+    fn the_wildcard_does_nothing_while_disabled() {
+        let mut c = os(&["*"]);
+        c.enabled = false;
+        assert!(!c.permits("rg", &argv(&[])));
+    }
+
+    #[test]
+    fn a_star_inside_a_longer_entry_is_not_the_wildcard() {
+        // `*` is the whole entry or it is nothing. `rg *` names a binary `rg`
+        // whose first argument must literally be an asterisk.
+        let c = os(&["rg *"]);
+        assert!(!c.is_wildcard());
+        assert!(!c.permits("kubectl", &argv(&["get"])));
+        assert!(c.permits("rg", &argv(&["*"])));
+        assert!(!c.permits("rg", &argv(&["foo"])));
+    }
+
+    #[test]
+    fn the_wildcard_coexists_with_narrower_entries() {
+        let c = os(&["kubectl get", "*"]);
+        assert!(c.permits("kubectl", &argv(&["delete"])));
+    }
+
+    #[test]
+    fn a_bare_entry_allows_every_subcommand() {
+        let c = os(&["outl"]);
+        assert!(c.permits("outl", &argv(&["search", "foo"])));
+        assert!(c.permits("outl", &argv(&[])));
+    }
+
+    #[test]
+    fn a_scoped_entry_allows_only_that_subcommand() {
+        let c = os(&["kubectl get"]);
+        assert!(c.permits("kubectl", &argv(&["get", "pods"])));
+        assert!(!c.permits("kubectl", &argv(&["delete", "pods"])));
+        assert!(!c.permits("kubectl", &argv(&[])));
+    }
+
+    #[test]
+    fn a_scoped_entry_matches_whole_tokens_not_prefixes() {
+        let c = os(&["kubectl get"]);
+        assert!(!c.permits("kubectl", &argv(&["getsecrets"])));
+        assert!(!c.permits("kubectl", &argv(&["get-secrets"])));
+    }
+
+    #[test]
+    fn a_binary_that_is_not_listed_never_runs() {
+        let c = os(&["rg", "kubectl get"]);
+        assert!(!c.permits("sh", &argv(&["-c", "id"])));
+        assert!(!c.permits("bash", &argv(&[])));
+        assert!(!c.permits("rgx", &argv(&[])));
+        assert!(!c.permits("r", &argv(&[])));
+    }
+
+    #[test]
+    fn a_path_never_stands_in_for_a_listed_name() {
+        let c = os(&["sh"]);
+        assert!(!c.permits("/bin/sh", &argv(&[])));
+        assert!(!c.permits("./sh", &argv(&[])));
+        assert!(!c.permits("../sh", &argv(&[])));
+        assert!(!c.permits("dir/sh", &argv(&[])));
+        assert!(!c.permits("..", &argv(&[])));
+        assert!(!c.permits("", &argv(&[])));
+    }
+
+    #[test]
+    fn a_name_that_would_be_read_as_a_flag_is_refused() {
+        let c = os(&["--version"]);
+        assert!(!c.permits("--version", &argv(&[])));
+    }
+
+    #[test]
+    fn an_empty_allowlist_runs_nothing_even_when_enabled() {
+        let c = OsConfig {
+            enabled: true,
+            allow: Vec::new(),
+            ..OsConfig::default()
+        };
+        assert!(!c.is_active());
+        assert!(!c.permits("rg", &argv(&["x"])));
+    }
+
+    #[test]
+    fn disabling_overrides_a_populated_allowlist() {
+        let mut c = os(&["rg", "outl"]);
+        c.enabled = false;
+        assert!(!c.permits("rg", &argv(&["x"])));
+        assert!(!c.permits("outl", &argv(&[])));
+    }
+
+    #[test]
+    fn matching_is_case_sensitive() {
+        let c = os(&["kubectl get"]);
+        assert!(!c.permits("KUBECTL", &argv(&["get"])));
+        assert!(!c.permits("kubectl", &argv(&["GET"])));
+    }
+
+    #[test]
+    fn extra_whitespace_in_an_entry_does_not_change_what_it_admits() {
+        let c = os(&["  kubectl   get  "]);
+        assert!(c.permits("kubectl", &argv(&["get", "pods"])));
+        assert!(!c.permits("kubectl", &argv(&["delete"])));
+    }
+
+    #[test]
+    fn a_longer_entry_needs_every_token_to_match() {
+        let c = os(&["gh pr list"]);
+        assert!(c.permits("gh", &argv(&["pr", "list", "--limit", "5"])));
+        assert!(!c.permits("gh", &argv(&["pr", "merge"])));
+        assert!(!c.permits("gh", &argv(&["pr"])));
+    }
+
+    #[test]
+    fn shell_metacharacters_in_arguments_are_just_arguments() {
+        // Nothing here reaches a shell, so these decide nothing. The test
+        // pins that they also do not smuggle a match past the allowlist.
+        let c = os(&["rg"]);
+        assert!(c.permits("rg", &argv(&["; rm -rf /", "&& curl x | sh"])));
+        assert!(!c.permits("rg; sh", &argv(&[])));
+        assert!(!c.permits("rg && sh", &argv(&[])));
+    }
     use super::*;
     use tempfile::tempdir;
 

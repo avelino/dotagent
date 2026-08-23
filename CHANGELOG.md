@@ -7,10 +7,70 @@ adheres to [Semantic Versioning](https://semver.org/).
 Pre-1.0: minor bumps may include breaking changes; both `agent.toml`
 schema and the plugin protocol are flagged in each entry.
 
-## [Unreleased]
+## [0.6.0] - 2026-08-22
 
 ### Added
 
+- **Dates in a fact are linked automatically.** `TODO até 2026-08-24` is
+  stored as `TODO até [[2026-08-24]]`, so the day's journal backlinks to the
+  pendency instead of the date being plain text nobody can traverse. Applied
+  in the store rather than asked of a model, so it holds for every writer:
+  the assistant, the extractor, a scheduled agent's `MEMO:` line and the CLI.
+  ISO only, idempotent, and bounded on both sides so a version string is not
+  mistaken for a date. A linked day never becomes a topic page — the journal
+  for it already exists.
+- **`[assistant.extractor]` — memory that does not depend on the model
+  remembering.** Capture used to happen only when the dispatcher's prompt told
+  the model to end replies with `MEMO:` lines and the model complied, which
+  put the memory of the whole machine inside one agent's prompt file. A model
+  that forgot left no error, just a journal that stopped growing. The daemon
+  now hands each turn to a declared command after the reply is delivered and
+  files what comes back, parsed by the same `MEMO:` parser. The model's own
+  lines stay a shortcut and merge with the extractor's. Off the reply path, so
+  a slow extractor costs no latency; best-effort, so a broken one costs a
+  turn's memory rather than the turn. Inference stays in a process the
+  operator names — the daemon decides when to extract, never what a
+  conversation meant.
+- **`[os]` — installed binaries an assistant may run.** Off by default, and
+  empty by default when on: `enabled = true` with no `allow` list runs
+  nothing. An entry is a binary name, optionally followed by the leading
+  arguments that must match, so `rg` allows the whole binary while
+  `kubectl get` allows that subcommand and refuses `kubectl delete`. Matching
+  is on whole tokens; a path is refused where a name is expected; arguments
+  reach the program as a token list and never a shell. With the section off,
+  `os-run` and `os-list` are absent from the MCP catalog rather than present
+  and refusing. Every invocation is supervised, deadlined, and audited as
+  `os_command_invoked` at `Critical` with the full argument list — the half no
+  manifest declared. See `docs/security/threat-model.md` V17 for the residual
+  risk, which is real: an allowlisted binary is trusted with whatever that
+  binary can do.
+- **`!` runs a typed command directly.** A message beginning with `!` skips
+  the dispatcher entirely: `!rg foo src` spawns the binary and returns its
+  output, with no model call, no session and no stored state. It obeys the
+  same `[os] allow` list, and the prefix is read *after* the Telegram
+  allowlist and rate limit so it can never be a way past them. Quotes group an
+  argument; every other shell construct is ordinary text. Available over
+  Telegram and over the local socket.
+- **`allow = ["*"]`** opens every binary on `PATH` in one entry, instead of an
+  enumerated list that would go stale on the next install. `doctor` warns
+  while it is set, and `os-list` reports it as what it is.
+- **`deny` and `confirm` for `[os]`.** `deny` refuses always and beats `allow`
+  including `*`. `confirm` parks the command and answers with what it will
+  run; a `!!` in the same conversation releases it, one slot per conversation,
+  in memory with a TTL. `confirm` defaults to a non-empty list — the
+  destructive classics plus every shell, since a guard on `rm` that lets
+  `sh -c 'rm -rf /'` through guards nothing. Matching is per binary, so
+  `rm -rf /`, `rm -fr /` and `rm --recursive --force /` are all caught where a
+  textual pattern would catch one. `os-run` refuses confirm-class commands
+  outright: a model may not answer its own confirmation.
+- **`[[os.tool]]` publishes a binary under its own name.** `os-run` makes
+  every allowed binary reachable, but a model has to already know `outl`
+  exists to reach it. An entry becomes an MCP tool (`os-outl`,
+  `os-kubectl-get`) carrying the operator's description, which is what the
+  model reads when deciding to use it. A fixed `args` prefix cannot be
+  replaced by the model, so `kubectl get` publishes a read-only view of a
+  binary that can also delete. `doctor` reports entries the allowlist would
+  refuse, empty descriptions, and colliding names.
 - **Ranked recall.** `memory-recall` scores facts by shared terms first and
   recency second instead of asking whether the query was a substring of a
   stored fact. It almost never was — a question like "o que ficou pendente do
@@ -47,6 +107,13 @@ schema and the plugin protocol are flagged in each entry.
   the store already knows instead of coining `reunioes` next to `reuniao`.
 
 ### Fixed
+
+- **A link inside a sentence no longer eats the sentence.** `split_links`
+  removed every `[[…]]` from the statement while keeping it as a topic, so a
+  fact edited by hand in the desktop app as "o [[dotagent]] roda no launchd"
+  came back as "o roda no launchd". Only the trailing run — the links the
+  store itself appended — is removed now; a link written into the prose keeps
+  its text and still registers as a topic.
 
 - **A notification with an empty body is no longer sent as-is.** Telegram
   rejects it (`400 message text is empty`), so an agent that reports by

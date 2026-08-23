@@ -21,6 +21,7 @@
 * [Memory](concepts/memory.md)
 * [Skills](concepts/skills.md)
 * [Commands](concepts/commands.md)
+* [Running installed binaries](concepts/os.md)
 
 ## Guides
 

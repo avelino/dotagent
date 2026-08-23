@@ -187,6 +187,7 @@ Canonical raw URL for `WebFetch`:
 - [Memory](docs/concepts/memory.md) — facts that outlive the conversation
 - [Skills](docs/concepts/skills.md) — procedures an assistant loads on demand
 - [Commands](docs/concepts/commands.md) — procedures you invoke by name, as a Telegram menu
+- [Running installed binaries](docs/concepts/os.md) — reaching the OS from a chat, and the brakes on it
 - [LLM agents](docs/guides/llm-agents.md) — calling `claude -p` from an agent
 
 **Reference:**

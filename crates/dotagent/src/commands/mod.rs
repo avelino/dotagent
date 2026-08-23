@@ -26,6 +26,7 @@ pub mod list_agents;
 pub mod mcp;
 pub mod memory;
 pub mod memory_capture;
+pub mod memory_extract;
 pub mod output;
 pub mod status;
 pub mod utility;
@@ -251,6 +252,7 @@ pub async fn doctor() -> Result<()> {
     // After the scan, so the dispatcher check reuses it instead of triggering
     // a second walk of the filesystem — and cannot disagree with it.
     warnings += report_telegram_status(&found.agents);
+    warnings += report_os_status();
     // Report unloadable manifests first: an agent that cannot parse never
     // runs, and its absence from the list below is otherwise silent.
     for bad in &found.invalid {
@@ -587,6 +589,86 @@ fn report_memory_status() -> usize {
             0
         }
     }
+}
+
+/// Report what `[os]` opens. Returns a warning count.
+///
+/// Silent when the section is off, like the Telegram report: a default that
+/// does nothing does not need announcing. Loud when it is a wildcard, because
+/// "every installed binary is reachable from a chat message" is exactly the
+/// kind of thing that gets configured once and forgotten.
+fn report_os_status() -> usize {
+    let config =
+        dotagent_core::Config::load(dotagent_state::paths::config_file()).unwrap_or_default();
+    let os = &config.os;
+    if !os.enabled {
+        return 0;
+    }
+    if os.allow.is_empty() {
+        println!("os: enabled but the allow list is empty — nothing can run");
+        return 1;
+    }
+    if os.is_wildcard() {
+        println!(
+            "os: on — every installed binary, {}s timeout",
+            os.timeout_seconds
+        );
+        println!(
+            "    ⚠ `*` allows anything on PATH, including a shell. Whoever can send a message \
+             can run what you can run."
+        );
+        // The wildcard says nothing about the curated tools, which can still
+        // be missing a description or name a binary that is not installed.
+        return 1 + report_os_tools(os);
+    }
+    println!(
+        "os: on — {} entr(ies) allowed, {}s timeout",
+        os.allow.len(),
+        os.timeout_seconds
+    );
+    report_os_tools(os)
+}
+
+/// Check the curated tools against the allowlist that has to admit them.
+///
+/// A published tool the policy refuses is worse than a missing one: it shows
+/// up in the catalog, a model picks it because the description fits, and the
+/// failure arrives as a refusal in the middle of a conversation.
+fn report_os_tools(os: &dotagent_core::config::OsConfig) -> usize {
+    let mut warnings = 0usize;
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for t in &os.tools {
+        let argv = t.argv(&[]);
+        if os.decide(&t.bin, &argv) == dotagent_core::config::OsDecision::Deny {
+            println!(
+                "    ⚠ tool '{}' publishes `{}`, which `allow` does not admit — it would be                  listed and then refused",
+                t.tool_name(),
+                t.bin
+            );
+            warnings += 1;
+        }
+        if t.description.trim().is_empty() {
+            println!(
+                "    ⚠ tool '{}' has no description — the description is the whole reason to                  name a binary instead of leaving it to os-run",
+                t.tool_name()
+            );
+            warnings += 1;
+        }
+        *seen.entry(t.tool_name()).or_default() += 1;
+    }
+
+    for (name, count) in seen {
+        if count > 1 {
+            println!("    ⚠ tool name '{name}' declared {count} times — only one will resolve");
+            warnings += 1;
+        }
+    }
+
+    if !os.tools.is_empty() && warnings == 0 {
+        println!("    {} binar(ies) published as named tools", os.tools.len());
+    }
+    warnings
 }
 
 /// Report inbound Telegram status. Returns a warning count.

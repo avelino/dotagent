@@ -262,6 +262,7 @@ mod tests {
             memory: true,
             transcript_bytes_max: None,
             toolkit: AssistantToolkit { servers },
+            extractor: None,
         }
     }
 

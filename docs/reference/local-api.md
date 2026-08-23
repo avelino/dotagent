@@ -155,6 +155,25 @@ The successful result is always:
 The request does not select an arbitrary agent. It always targets the
 discovered `telegram.dispatcher_agent` configured for this daemon.
 
+### `message.send` with a `!` prefix
+
+Text beginning with `!` is not forwarded to the dispatcher. It runs the named
+binary and answers with a single `reply` event — no `run.started`, no
+`typing`, no `reply.delta`, because there is no run and nothing streams.
+
+```json
+{"id":"1","method":"message.send","params":{"text":"!rg TODO src"}}
+```
+
+A command on the `confirm` list is parked instead of run: the reply quotes it
+and asks for `!!`, which arrives as another `message.send` on the same
+`session_id`. The session is what keys it, so a `!!` cannot release what a
+different session parked.
+
+Requires `[os]` to be configured, and obeys the same allowlist as `os-run`.
+A binary the list does not admit comes back as an ordinary `reply` naming the
+config, not as a protocol error: nothing about the request was malformed.
+
 ### `commands.list`
 
 Return the discovered command catalog shaped for Telegram/local dispatch. It

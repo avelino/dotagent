@@ -99,6 +99,35 @@ An invoked command arrives beside the text rather than instead of it:
 
 Two answers do come straight from the daemon: `/help` and "no command named /typo". Both are questions about *what exists*, which is the catalog the daemon already publishes. Letting `/typo` fall through would mean a model improvising an answer to something meant to be exact.
 
+## Running a command yourself
+
+A message starting with `!` runs an installed binary directly, without the
+dispatcher seeing it:
+
+```
+!rg TODO src
+!kubectl get pods
+```
+
+No model call, no session, nothing stored. Output comes back as-is, and so do
+errors — the point of typing a command is that it is exact, and a paraphrased
+exit code is worse than the exit code.
+
+Destructive commands ask first. `!rm -r /tmp/x` quotes back what it will run
+and waits for `!!`; anything else in between cancels nothing but does not
+confirm either. The list covers the usual suspects and every shell, because a
+guard on `rm` that lets `sh -c 'rm -rf /'` past guards nothing.
+
+It is off unless `[os]` is configured. The prefix obeys the same `allow` list
+as the assistant's own `os-run`, and it is read *after* the allowlist and rate
+limit, so `!` is never a way past either. Quotes group an argument
+(`!rg "hello world"`); nothing else from a shell applies, because no shell is
+involved.
+
+See [`../guides/config-reference.md`](../guides/config-reference.md#os) for the
+allowlist and [`../security/threat-model.md`](../security/threat-model.md) V17
+for what it does and does not bound.
+
 ## Answering a notification
 
 The bot posts when a run fails. Replying to that message is the natural next

@@ -235,6 +235,22 @@ pub enum AuditEvent {
         exit_code: i32,
         timed_out: bool,
     },
+    /// An installed binary was run through `os-run`.
+    ///
+    /// The heaviest inbound path there is: unlike a remediation, whose command
+    /// is fixed in a manifest, here the operator declared what *may* run and a
+    /// model chose the arguments. `Critical` for the same reason V12 is, with
+    /// the argument list recorded because the arguments are the part nobody
+    /// declared in advance.
+    OsCommandInvoked {
+        /// Binary name as requested, after the allowlist admitted it.
+        bin: String,
+        /// Arguments as the model supplied them. Recorded verbatim: this is
+        /// the field a forensic reader is here for.
+        args: Vec<String>,
+        exit_code: i32,
+        timed_out: bool,
+    },
     /// A script packaged inside a skill was executed.
     ///
     /// Skills are text by default; `scripts/` makes one executable, and that
@@ -360,6 +376,7 @@ impl AuditEvent {
             | AuditEvent::TriggerRejected { .. }
             | AuditEvent::ManifestInvalid { .. }
             | AuditEvent::RemediationInvoked { .. }
+            | AuditEvent::OsCommandInvoked { .. }
             | AuditEvent::AuditChainBroken { .. } => Severity::Critical,
         }
     }
