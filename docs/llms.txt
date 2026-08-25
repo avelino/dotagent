@@ -1121,6 +1121,21 @@ Any agent — not just a conversational one — can file facts by printing
 `MEMO: <fact> | topics: a, b` on stdout, if its manifest declares
 `[memory]`. Opt-in, and only on a successful run.
 
+An ordinary scheduled agent can configure `[memory.extractor]` to recover
+facts when it did not print explicit `MEMO:` lines:
+
+```toml
+[memory.extractor]
+command = "bash"
+args = ["./extract-memory.sh"]
+timeout_seconds = 45
+```
+
+The extractor receives the successful run output as JSON on stdin and prints
+`MEMO:` lines on stdout. Its errors are best-effort and do not change the run
+result. Manifest `topics` are added to extracted facts. Agents using
+`[assistant] memory = true` skip this path to avoid duplicate capture.
+
 The same verbs work from a shell without a daemon: `dotagent memory
 recall|remember|supersede|forget|topics|stats`.
 

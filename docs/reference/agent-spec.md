@@ -207,6 +207,31 @@ topics = ["ops"]
 | `capture` | `true` | Scan this agent's stdout for `MEMO:` lines. Writing the section at all is the opt-in; the field exists to switch it off without deleting the topics next to it. |
 | `topics` | *(empty)* | Topics added to every fact this agent files, on top of whatever the `MEMO:` line named. |
 
+#### `[memory.extractor]` - extracting facts from ordinary agent output
+
+An ordinary agent can delegate memory extraction to a command when its output
+does not contain explicit `MEMO:` lines. The command receives the successful
+run output as JSON on stdin and must print zero or more `MEMO:` lines on stdout.
+
+```toml
+[memory.extractor]
+command = "bash"
+args = ["./extract-memory.sh"]
+timeout_seconds = 45
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `command` | *(required)* | Program to run. Arguments are passed directly; no shell is added. |
+| `args` | `[]` | Arguments passed to `command`. |
+| `timeout_seconds` | `45` | Maximum time allowed for the extractor. |
+
+The extractor runs only after a successful scheduled run and is best-effort:
+an extractor failure does not change the run result. Manifest `topics` are
+added to extracted facts, and duplicate topics are removed. Agents using the
+`[assistant]` harness with `memory = true` skip this extractor, so the same
+turn cannot be captured twice.
+
 Absent means the agent's output is never read for facts. That default is
 deliberate: most agents print status, not knowledge, and a store that absorbs
 status is a store whose recall returns status.

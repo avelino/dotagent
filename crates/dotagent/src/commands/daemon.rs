@@ -354,6 +354,7 @@ impl GatewayRunner for GatewayRunnerAdapter {
                 .to_string();
             let source = req.source.to_string();
             let session = req.session_id.clone();
+            let manifest_dir = agent.dir.clone();
             let root = dirs.memory_root;
             let provenance = outcome.provenance;
             let volunteered = outcome.memos;
@@ -365,6 +366,7 @@ impl GatewayRunner for GatewayRunnerAdapter {
                         Some(cfg) => {
                             crate::commands::memory_extract::extract(
                                 &cfg,
+                                &manifest_dir,
                                 &turn_message,
                                 &reply_for_extract,
                                 &source,
@@ -380,7 +382,7 @@ impl GatewayRunner for GatewayRunnerAdapter {
                     }
                     // spawn_blocking for the write: the outl store is
                     // synchronous and must not block the async runtime.
-                    tokio::task::spawn_blocking(move || {
+                    let _ = tokio::task::spawn_blocking(move || {
                         let written = dotagent_assistant::flush_memos(&root, &memos, &provenance);
                         if written < memos.len() {
                             tracing::warn!(
@@ -389,7 +391,8 @@ impl GatewayRunner for GatewayRunnerAdapter {
                                 "assistant harness: some captured memos were not persisted"
                             );
                         }
-                    });
+                    })
+                    .await;
                 });
             }
             outcome.reply
@@ -2302,12 +2305,48 @@ async fn dispatch_one(
                 &ro.stdout_tail,
                 ro.exit_code,
             );
-            if !memos.is_empty() {
+            if ro.exit_code == 0 {
+                let extractor = crate::commands::memory_capture::extractor(&agent.manifest);
+                if let Some(cfg) = extractor {
+                    let message = String::new();
+                    let reply = ro.stdout_tail.clone();
+                    let source = "schedule".to_string();
+                    let session = Some(sched.id().to_string());
+                    let root = dotagent_state::paths::memory_workspace_dir();
+                    let name = agent.manifest.agent.name.clone();
+                    let manifest_dir = agent.dir.clone();
+                    let topics_manifest = agent.manifest.clone();
+                    let volunteered = memos;
+                    let mut extracted = crate::commands::memory_extract::extract(
+                        &cfg,
+                        &manifest_dir,
+                        &message,
+                        &reply,
+                        &source,
+                        session.as_deref(),
+                    )
+                    .await;
+                    crate::commands::memory_capture::add_topics(&topics_manifest, &mut extracted);
+                    let memos = crate::commands::memory_extract::merge(volunteered, extracted);
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::commands::memory_capture::flush(&root, &name, &memos);
+                    })
+                    .await;
+                } else if !memos.is_empty() {
+                    let root = dotagent_state::paths::memory_workspace_dir();
+                    let name = agent.manifest.agent.name.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::commands::memory_capture::flush(&root, &name, &memos);
+                    })
+                    .await;
+                }
+            } else if !memos.is_empty() {
                 let root = dotagent_state::paths::memory_workspace_dir();
                 let name = agent.manifest.agent.name.clone();
-                tokio::task::spawn_blocking(move || {
+                let _ = tokio::task::spawn_blocking(move || {
                     crate::commands::memory_capture::flush(&root, &name, &memos);
-                });
+                })
+                .await;
             }
 
             if ro.exit_code == 0 && attempts_before > 0 {

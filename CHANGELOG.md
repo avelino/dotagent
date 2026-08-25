@@ -7,6 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/).
 Pre-1.0: minor bumps may include breaking changes; both `agent.toml`
 schema and the plugin protocol are flagged in each entry.
 
+## [0.6.1] - 2026-08-25
+
+### Fixed
+
+- **Memory extractor deadlines.** The extractor now applies its deadline to
+  stdin and process completion, preventing a stalled extractor from blocking
+  the daemon indefinitely.
+- **Memory persistence after dispatch.** The daemon waits for the scheduled
+  flush and runs extractor commands from the manifest directory, so extracted
+  facts are persisted with the expected working directory.
+- **`run-now` memory capture.** Manual runs merge captured facts before one
+  flush instead of racing multiple persistence operations.
+
 ## [0.6.0] - 2026-08-22
 
 ### Added

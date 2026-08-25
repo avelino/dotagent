@@ -218,6 +218,8 @@ pub struct AgentMemoryConfig {
     /// every line.
     #[serde(default)]
     pub topics: Vec<String>,
+    #[serde(default)]
+    pub extractor: Option<AssistantExtractor>,
 }
 
 fn default_capture() -> bool {
@@ -229,6 +231,7 @@ impl Default for AgentMemoryConfig {
         Self {
             capture: true,
             topics: Vec::new(),
+            extractor: None,
         }
     }
 }

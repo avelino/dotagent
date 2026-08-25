@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use dotagent_assistant::{flush_memos, strip_memos, CapturedMemo};
-use dotagent_core::manifest::AgentManifest;
+use dotagent_core::manifest::{AgentManifest, AssistantExtractor};
 use dotagent_memory::Provenance;
 use tracing::{debug, warn};
 
@@ -52,6 +52,31 @@ pub(crate) fn capture(manifest: &AgentManifest, stdout: &str, exit_code: i32) ->
         }
     }
     memos
+}
+
+pub(crate) fn extractor(manifest: &AgentManifest) -> Option<AssistantExtractor> {
+    let config = manifest.memory.as_ref().filter(|m| m.capture)?;
+    if manifest
+        .assistant
+        .as_ref()
+        .is_some_and(|a| a.enabled && a.memory)
+    {
+        return None;
+    }
+    config.extractor.clone()
+}
+
+pub(crate) fn add_topics(manifest: &AgentManifest, memos: &mut [CapturedMemo]) {
+    let Some(config) = manifest.memory.as_ref() else {
+        return;
+    };
+    for memo in memos {
+        for topic in &config.topics {
+            if !memo.topics.contains(topic) {
+                memo.topics.push(topic.clone());
+            }
+        }
+    }
 }
 
 /// File captured facts, logging what landed. Never fails the caller.
@@ -156,5 +181,28 @@ mod tests {
         let m = manifest("[memory]\n");
         assert!(m.memory.as_ref().is_some_and(AgentMemoryConfig::captures));
         assert_eq!(capture(&m, "MEMO: a fact", 0).len(), 1);
+    }
+
+    #[test]
+    fn ordinary_agent_can_configure_an_extractor() {
+        let m = manifest("[memory.extractor]\ncommand = \"extract\"\nargs = [\"--json\"]\n");
+        assert_eq!(extractor(&m).expect("extractor").command, "extract");
+    }
+
+    #[test]
+    fn assistant_agent_does_not_run_the_ordinary_extractor() {
+        let m = manifest("[memory.extractor]\ncommand = \"extract\"\n\n[assistant]\n");
+        assert!(extractor(&m).is_none());
+    }
+
+    #[test]
+    fn extractor_facts_receive_manifest_topics() {
+        let m = manifest("[memory]\ntopics = [\"ops\"]\n");
+        let mut memos = vec![CapturedMemo {
+            text: "fact".to_string(),
+            topics: Vec::new(),
+        }];
+        add_topics(&m, &mut memos);
+        assert_eq!(memos[0].topics, vec!["ops"]);
     }
 }

@@ -41,6 +41,7 @@ struct Turn<'a> {
 /// where the system was before the extractor existed.
 pub async fn extract(
     cfg: &AssistantExtractor,
+    manifest_dir: &std::path::Path,
     message: &str,
     reply: &str,
     source: &str,
@@ -59,6 +60,7 @@ pub async fn extract(
 
     let mut cmd = tokio::process::Command::new(&cfg.command);
     cmd.args(&cfg.args)
+        .current_dir(manifest_dir)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -82,16 +84,24 @@ pub async fn extract(
         }
     };
 
-    if let Some(mut stdin) = handle.take_stdin() {
+    let stdin = handle.take_stdin();
+    let write = async move {
+        let Some(mut stdin) = stdin else {
+            return Ok::<(), std::io::Error>(());
+        };
         use tokio::io::AsyncWriteExt;
-        if let Err(e) = stdin.write_all(payload.as_bytes()).await {
-            warn!(error = %e, "memory extractor: could not write the turn");
-            return Vec::new();
-        }
+        stdin.write_all(payload.as_bytes()).await?;
         drop(stdin);
+        Ok(())
+    };
+
+    let (write_result, output_result) = tokio::join!(write, handle.wait_with_output());
+    if let Err(e) = write_result {
+        warn!(error = %e, "memory extractor: could not write the turn");
+        return Vec::new();
     }
 
-    let out = match handle.wait_with_output().await {
+    let out = match output_result {
         Ok(out) => out,
         Err(e) => {
             warn!(error = %e, "memory extractor: did not finish");

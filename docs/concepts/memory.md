@@ -133,6 +133,7 @@ Three doors, all landing in the same workspace:
 |---|---|---|
 | A conversational agent | `MEMO:` lines in its reply, captured by the `[assistant]` harness | agent, source, session |
 | The same agent, when it forgets | `[assistant.extractor]` — a command the daemon runs over the turn after the reply goes out | agent, source, session |
+| An ordinary agent, when it forgets | `[memory.extractor]` — a command the daemon runs after a successful scheduled run | agent, `source:: schedule` |
 | Any other agent | `MEMO:` lines on stdout, when its manifest declares `[memory]` | agent, `source:: schedule` |
 | Anything holding the tools | `memory-remember` over MCP, or `dotagent memory remember` | agent |
 
@@ -160,6 +161,14 @@ every turn. The model's own lines remain a shortcut worth taking; they stop
 being the only way in.
 
 The third door is the one that makes the store grow on its own: a scheduled agent that learns something durable prints `MEMO: <fact> | topics: a, b` and the daemon files it. Opt-in per manifest, and only on a successful run — see [`[memory]` in the agent spec](../reference/agent-spec.md#memory--memory-capture-for-a-plain-agent-opt-in).
+
+An ordinary scheduled agent can configure `[memory.extractor]` when it does
+not control its output format. The daemon passes the successful run output as
+JSON to the configured command, parses returned `MEMO:` lines, merges them
+with explicit stdout memos, and adds the manifest's topics. Extractor errors
+are best-effort and do not turn a successful run into a failure. An agent with
+`[assistant] memory = true` is excluded from this path because the assistant
+harness owns its memory capture.
 
 Opt-in rather than automatic because most agents print status, not knowledge. A store that absorbs status is a store whose recall returns status, and then the assistant answers from it.
 

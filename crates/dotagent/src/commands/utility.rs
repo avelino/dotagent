@@ -229,11 +229,28 @@ pub async fn run_now(agent_name: String, schedule: Option<String>, format: Forma
     // does neither, and does not file facts either: writing durable memory
     // from a debugging session is the same mistake as publishing from one.
     if let dotagent_runner::OrchestratedOutcome::Ran(ref ro) = outcome {
-        let memos = crate::commands::memory_capture::capture(
+        let mut memos = crate::commands::memory_capture::capture(
             &agent.manifest,
             &ro.stdout_tail,
             ro.exit_code,
         );
+
+        if ro.exit_code == 0 {
+            if let Some(cfg) = crate::commands::memory_capture::extractor(&agent.manifest) {
+                let mut extracted = crate::commands::memory_extract::extract(
+                    &cfg,
+                    &agent.dir,
+                    "",
+                    &ro.stdout_tail,
+                    "schedule",
+                    Some(sched.id()),
+                )
+                .await;
+                crate::commands::memory_capture::add_topics(&agent.manifest, &mut extracted);
+                memos = crate::commands::memory_extract::merge(memos, extracted);
+            }
+        }
+
         crate::commands::memory_capture::flush(
             &dotagent_state::paths::memory_workspace_dir(),
             &agent.manifest.agent.name,
