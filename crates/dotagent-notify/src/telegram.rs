@@ -241,7 +241,8 @@ impl TelegramConfig {
             self.parse_mode,
             self.disable_notification.unwrap_or(false),
             // A scheduled notification answers nothing — there is no inbound
-            // message to quote.
+            // message to quote, and no topic to target.
+            None,
             None,
         )
         .await
@@ -269,10 +270,19 @@ pub(crate) async fn send_message(
     parse_mode: Option<ParseMode>,
     silent: bool,
     reply_to: Option<i64>,
+    message_thread_id: Option<i64>,
 ) -> Result<Option<i64>> {
-    send_message_with_result(bot_token, chat_id, text, parse_mode, silent, reply_to)
-        .await
-        .map(|result| result.map(|result| result.message_id))
+    send_message_with_result(
+        bot_token,
+        chat_id,
+        text,
+        parse_mode,
+        silent,
+        reply_to,
+        message_thread_id,
+    )
+    .await
+    .map(|result| result.map(|result| result.message_id))
 }
 
 async fn send_message_with_result(
@@ -282,6 +292,7 @@ async fn send_message_with_result(
     parse_mode: Option<ParseMode>,
     silent: bool,
     reply_to: Option<i64>,
+    message_thread_id: Option<i64>,
 ) -> Result<Option<TelegramSendResult>> {
     if bot_token.trim().is_empty() {
         return Err(NotifyError::Config(
@@ -301,6 +312,11 @@ async fn send_message_with_result(
         "chat_id": chat_id,
         "text": body_text,
     });
+    if let Some(thread_id) = message_thread_id {
+        // Without this a reply inside a forum topic lands in "General",
+        // splitting the answer from the question it quotes.
+        payload["message_thread_id"] = json!(thread_id);
+    }
     if let Some(mode) = parse_mode {
         let mode_str = match mode {
             ParseMode::MarkdownV2 => "MarkdownV2",
@@ -774,6 +790,7 @@ mod tests {
             "m",
             None,
             false,
+            None,
             None,
         )
         .await

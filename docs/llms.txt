@@ -268,7 +268,10 @@ requests rather than being fresh per run.
 
 The message body travels in `AGENT_TRIGGER_PAYLOAD`, never in argv.
 When the sender used Telegram's reply, `reply_to_text` carries what they
-replied to — a bare "sim" is meaningless without it.
+replied to — a bare "sim" is meaningless without it. Telegram payloads also
+carry `chat_type` (`private` | `group` | `supergroup`), `message_thread_id`
+(present in forum topics), and a `session_id` that keys the conversation: the
+chat id in a direct chat, the reply-chain root in a group.
 Whatever a triggered agent prints on stdout is sent back to whoever
 asked; log to stderr.
 

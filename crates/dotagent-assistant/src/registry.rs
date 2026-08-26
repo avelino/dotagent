@@ -114,6 +114,18 @@ impl RegistryRecord {
         }
     }
 
+    /// Drop the session pointer on request (`/novo`), keeping the record.
+    ///
+    /// Same shape as a transcript retirement — generation bumps, pointer
+    /// clears — so agents that derive per-generation ids see a new one and
+    /// the next trigger starts a fresh conversation while durable facts
+    /// survive in memory.
+    pub fn reset(&mut self) {
+        self.generation += 1;
+        self.model_session = None;
+        self.transcript_bytes = 0;
+    }
+
     /// The pointer to reinject on the next trigger, if any.
     pub fn session_pointer(&self) -> Option<&str> {
         self.model_session.as_deref()
@@ -239,6 +251,19 @@ mod tests {
         assert!(!json.contains("transcript_text"));
         let back: RegistryRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, r);
+    }
+
+    #[test]
+    fn manual_reset_drops_the_pointer_and_bumps_generation() {
+        let mut r = record();
+        r.note_toolkit_hash("hash-a");
+        r.apply_session_frame("s-1", 1_000, DEFAULT_TRANSCRIPT_BYTES_MAX);
+        r.reset();
+        assert_eq!(r.session_pointer(), None);
+        assert_eq!(r.generation, 1);
+        assert_eq!(r.transcript_bytes, 0);
+        // The toolkit hash survives: the next session still wants the tools.
+        assert_eq!(r.toolkit_hash.as_deref(), Some("hash-a"));
     }
 
     #[test]

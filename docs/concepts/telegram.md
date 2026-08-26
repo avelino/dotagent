@@ -85,6 +85,29 @@ dotagent itself interprets nothing. There is no model, no provider and no prompt
 
 A dispatcher that wants *continuity* declares `[assistant]` in its manifest: the daemon then keeps the conversation's pointers (model session id, toolkit hash, transcript size), reinjects them as `AGENT_ASSISTANT_*` on every trigger, retires sessions whose transcript outgrew the ceiling, and strips `MEMO:` capture lines from replies into the memory workspace. The chat transcript itself still never lives in the daemon. Schema in the [agent spec](../reference/agent-spec.md#assistant-conversational-harness-opt-in).
 
+## Conversations and threads
+
+Which messages share a conversation depends on the kind of chat:
+
+- **Direct chat** — one chat, one conversation. Every message shares the session keyed by the chat id. This is the original keying and it does not change.
+- **Group** — every fresh mention roots a new conversation. Replying to any message of a thread — your own question or the bot's answer — continues that thread's conversation. Two subjects asked in parallel never see each other's context.
+- **Group with forum topics** — same as a group, and each topic keeps its own conversations. The bot answers inside the topic it was asked in.
+
+```mermaid
+flowchart TD
+    M[group message arrives] --> R{is a reply?}
+    R -->|no| N[new conversation<br/>rooted at this message]
+    R -->|yes| L[look up the replied-to message]
+    L -->|known| H[continue that conversation]
+    L -->|unknown| N
+```
+
+The binding lives in `state/notify/telegram/threads.json`, a bounded table of the last thousand messages per chat — the same philosophy as the notification correlation table, and it can be deleted at any time: an unresolvable reply simply starts a new conversation, which is what every message did before threads existed.
+
+`/novo` (or `/new`) resets the current thread's conversation — the next message there starts from zero, keeping memory facts but dropping the model session. Like `/help`, it yields to a command file you install yourself. In a direct chat it resets the one conversation there is.
+
+`!!` and parked `!` confirmations are scoped the same way: a confirmation releases what *this thread* parked, so two threads cannot confirm each other's destructive commands.
+
 ## Commands
 
 [Commands](commands.md) put a `/` menu in the chat. The daemon registers it with `setMyCommands` on start and every reload, scoped to each allowlisted chat rather than globally — the allowlist gates execution already, but a global menu would publish every command name to anyone who finds the bot.
@@ -97,7 +120,7 @@ An invoked command arrives beside the text rather than instead of it:
 
 `command` is `null` for ordinary prose. The daemon parses `/name args` — Telegram wire syntax, the same class of thing as reading `update_id` — and stops there. Resolving a name to a prompt is `command-get`, over MCP, and belongs to the dispatcher.
 
-Two answers do come straight from the daemon: `/help` and "no command named /typo". Both are questions about *what exists*, which is the catalog the daemon already publishes. Letting `/typo` fall through would mean a model improvising an answer to something meant to be exact.
+Three answers do come straight from the daemon: `/help`, `/novo` and "no command named /typo". The first two are questions about *what exists* and *what to forget* — the catalog the daemon publishes and the registry the daemon owns. Letting `/typo` fall through would mean a model improvising an answer to something meant to be exact.
 
 ## Running a command yourself
 
@@ -115,7 +138,9 @@ exit code is worse than the exit code.
 
 Destructive commands ask first. `!rm -r /tmp/x` quotes back what it will run
 and waits for `!!`; anything else in between cancels nothing but does not
-confirm either. The list covers the usual suspects and every shell, because a
+confirm either. The parked command is keyed by the conversation — reply in
+the same thread to release it, and a different thread's `!!` cannot. The
+list covers the usual suspects and every shell, because a
 guard on `rm` that lets `sh -c 'rm -rf /'` past guards nothing.
 
 It is off unless `[os]` is configured. The prefix obeys the same `allow` list

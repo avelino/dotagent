@@ -51,10 +51,16 @@ pub trait ReplySink: Send + Sync {
 /// chat with several questions in flight shows which answer belongs to
 /// which. Typing maps to the chat action. Deltas are a no-op — the Bot API
 /// has no streaming, so phase 1 delivers only the final reply.
+///
+/// In a group chat the sink is also given the thread table: the id of every
+/// message it posts is bound to the conversation the worker says it served,
+/// which is what lets the next reply to that answer inherit the thread.
 pub struct TelegramSink {
     bot_token: String,
     chat_id: i64,
     message_id: Option<i64>,
+    message_thread_id: Option<i64>,
+    threads: Option<dotagent_state::ThreadSessionStore>,
 }
 
 impl TelegramSink {
@@ -65,24 +71,57 @@ impl TelegramSink {
             bot_token: bot_token.into(),
             chat_id,
             message_id,
+            message_thread_id: None,
+            threads: None,
         }
+    }
+
+    /// Bind posted answers to their conversation, and target the forum topic
+    /// the question came from. Only meaningful in a group; a direct chat has
+    /// one conversation and no topics.
+    pub fn with_threads(
+        mut self,
+        threads: dotagent_state::ThreadSessionStore,
+        message_thread_id: Option<i64>,
+    ) -> Self {
+        self.threads = Some(threads);
+        self.message_thread_id = message_thread_id;
+        self
     }
 }
 
 impl ReplySink for TelegramSink {
     fn started(&self, _session: Option<&str>, _agent: &str) {}
 
-    fn reply<'a>(&'a self, _session: Option<&'a str>, text: &'a str) -> SinkFuture<'a> {
+    fn reply<'a>(&'a self, session: Option<&'a str>, text: &'a str) -> SinkFuture<'a> {
         let token = self.bot_token.clone();
         let chat_id = self.chat_id;
         let message_id = self.message_id;
+        let thread_id = self.message_thread_id;
+        let threads = self.threads.clone();
         let text = text.to_string();
+        let session = session.map(str::to_string);
         Box::pin(async move {
-            if let Err(e) =
-                dotagent_notify::telegram_inbound::reply(&token, chat_id, message_id, &text).await
+            match dotagent_notify::telegram_inbound::reply(
+                &token, chat_id, message_id, &text, thread_id,
+            )
+            .await
             {
+                Ok(Some(sent)) => {
+                    if let (Some(threads), Some(session)) = (&threads, &session) {
+                        let at = chrono::Utc::now().timestamp();
+                        if let Err(e) =
+                            threads.record_for_chat(&chat_id.to_string(), sent, session, at)
+                        {
+                            // Losing the binding costs thread continuity on
+                            // the next reply, never the answer just delivered.
+                            warn!(error = %e, chat_id, "gateway: could not bind telegram reply to its thread");
+                        }
+                    }
+                }
                 // Already token-sanitized by the transport layer.
-                warn!(error = %e, chat_id, "gateway: telegram reply failed");
+                Err(e) => warn!(error = %e, chat_id, "gateway: telegram reply failed"),
+                Ok(None) => {}
             }
         })
     }

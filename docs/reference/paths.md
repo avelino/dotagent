@@ -446,6 +446,33 @@ Capped at the most recent 500, oldest dropped first. It is a lookup table for
 alerts you might still answer, not a history — and losing it costs correlation
 on old messages, never delivery.
 
+### `state/notify/telegram/threads.json`
+
+Which conversation each recent group message belongs to, so a Telegram reply
+inherits the thread it answers instead of mixing subjects into one session.
+
+```jsonc
+{
+  "entries": {
+    "6:-1001:4821": {
+      "chat_id": "-1001",
+      "session": "-1001-r4821",
+      "at": 1785925367
+    }
+  }
+}
+```
+
+Both ends of an exchange are bound: the inbound message when it is screened,
+and the bot's reply when it is delivered — so replying to either continues
+the thread. The key is scoped by chat, like `sent.json`, because Telegram
+message ids are only unique within a chat.
+
+Capped at the most recent 1000, oldest dropped first. Losing an entry costs
+thread continuity on that one reply (it roots a new conversation), never a
+delivered message. Direct chats never touch this file — their session is the
+chat id. See [Telegram](../concepts/telegram.md#conversations-and-threads).
+
 ### `state/notify/telegram/offset.json`
 
 Last acknowledged Telegram `update_id`, written tmp-then-rename.

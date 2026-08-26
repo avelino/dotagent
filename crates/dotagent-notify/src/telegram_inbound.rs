@@ -41,6 +41,18 @@ pub struct InboundMessage {
     /// questions in flight shows which answer belongs to which.
     pub message_id: i64,
     pub text: String,
+    /// `chat.type` as Telegram reports it: `private`, `group`, `supergroup`
+    /// or `channel`. Empty when the update omitted it, which the policy
+    /// layer treats as `private` — the keying that predates this field, so
+    /// a weird update degrades to the old behaviour instead of a new one.
+    pub chat_type: String,
+    /// Forum topic the message was posted in, when the group has topics
+    /// enabled. `None` for direct messages and plain groups.
+    ///
+    /// Telegram scopes `message_id` to a chat, not to a topic, so the topic
+    /// is a namespace rather than an identity — but a reply must land in the
+    /// topic it answers, which is why the sink needs it on the way out.
+    pub message_thread_id: Option<i64>,
     /// Text of the message this one replies to, when the sender used
     /// Telegram's reply.
     ///
@@ -94,6 +106,8 @@ struct Message {
     chat: Option<Chat>,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    message_thread_id: Option<i64>,
     /// Boxed because `Message` would otherwise be infinitely sized.
     #[serde(default)]
     reply_to_message: Option<Box<Message>>,
@@ -107,6 +121,8 @@ struct User {
 #[derive(Debug, Deserialize)]
 struct Chat {
     id: i64,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
 }
 
 /// Extract the messages we can act on. Updates without a sender, a chat or
@@ -138,6 +154,8 @@ fn extract(updates: Vec<Update>) -> Vec<InboundMessage> {
                 chat_id: chat.id,
                 message_id,
                 text,
+                chat_type: chat.kind.unwrap_or_default(),
+                message_thread_id: msg.message_thread_id,
                 reply_to_text,
                 reply_to_message_id,
             })
@@ -257,17 +275,34 @@ impl Poller {
 /// have several questions in flight, so without the quote there is no telling
 /// which answer belongs to which.
 ///
+/// `message_thread_id` posts into the forum topic the question came from;
+/// `None` in direct messages and plain groups.
+///
 /// Truncation to Telegram's 4096-char cap happens inside `send_message`, which
 /// is the single choke point every outbound message goes through — trimming
 /// here as well would leave the notification path uncovered, which is exactly
 /// how it stayed broken.
-pub async fn reply(bot_token: &str, chat_id: i64, reply_to: Option<i64>, text: &str) -> Result<()> {
-    // The id of the reply is not recorded: correlation exists so a *failure
-    // notification* can be answered, and an answer to an answer resolves to
-    // the same run through the message it quotes.
-    send_message(bot_token, &chat_id.to_string(), text, None, false, reply_to)
-        .await
-        .map(|_| ())
+///
+/// Returns the id of the posted message when the API reports one, so the
+/// caller can bind it to the conversation it answered — a reply to the answer
+/// then resolves to the same thread.
+pub async fn reply(
+    bot_token: &str,
+    chat_id: i64,
+    reply_to: Option<i64>,
+    text: &str,
+    message_thread_id: Option<i64>,
+) -> Result<Option<i64>> {
+    send_message(
+        bot_token,
+        &chat_id.to_string(),
+        text,
+        None,
+        false,
+        reply_to,
+        message_thread_id,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------
@@ -431,7 +466,7 @@ mod tests {
     #[test]
     fn extracts_a_plain_text_message() {
         let raw = r#"{"ok":true,"result":[
-            {"update_id":10,"message":{"message_id":7,"from":{"id":42},"chat":{"id":99},"text":"hello"}}
+            {"update_id":10,"message":{"message_id":7,"from":{"id":42},"chat":{"id":99,"type":"private"},"text":"hello"}}
         ]}"#;
         let msgs = extract(updates_json(raw));
         assert_eq!(
@@ -442,10 +477,38 @@ mod tests {
                 chat_id: 99,
                 message_id: 7,
                 text: "hello".into(),
+                chat_type: "private".into(),
+                message_thread_id: None,
                 reply_to_text: None,
                 reply_to_message_id: None
             }]
         );
+    }
+
+    #[test]
+    fn extracts_the_chat_kind_and_topic_of_a_forum_message() {
+        // The pair the session policy keys on: without `type` a group would
+        // be keyed like a direct chat, and without the topic a reply would
+        // land in "General".
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":11,"message":{"message_id":8,"from":{"id":42},
+             "chat":{"id":-1001234,"type":"supergroup"},
+             "message_thread_id":77,"text":"hi"}}
+        ]}"#;
+        let m = &extract(updates_json(raw))[0];
+        assert_eq!(m.chat_type, "supergroup");
+        assert_eq!(m.message_thread_id, Some(77));
+    }
+
+    #[test]
+    fn an_update_without_chat_type_reads_as_empty_not_guessed() {
+        // The policy layer treats empty as `private` (the pre-field keying);
+        // deciding that here would duplicate the fallback in two modules.
+        let raw = r#"{"ok":true,"result":[
+            {"update_id":10,"message":{"message_id":7,"from":{"id":42},"chat":{"id":99},"text":"hello"}}
+        ]}"#;
+        let m = &extract(updates_json(raw))[0];
+        assert_eq!(m.chat_type, "");
     }
 
     #[test]

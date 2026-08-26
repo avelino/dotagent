@@ -132,6 +132,19 @@ pub fn telegram_offset_file() -> PathBuf {
         .join("offset.json")
 }
 
+/// Which conversation each recent group message belongs to, so a Telegram
+/// reply inherits the thread it answers instead of mixing subjects in one
+/// session.
+///
+/// Bounded like the sent-message table: it exists to resolve replies from
+/// the last few days, not to remember every group message forever.
+pub fn telegram_threads_file() -> PathBuf {
+    state_dir()
+        .join("notify")
+        .join("telegram")
+        .join("threads.json")
+}
+
 pub fn known_manifests_file() -> PathBuf {
     state_dir().join("known_manifests.json")
 }

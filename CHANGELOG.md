@@ -7,6 +7,28 @@ adheres to [Semantic Versioning](https://semver.org/).
 Pre-1.0: minor bumps may include breaking changes; both `agent.toml`
 schema and the plugin protocol are flagged in each entry.
 
+## [0.6.2] - 2026-08-26
+
+### Added
+
+- **Telegram reply-chain threads.** In groups, every fresh mention roots a
+  new conversation and replies (to your message or the bot's answer) continue
+  that thread, so parallel subjects stop sharing one session. Forum topics
+  keep per-topic conversations, and bot replies now land in the topic they
+  were asked in. Direct chats keep the chat-wide keying. Bindings live in
+  `state/notify/telegram/threads.json` (bounded, deletable).
+- **`/novo` (alias `/new`).** Built-in Telegram command that resets the
+  current thread's model session; yields to an installed command file, like
+  `/help`.
+- Telegram trigger payloads now carry `chat_type` and `message_thread_id`
+  alongside the existing fields.
+
+### Changed
+
+- **`!!` and parked `!` confirmations are scoped per conversation** instead
+  of per chat. In a group, a thread's `!!` releases only what that thread
+  parked. Direct chats are unaffected.
+
 ## [0.6.1] - 2026-08-25
 
 ### Fixed

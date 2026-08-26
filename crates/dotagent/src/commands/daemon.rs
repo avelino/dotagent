@@ -838,52 +838,80 @@ fn spawn_telegram_ingress(
                             msg.chat_id,
                             Some(msg.message_id),
                             &text,
+                            msg.message_thread_id,
                         )
                         .await
                         {
                             warn!(error = %e, "could not answer a catalog question");
                         }
                     }
-                    Screened::Bang { bin, args } => {
+                    Screened::Bang { bin, args, session } => {
                         // No model call and no session: the sender typed the
                         // command, so there is nothing to interpret and
                         // nothing to remember. Errors go back raw for the
                         // same reason — a paraphrased exit code is worse
                         // than the exit code.
-                        let text =
-                            handle_typed_command(&msg.chat_id.to_string(), &bin, &args).await;
+                        let text = handle_typed_command(&session, &bin, &args).await;
                         if let Err(e) = dotagent_notify::telegram_inbound::reply(
                             &cfg.bot_token,
                             msg.chat_id,
                             Some(msg.message_id),
                             &text,
+                            msg.message_thread_id,
                         )
                         .await
                         {
                             warn!(error = %e, "could not deliver a ! result");
                         }
                     }
-                    Screened::Confirm => {
-                        // The chat id keys the parked command, so `!!` can
-                        // only ever release what was asked in this chat.
-                        let text = handle_confirmation(&msg.chat_id.to_string()).await;
+                    Screened::Confirm { session } => {
+                        // The session keys the parked command, so `!!` can
+                        // only ever release what was asked in this thread —
+                        // or, in a direct chat, this conversation.
+                        let text = handle_confirmation(&session).await;
                         if let Err(e) = dotagent_notify::telegram_inbound::reply(
                             &cfg.bot_token,
                             msg.chat_id,
                             Some(msg.message_id),
                             &text,
+                            msg.message_thread_id,
                         )
                         .await
                         {
                             warn!(error = %e, "could not deliver a !! result");
                         }
                     }
+                    Screened::Reset { session } => {
+                        let text = reset_conversation(&session);
+                        if let Err(e) = dotagent_notify::telegram_inbound::reply(
+                            &cfg.bot_token,
+                            msg.chat_id,
+                            Some(msg.message_id),
+                            &text,
+                            msg.message_thread_id,
+                        )
+                        .await
+                        {
+                            warn!(error = %e, "could not deliver a /novo result");
+                        }
+                    }
                     Screened::Run(req) => {
-                        let sink = Arc::new(TelegramSink::new(
+                        let mut sink = TelegramSink::new(
                             cfg.bot_token.clone(),
                             msg.chat_id,
                             Some(msg.message_id),
-                        ));
+                        );
+                        if is_group_chat(&msg.chat_type) {
+                            // The answer must anchor the thread: binding its
+                            // message id is what makes a reply to it inherit
+                            // the conversation. In a direct chat the session
+                            // is the chat, so there is nothing to bind.
+                            sink = sink.with_threads(
+                                dotagent_state::ThreadSessionStore::from_home(),
+                                msg.message_thread_id,
+                            );
+                        }
+                        let sink = Arc::new(sink);
                         if let Err(rejection) = gateway.submit(*req, sink).await {
                             warn!(
                                 user_id = msg.user_id,
@@ -896,6 +924,7 @@ fn spawn_telegram_ingress(
                                 msg.chat_id,
                                 Some(msg.message_id),
                                 &short,
+                                msg.message_thread_id,
                             )
                             .await
                             {
@@ -997,6 +1026,12 @@ async fn publish_command_menu(cfg: &dotagent_core::TelegramIngressConfig) {
 }
 
 /// What screening decided about one inbound message.
+///
+/// Every variant that acts instead of running carries the derived
+/// conversation key, because acting is scoped to a conversation: `!!`
+/// releases what *this thread* parked, and `/novo` clears *this thread's*
+/// context. A chat-wide key would let one thread confirm another's parked
+/// command.
 enum Screened {
     /// Hand it to the dispatcher.
     Run(Box<TriggerRequest>),
@@ -1017,9 +1052,16 @@ enum Screened {
     Bang {
         bin: String,
         args: Vec<String>,
+        session: String,
     },
     /// `!!` — run what this conversation parked, if anything.
-    Confirm,
+    Confirm {
+        session: String,
+    },
+    /// `/novo` (or `/new`): drop this conversation's model session.
+    Reset {
+        session: String,
+    },
     Reject(&'static str),
 }
 
@@ -1042,7 +1084,8 @@ impl Screened {
             Screened::Run(r) => *r,
             Screened::Answer(t) => panic!("expected a run, got an answer: {t}"),
             Screened::Bang { bin, .. } => panic!("expected a run, got a bang: {bin}"),
-            Screened::Confirm => panic!("expected a run, got a confirmation"),
+            Screened::Confirm { .. } => panic!("expected a run, got a confirmation"),
+            Screened::Reset { .. } => panic!("expected a run, got a reset"),
             Screened::Reject(r) => panic!("expected a run, got a rejection: {r}"),
         }
     }
@@ -1050,6 +1093,12 @@ impl Screened {
         match self {
             Screened::Answer(t) => t,
             _ => panic!("expected a direct answer"),
+        }
+    }
+    fn reset_session(self) -> String {
+        match self {
+            Screened::Reset { session } => session,
+            _ => panic!("expected a reset"),
         }
     }
 }
@@ -1113,7 +1162,60 @@ fn screen(
     catalog: &crate::slash::CommandDiscovery,
 ) -> Screened {
     let store = dotagent_state::SentMessageStore::from_home();
-    screen_with_store(msg, cfg, limiter, catalog, &store)
+    let threads = dotagent_state::ThreadSessionStore::from_home();
+    screen_with_store(msg, cfg, limiter, catalog, &store, &threads)
+}
+
+/// Telegram chat kinds where one chat holds many conversations at once.
+fn is_group_chat(chat_type: &str) -> bool {
+    matches!(chat_type, "group" | "supergroup")
+}
+
+/// The conversation key a new group message roots itself in.
+///
+/// `r` marks the reply-chain root; `t` namespaces it by forum topic so two
+/// topics never share a session even though Telegram scopes message ids per
+/// chat, not per topic. Both markers keep the key inside the charset
+/// `is_valid_session_id` accepts.
+fn root_session(chat_id: i64, thread_id: Option<i64>, message_id: i64) -> String {
+    match thread_id {
+        Some(t) => format!("{chat_id}-t{t}-r{message_id}"),
+        None => format!("{chat_id}-r{message_id}"),
+    }
+}
+
+/// Derive the conversation one message belongs to and bind it.
+///
+/// A direct chat is one conversation by definition and keeps the chat-wide
+/// key that predates threads — including an update whose chat type is
+/// missing, which degrades to the old keying rather than a new one. In a
+/// group, a reply inherits the conversation of the message it answers;
+/// anything else roots a new conversation. The message is then bound in the
+/// thread table so the *next* reply — to it or to the bot's answer to it —
+/// resolves to the same conversation.
+fn session_key(
+    msg: &dotagent_notify::telegram_inbound::InboundMessage,
+    threads: &dotagent_state::ThreadSessionStore,
+) -> String {
+    if !is_group_chat(&msg.chat_type) {
+        return msg.chat_id.to_string();
+    }
+    let chat = msg.chat_id.to_string();
+    let inherited = msg
+        .reply_to_message_id
+        .and_then(|replied| threads.resolve_for_chat(&chat, replied));
+    let session = inherited
+        .unwrap_or_else(|| root_session(msg.chat_id, msg.message_thread_id, msg.message_id));
+    if let Err(e) = threads.record_for_chat(&chat, msg.message_id, &session, now_epoch()) {
+        // Continuity is best-effort: an unbound message costs a fresh
+        // conversation next time, never a lost one.
+        warn!(error = %e, chat_id = %msg.chat_id, "could not bind telegram thread session");
+    }
+    session
+}
+
+fn now_epoch() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 fn screen_with_store(
@@ -1122,6 +1224,7 @@ fn screen_with_store(
     limiter: &mut dotagent_notify::telegram_inbound::RateLimiter,
     catalog: &crate::slash::CommandDiscovery,
     store: &dotagent_state::SentMessageStore,
+    threads: &dotagent_state::ThreadSessionStore,
 ) -> Screened {
     if !cfg.allows(msg.user_id) {
         // Someone found the bot.
@@ -1131,13 +1234,18 @@ fn screen_with_store(
         return Screened::Reject("rate limit exceeded");
     }
 
+    // Derived after the allowlist and rate limit — a refused sender must not
+    // spend a state write — and before anything that acts, because acting
+    // (`!!`, `!`, `/novo`) is scoped to the conversation.
+    let session = session_key(msg, threads);
+
     // After the allowlist and the rate limit, before anything that involves
     // the dispatcher: a `!` line is not a conversation turn.
     if crate::os_exec::is_confirmation(&msg.text) {
-        return Screened::Confirm;
+        return Screened::Confirm { session };
     }
     if let Some((bin, args)) = crate::os_exec::parse_bang(&msg.text) {
-        return Screened::Bang { bin, args };
+        return Screened::Bang { bin, args, session };
     }
 
     // Lexical only: `/name args` is Telegram wire syntax, the same class of
@@ -1149,6 +1257,13 @@ fn screen_with_store(
             // A built-in only when nobody installed their own: someone who
             // writes help.md meant to replace this.
             None if name == "help" => return Screened::Answer(help_text(catalog)),
+            // `/novo` / `/new`: reset the model session of this conversation.
+            // Built-in for the same reason as help — the daemon owns the
+            // registry, and routing a reset through the dispatcher would ask
+            // the thing being reset to perform it.
+            None if name == "novo" || name == "new" => {
+                return Screened::Reset { session };
+            }
             None => {
                 // Falling through to the dispatcher would mean a model
                 // improvising an answer to something meant to be exact.
@@ -1167,8 +1282,10 @@ fn screen_with_store(
         // `message_id` rides along so the reply can quote what it answers.
         payload: Some(serde_json::json!({
             "text": msg.text,
-            "session_id": msg.chat_id.to_string(),
+            "session_id": session.clone(),
             "chat_id": msg.chat_id,
+            "chat_type": msg.chat_type,
+            "message_thread_id": msg.message_thread_id,
             "user_id": msg.user_id,
             "message_id": msg.message_id,
             // What the sender was replying to, when they used Telegram's
@@ -1197,8 +1314,39 @@ fn screen_with_store(
         })),
         actor: Some(msg.user_id.to_string()),
         reply_to: Some(msg.chat_id.to_string()),
-        session_id: Some(msg.chat_id.to_string()),
+        session_id: Some(session),
     }))
+}
+
+/// `/novo`: drop the model session of one conversation.
+///
+/// Reads and writes the assistant registry directly, next to where the
+/// harness itself does — the reset must take effect even though the
+/// conversation being reset is between the user and the dispatcher.
+fn reset_conversation(session: &str) -> String {
+    let store = dotagent_assistant::store::RegistryStore::new(
+        dotagent_state::paths::state_dir().join("assistant"),
+    );
+    match store.load(TriggerSource::Telegram.to_string().as_str(), session) {
+        Ok(Some(mut record)) => {
+            let had_context = record.session_pointer().is_some();
+            record.reset();
+            if let Err(e) = store.save(&record, chrono::Utc::now()) {
+                warn!(error = %e, "could not persist conversation reset");
+                return "Could not reset this conversation.".into();
+            }
+            if had_context {
+                "Fresh context — the next message in this thread starts from zero.".into()
+            } else {
+                "Already fresh — nothing to reset in this thread.".into()
+            }
+        }
+        Ok(None) => "Already fresh — nothing to reset in this thread.".into(),
+        Err(e) => {
+            warn!(error = %e, "registry unreadable; reset refused rather than guessed");
+            "Could not reset this conversation.".into()
+        }
+    }
 }
 
 /// The built-in `/help`: what is installed, nothing about what any of it means.
@@ -3728,9 +3876,25 @@ minute = 0
             chat_id: 999,
             message_id: 55,
             text: "how's disk?".into(),
+            // A direct chat: the keying every pre-thread test assumed.
+            chat_type: "private".into(),
+            message_thread_id: None,
             reply_to_text: None,
             reply_to_message_id: None,
         }
+    }
+
+    fn group_message(user_id: i64) -> dotagent_notify::telegram_inbound::InboundMessage {
+        let mut m = inbound(user_id);
+        m.chat_id = -1001234;
+        m.chat_type = "supergroup".into();
+        m
+    }
+
+    fn thread_store() -> (tempfile::TempDir, dotagent_state::ThreadSessionStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dotagent_state::ThreadSessionStore::new(dir.path().join("threads.json"));
+        (dir, store)
     }
 
     fn cfg(allowed: Vec<i64>) -> dotagent_core::TelegramIngressConfig {
@@ -3780,7 +3944,7 @@ minute = 0
             &empty_catalog(),
         );
         match out {
-            Screened::Bang { bin, args } => {
+            Screened::Bang { bin, args, .. } => {
                 assert_eq!(bin, "ls");
                 assert_eq!(args, vec!["-la".to_string()]);
             }
@@ -3797,7 +3961,7 @@ minute = 0
                 &mut limiter(),
                 &empty_catalog()
             ),
-            Screened::Confirm
+            Screened::Confirm { .. }
         ));
     }
 
@@ -3948,12 +4112,14 @@ minute = 0
         let mut msg = inbound(7);
         msg.chat_id = -1001234567890;
         msg.reply_to_message_id = Some(42);
+        let (_threads_dir, threads) = thread_store();
         let payload = screen_with_store(
             &msg,
             &cfg(vec![7]),
             &mut limiter(),
             &empty_catalog(),
             &store,
+            &threads,
         )
         .run()
         .payload
@@ -3961,6 +4127,243 @@ minute = 0
 
         assert_eq!(payload["reply_to_run"]["agent"], "agent");
         assert_eq!(payload["reply_to_run"]["schedule"], "daily");
+    }
+
+    // --- session derivation: a group is many conversations, a direct chat
+    // stays one. Every keying rule lives here because every keying bug
+    // would mix subjects — the exact complaint this exists to fix. ---
+
+    fn run_with(
+        msg: &dotagent_notify::telegram_inbound::InboundMessage,
+        threads: &dotagent_state::ThreadSessionStore,
+    ) -> TriggerRequest {
+        let sent = dotagent_state::SentMessageStore::new(
+            std::env::temp_dir().join("dotagent-test-sent.json"),
+        );
+        screen_with_store(
+            msg,
+            &cfg(vec![7]),
+            &mut limiter(),
+            &empty_catalog(),
+            &sent,
+            threads,
+        )
+        .run()
+    }
+
+    #[test]
+    fn a_direct_chat_keeps_the_chat_wide_session() {
+        // Backcompat: these keys are already on disk as registry records and
+        // heartbeat slugs. A direct chat must never start keying differently.
+        let (_dir, threads) = thread_store();
+        let req = run_with(&inbound(7), &threads);
+        assert_eq!(req.session_id.as_deref(), Some("999"));
+    }
+
+    #[test]
+    fn an_update_without_a_chat_type_keeps_the_chat_wide_session() {
+        // A weird update degrades to the pre-thread keying instead of
+        // inventing a third behaviour.
+        let (_dir, threads) = thread_store();
+        let mut msg = inbound(7);
+        msg.chat_type = String::new();
+        let req = run_with(&msg, &threads);
+        assert_eq!(req.session_id.as_deref(), Some("999"));
+    }
+
+    #[test]
+    fn a_fresh_group_message_roots_a_new_session() {
+        let (_dir, threads) = thread_store();
+        let req = run_with(&group_message(7), &threads);
+        assert_eq!(req.session_id.as_deref(), Some("-1001234-r55"));
+    }
+
+    #[test]
+    fn a_fresh_group_message_in_a_topic_namespaces_the_session() {
+        let (_dir, threads) = thread_store();
+        let mut msg = group_message(7);
+        msg.message_thread_id = Some(77);
+        let req = run_with(&msg, &threads);
+        assert_eq!(req.session_id.as_deref(), Some("-1001234-t77-r55"));
+    }
+
+    #[test]
+    fn a_reply_inherits_the_session_of_the_message_it_answers() {
+        let (_dir, threads) = thread_store();
+        threads
+            .record_for_chat("-1001234", 40, "-1001234-r11", 1)
+            .unwrap();
+        let mut msg = group_message(7);
+        msg.message_id = 56;
+        msg.reply_to_message_id = Some(40);
+        let req = run_with(&msg, &threads);
+        assert_eq!(req.session_id.as_deref(), Some("-1001234-r11"));
+    }
+
+    #[test]
+    fn a_reply_to_an_unbound_message_roots_a_new_session() {
+        // Replying to a human message from before the bot joined (or past
+        // the table's horizon) is a new conversation, not a guess.
+        let (_dir, threads) = thread_store();
+        let mut msg = group_message(7);
+        msg.message_id = 56;
+        msg.reply_to_message_id = Some(40);
+        let req = run_with(&msg, &threads);
+        assert_eq!(req.session_id.as_deref(), Some("-1001234-r56"));
+    }
+
+    #[test]
+    fn the_derived_session_is_gateway_valid() {
+        // The gateway refuses ids outside [A-Za-z0-9_-]; a derived key that
+        // fails this would never run at all.
+        let (_dir, threads) = thread_store();
+        let mut msg = group_message(7);
+        msg.message_thread_id = Some(77);
+        let session = run_with(&msg, &threads).session_id.unwrap();
+        assert!(dotagent_core::slug::is_valid_session_id(&session));
+    }
+
+    #[test]
+    fn two_threads_in_one_group_never_share_a_session() {
+        let (_dir, threads) = thread_store();
+        let mut first = group_message(7);
+        first.message_id = 11;
+        let mut second = group_message(7);
+        second.message_id = 12;
+        let a = run_with(&first, &threads).session_id.unwrap();
+        let b = run_with(&second, &threads).session_id.unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn screening_binds_the_inbound_group_message_to_its_session() {
+        // Without this binding, a reply to your own question (not to the
+        // bot's answer) would start a second conversation.
+        let (_dir, threads) = thread_store();
+        run_with(&group_message(7), &threads);
+        assert_eq!(
+            threads.resolve_for_chat("-1001234", 55).as_deref(),
+            Some("-1001234-r55")
+        );
+    }
+
+    #[test]
+    fn screening_does_not_bind_direct_chat_messages() {
+        // The direct-chat session is the chat id; a binding table entry per
+        // message would be pure write amplification.
+        let (_dir, threads) = thread_store();
+        run_with(&inbound(7), &threads);
+        assert!(threads.resolve_for_chat("999", 55).is_none());
+    }
+
+    #[test]
+    fn the_payload_carries_the_derived_session_and_the_chat_shape() {
+        let (_dir, threads) = thread_store();
+        let mut msg = group_message(7);
+        msg.message_thread_id = Some(77);
+        let payload = run_with(&msg, &threads).payload.unwrap();
+        assert_eq!(payload["session_id"], "-1001234-t77-r55");
+        assert_eq!(payload["chat_type"], "supergroup");
+        assert_eq!(payload["message_thread_id"], 77);
+    }
+
+    #[test]
+    fn a_bang_line_carries_the_conversation_session() {
+        let (_dir, threads) = thread_store();
+        let mut msg = group_message(7);
+        msg.text = "!ls".into();
+        match screen_with_store(
+            &msg,
+            &cfg(vec![7]),
+            &mut limiter(),
+            &empty_catalog(),
+            &dotagent_state::SentMessageStore::new(
+                std::env::temp_dir().join("dotagent-test-sent.json"),
+            ),
+            &threads,
+        ) {
+            Screened::Bang { session, .. } => assert_eq!(session, "-1001234-r55"),
+            _ => panic!("expected a bang"),
+        }
+    }
+
+    // --- /novo: reset is scoped to the thread that asked. ---
+
+    #[test]
+    fn novo_is_a_builtin_reset() {
+        let (_dir, threads) = thread_store();
+        let mut msg = group_message(7);
+        msg.text = "/novo".into();
+        let session = screen_with_store(
+            &msg,
+            &cfg(vec![7]),
+            &mut limiter(),
+            &empty_catalog(),
+            &dotagent_state::SentMessageStore::new(
+                std::env::temp_dir().join("dotagent-test-sent.json"),
+            ),
+            &threads,
+        )
+        .reset_session();
+        assert_eq!(session, "-1001234-r55");
+    }
+
+    #[test]
+    fn new_is_an_alias_for_novo() {
+        let (_dir, threads) = thread_store();
+        let mut msg = group_message(7);
+        msg.text = "/new".into();
+        let out = screen_with_store(
+            &msg,
+            &cfg(vec![7]),
+            &mut limiter(),
+            &empty_catalog(),
+            &dotagent_state::SentMessageStore::new(
+                std::env::temp_dir().join("dotagent-test-sent.json"),
+            ),
+            &threads,
+        );
+        assert!(matches!(out, Screened::Reset { .. }));
+    }
+
+    #[test]
+    fn novo_replies_as_an_answer_when_a_command_file_owns_the_name() {
+        // Same precedence as help: someone who wrote novo.md meant to replace
+        // the built-in, and the dispatcher should see it as a command.
+        let (_dir, threads) = thread_store();
+        let (_cat_dir, catalog) =
+            catalog_with(&[("novo.md", "---\ndescription: Custom.\n---\nBody.\n")]);
+        let mut msg = inbound(7);
+        msg.text = "/novo".into();
+        let out = screen_with_store(
+            &msg,
+            &cfg(vec![7]),
+            &mut limiter(),
+            &catalog,
+            &dotagent_state::SentMessageStore::new(
+                std::env::temp_dir().join("dotagent-test-sent.json"),
+            ),
+            &threads,
+        );
+        assert!(out.is_run(), "an installed command beats the builtin reset");
+    }
+
+    #[test]
+    fn an_unlisted_user_cannot_reset() {
+        let (_dir, threads) = thread_store();
+        let mut msg = group_message(7);
+        msg.text = "/novo".into();
+        assert!(screen_with_store(
+            &msg,
+            &cfg(vec![1, 2]),
+            &mut limiter(),
+            &empty_catalog(),
+            &dotagent_state::SentMessageStore::new(
+                std::env::temp_dir().join("dotagent-test-sent.json")
+            ),
+            &threads,
+        )
+        .is_rejected());
     }
 
     #[test]
