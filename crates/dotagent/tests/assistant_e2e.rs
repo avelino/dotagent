@@ -32,7 +32,7 @@ fn write(path: &Path, contents: &str) {
     std::fs::write(path, contents).unwrap();
 }
 
-fn spawn_daemon() -> (Daemon, std::path::PathBuf) {
+fn spawn_daemon(retire_first_turn: bool) -> (Daemon, std::path::PathBuf) {
     let home = TempDir::new().unwrap();
     let root = home.path().join("agents");
 
@@ -53,15 +53,30 @@ protocol = "assistant-v1"
 memory = true
 "#,
     );
-    write(
-        &root.join("smoke-dispatcher/agent.sh"),
+    let transcript_bytes = if retire_first_turn {
+        r#"if [ ! -e "$AGENT_HOME/retired-once" ]; then
+  : > "$AGENT_HOME/retired-once"
+  T=409601
+else
+  T=120
+fi
+"#
+    } else {
+        "T=120\n"
+    };
+    let agent_script = [
         r#"#!/usr/bin/env bash
 S="session=none"; [ -n "$AGENT_ASSISTANT_SESSION" ] && S="session=$AGENT_ASSISTANT_SESSION"
 M="memory=no"; [ -n "$AGENT_ASSISTANT_MEMORY" ] && M="memory=yes"
-echo "{\"type\":\"session\",\"claude_session\":\"smoke-s1\",\"transcript_bytes\":120}"
-printf '{"type":"reply","text":"%s %s\\nMEMO: smoke likes rust | topics: smoke"}\n' "$S" "$M"
+R="context_retired=false"; [ "$AGENT_ASSISTANT_CONTEXT_RETIRED" = "true" ] && R="context_retired=true"
 "#,
-    );
+        transcript_bytes,
+        r#"echo "{\"type\":\"session\",\"claude_session\":\"smoke-s1\",\"transcript_bytes\":$T}"
+printf '{"type":"reply","text":"%s %s %s\\nMEMO: smoke likes rust | topics: smoke"}\n' "$S" "$M" "$R"
+"#,
+    ]
+    .concat();
+    write(&root.join("smoke-dispatcher/agent.sh"), &agent_script);
     write(
         &home.path().join("config.toml"),
         "[telegram]\ndispatcher_agent = \"smoke-dispatcher\"\n",
@@ -125,7 +140,7 @@ fn send_and_await_reply(socket: &Path, id: u64, session: &str, text: &str) -> St
 
 #[test]
 fn assistant_harness_end_to_end() {
-    let (daemon, socket) = spawn_daemon();
+    let (daemon, socket) = spawn_daemon(false);
     wait_for_socket(&socket);
 
     // First trigger: no pointer yet, fact not yet in memory.
@@ -173,4 +188,28 @@ fn assistant_harness_end_to_end() {
         }
     }
     assert!(found, "captured memo reached the memory workspace journal");
+}
+
+#[test]
+fn assistant_harness_notifies_the_child_of_retirement_once() {
+    let (_daemon, socket) = spawn_daemon(true);
+    wait_for_socket(&socket);
+
+    let first = send_and_await_reply(&socket, 1, "smoke1", "hello");
+    assert!(
+        first.contains("context_retired=false"),
+        "first reply: {first}"
+    );
+
+    let second = send_and_await_reply(&socket, 2, "smoke1", "again");
+    assert!(
+        second.contains("context_retired=true"),
+        "second reply: {second}"
+    );
+
+    let third = send_and_await_reply(&socket, 3, "smoke1", "continue");
+    assert!(
+        third.contains("context_retired=false"),
+        "third reply: {third}"
+    );
 }

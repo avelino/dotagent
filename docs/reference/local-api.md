@@ -303,9 +303,10 @@ When the manifest also declares `[assistant]`, the daemon stops ignoring
 recorded in the conversation registry (pointers, never transcript content),
 and the next trigger for the same session receives the pointer back as
 `AGENT_ASSISTANT_SESSION`. A `transcript_bytes` past the configured ceiling
-retires the pointer — the next trigger starts a fresh session. Trailing
-`MEMO:` capture lines are stripped from the delivered reply and flushed to
-the memory workspace. See
+retires the pointer — the next trigger starts a fresh session and receives
+`AGENT_ASSISTANT_CONTEXT_RETIRED=true` exactly once. `/novo` clears the
+pointer without that marker. Trailing `MEMO:` capture lines are stripped from
+the delivered reply and flushed to the memory workspace. See
 [agent-spec](agent-spec.md#assistant-conversational-harness-opt-in).
 
 `assistant-v1` is the only currently supported value for `[run].protocol`.

@@ -164,7 +164,8 @@ Present, the daemon becomes the conversation's bookkeeper **for pointers,
 never transcripts**: it records which model session served the chat, which
 toolkit it ran under and how much transcript it produced, reinjects the
 pointer on the next trigger, retires it when the transcript outgrows the
-ceiling, and captures `MEMO:` lines from replies into the memory workspace.
+ceiling, marks that next trigger as context-retired, and captures `MEMO:`
+lines from replies into the memory workspace.
 
 | Field | Default | Meaning |
 |---|---|---|
@@ -181,7 +182,7 @@ not a silent last-write-wins. The assembled config lands content-addressed at
 session-invalidation key, so adding a server starts a fresh model session on
 the next message without any agent-side state.
 
-What the agent gets out of it: the four `AGENT_ASSISTANT_*` variables
+What the agent gets out of it: the five `AGENT_ASSISTANT_*` variables
 (see [env-vars](#environment-variables-dotagent-injects)), and the guarantee
 that trailing `MEMO: <fact> | topics: a, b` lines never reach the chat —
 they are stripped after the run and flushed to memory off the reply path.
@@ -547,11 +548,17 @@ triggered runs only:
 | `AGENT_ASSISTANT_MCP_CONFIG`  | path to the assembled, content-addressed `mcp.json`                 |
 | `AGENT_ASSISTANT_TOOLKIT_HASH`| stable identity of the toolkit (changes ⇒ fresh session)            |
 | `AGENT_ASSISTANT_MEMORY`      | bounded block of recalled facts plus the topics already in use, when `[assistant].memory` is on |
+| `AGENT_ASSISTANT_CONTEXT_RETIRED` | `"true"` only on the first trigger after automatic transcript retirement |
 
 Each is omitted when it has nothing to say — no pointer recorded, no toolkit
 declared, no facts stored. A typical dispatcher resumes the model session
 with `claude --resume "$AGENT_ASSISTANT_SESSION"` and attaches the toolkit
 with `--mcp-config "$AGENT_ASSISTANT_MCP_CONFIG"`.
+
+`AGENT_ASSISTANT_CONTEXT_RETIRED` is a one-shot marker. The daemon persists
+its consumption before starting that process, so later triggers do not receive
+it. `/novo` clears the pointer without setting the marker; toolkit invalidation
+also starts fresh without it.
 
 ## Heartbeat & state
 

@@ -107,6 +107,9 @@ pub(crate) fn harness_env(
     if let Some(pointer) = record.as_ref().and_then(|r| r.session_pointer()) {
         env.push(("AGENT_ASSISTANT_SESSION".to_string(), pointer.to_string()));
     }
+    let retirement_notice = record
+        .as_mut()
+        .is_some_and(RegistryRecord::take_retirement_notice);
     if config.memory {
         let query = req
             .payload
@@ -121,8 +124,15 @@ pub(crate) fn harness_env(
     }
 
     if let Some(record) = record {
-        if let Err(e) = store.save(&record, chrono::Utc::now()) {
-            warn!(error = %e, "assistant harness: could not persist registry record");
+        match store.save(&record, chrono::Utc::now()) {
+            Ok(()) if retirement_notice => env.push((
+                "AGENT_ASSISTANT_CONTEXT_RETIRED".to_string(),
+                "true".to_string(),
+            )),
+            Ok(()) => {}
+            Err(e) => {
+                warn!(error = %e, "assistant harness: could not persist registry record");
+            }
         }
     }
     env
@@ -409,6 +419,30 @@ mod tests {
         let record = store.load("telegram", "c1").unwrap().unwrap();
         assert_eq!(record.session_pointer(), None, "retired, not recorded");
         assert_eq!(record.generation, 1);
+    }
+
+    #[test]
+    fn automatic_retirement_injects_context_retired_on_next_trigger() {
+        let temp = tempdir().unwrap();
+        let dirs = dirs(&temp);
+        let manifest = manifest_with(Some(assistant_config(vec![])));
+
+        finalize(
+            &manifest,
+            &request(Some("c1"), "x"),
+            "ok".into(),
+            Some(AssistantSessionFrame {
+                claude_session: "s-big".into(),
+                transcript_bytes: DEFAULT_TRANSCRIPT_BYTES_MAX + 1,
+            }),
+            &dirs,
+        );
+
+        let env = harness_env(&manifest, &request(Some("c1"), "again"), &dirs);
+
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "AGENT_ASSISTANT_CONTEXT_RETIRED" && value == "true"));
     }
 
     #[test]

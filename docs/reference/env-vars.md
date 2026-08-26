@@ -34,6 +34,7 @@ SDK to import.
 | `AGENT_TRIGGER_REPLY_TO` | string | `123456789`                                        | One-shot triggered runs, when the source can be answered. Telegram: chat id. |
 | `AGENT_TRIGGER_PAYLOAD` | JSON object | `{"text":"/standup x","chat_id":1,"user_id":2,"command":{"name":"standup","args":"x"}}` | One-shot triggered runs. Body travels here, never in argv. `command` is present only when the sender invoked one — see [Commands](../concepts/commands.md#the-payload). `reply_to_run` is present when the sender replied to a notification dotagent sent — see below. |
 | `AGENT_SESSION_ID`      | string   | `chat-9_a`                                         | One-shot triggered runs only, when the source has a conversation id. Persistent agents receive this as `trigger.session_id` in each request frame instead. |
+| `AGENT_ASSISTANT_CONTEXT_RETIRED` | `"true"` | `"true"` | Only on the first triggered `[assistant]` run after automatic transcript retirement. Absent after `/novo` and otherwise. |
 | `LANG`                 | string   | `en_US.UTF-8`                                      | Only when neither `LANG` nor `LC_ALL` was inherited — see below. |
 
 ### `LANG`, and why a daemon has to name one

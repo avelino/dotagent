@@ -50,6 +50,9 @@ pub struct RegistryRecord {
     /// Last reported transcript size in bytes.
     #[serde(default)]
     pub transcript_bytes: u64,
+    /// Whether an automatic retirement must be announced to the next run.
+    #[serde(default)]
+    pub retirement_notice_pending: bool,
 }
 
 /// Default transcript retirement ceiling (400 KiB), matching the measured
@@ -65,6 +68,7 @@ impl RegistryRecord {
             generation: 0,
             toolkit_hash: None,
             transcript_bytes: 0,
+            retirement_notice_pending: false,
         }
     }
 
@@ -102,6 +106,7 @@ impl RegistryRecord {
             self.generation += 1;
             self.model_session = None;
             self.transcript_bytes = 0;
+            self.retirement_notice_pending = true;
             return RegistryChange::Retired;
         }
         let changed = self.model_session.as_deref() != Some(model_session);
@@ -124,11 +129,17 @@ impl RegistryRecord {
         self.generation += 1;
         self.model_session = None;
         self.transcript_bytes = 0;
+        self.retirement_notice_pending = false;
     }
 
     /// The pointer to reinject on the next trigger, if any.
     pub fn session_pointer(&self) -> Option<&str> {
         self.model_session.as_deref()
+    }
+
+    /// Consume the automatic-retirement notice for the next agent run.
+    pub fn take_retirement_notice(&mut self) -> bool {
+        std::mem::take(&mut self.retirement_notice_pending)
     }
 }
 
@@ -185,6 +196,36 @@ mod tests {
         assert_eq!(r.generation, 1);
         assert_eq!(r.session_pointer(), None);
         assert_eq!(r.transcript_bytes, 0);
+    }
+
+    #[test]
+    fn automatic_retirement_marks_context_for_one_following_run() {
+        let mut r = record();
+        assert_eq!(
+            r.apply_session_frame(
+                "s-1",
+                DEFAULT_TRANSCRIPT_BYTES_MAX + 1,
+                DEFAULT_TRANSCRIPT_BYTES_MAX
+            ),
+            RegistryChange::Retired
+        );
+
+        assert!(r.take_retirement_notice());
+        assert!(!r.take_retirement_notice());
+    }
+
+    #[test]
+    fn manual_reset_clears_pending_retirement_notice() {
+        let mut r = record();
+        r.apply_session_frame(
+            "s-1",
+            DEFAULT_TRANSCRIPT_BYTES_MAX + 1,
+            DEFAULT_TRANSCRIPT_BYTES_MAX,
+        );
+
+        r.reset();
+
+        assert!(!r.take_retirement_notice());
     }
 
     #[test]

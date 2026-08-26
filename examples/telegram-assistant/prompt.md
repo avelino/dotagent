@@ -33,6 +33,16 @@ When the message replies to a notification, `AGENT_TRIGGER_PAYLOAD` carries `rep
 
 Without `reply_to_run`, say you cannot tell which run they mean and ask, rather than guessing from the text.
 
+## Reading session ids in logs
+
+Heartbeat slugs and state files are keyed by the conversation: `trigger-telegram-<session>`. The session format tells you where a message came from:
+
+- `trigger-telegram-2813445` — a direct chat. The number is the chat id.
+- `trigger-telegram--1004457436194-r7` — a group thread rooted at message `7`. `r` marks the reply-chain root, **not a retry**. Replies in that thread (to the question or to your answer) share the session.
+- `trigger-telegram--1004457436194-t12-r7` — same, inside forum topic `12`.
+
+If a run's claude session changed while `state/assistant/*.json` shows `generation` incremented, that is transcript retirement — the transcript passed the size ceiling and started fresh, by design. Durable memory survives it. Not a bug, and not `/novo`.
+
 ## Skills
 
 Before answering anything non-trivial, check whether a `skill-*` description matches the request. If one does, load it first and follow it — it exists because someone decided the obvious approach was wrong.

@@ -363,7 +363,7 @@ inherited environment (unless `env.inherit = false` in the manifest):
 | `AGENT_ARGV`           | JSON array of the schedule's `args`                   |
 | `AGENT_TRIGGER_*`      | only on one-shot [triggered](triggers.md) runs — source, actor, reply handle, payload. **Not set** for a [persistent](lifecycle.md) agent. |
 | `AGENT_SESSION_ID`     | opaque conversation id for a one-shot triggered run, when present. Persistent agents receive it as `trigger.session_id` per request instead. |
-| `AGENT_ASSISTANT_*`    | only on triggered runs of an agent with `[assistant]`: session pointer, toolkit config + hash, memory recall block — see [agent-spec](../reference/agent-spec.md#assistant-conversational-harness-opt-in) |
+| `AGENT_ASSISTANT_*`    | only on triggered runs of an agent with `[assistant]`: session pointer, toolkit config + hash, memory recall block, plus a one-shot automatic-retirement marker — see [agent-spec](../reference/agent-spec.md#assistant-conversational-harness-opt-in) |
 | `AGENT_LIFECYCLE`      | `persistent` when the agent stays alive between runs; absent otherwise |
 | `AGENT_PERSIST_KEY`    | which slice a persistent instance answers for              |
 | `AGENT_HEARTBEAT_FILE` | path to the heartbeat file (empty if `dry_run`)       |
@@ -386,6 +386,11 @@ the daemon: recorded model session ids, toolkit hashes and transcript sizes,
 reinjected as `AGENT_ASSISTANT_*` on the next trigger, with `MEMO:` capture
 lines stripped from replies into the memory workspace. Schema in
 [agent-spec](../reference/agent-spec.md#assistant-conversational-harness-opt-in).
+
+When the daemon retires a transcript that passed the configured ceiling, the
+first next trigger also receives `AGENT_ASSISTANT_CONTEXT_RETIRED=true`. It is
+absent on later triggers and after a manual `/novo` reset, so agents can avoid
+claiming continuity they no longer have.
 
 An agent that wants structured streaming declares
 `[run] protocol = "assistant-v1"` and emits JSON Lines `delta`, `reply`, and

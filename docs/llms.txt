@@ -271,7 +271,10 @@ When the sender used Telegram's reply, `reply_to_text` carries what they
 replied to — a bare "sim" is meaningless without it. Telegram payloads also
 carry `chat_type` (`private` | `group` | `supergroup`), `message_thread_id`
 (present in forum topics), and a `session_id` that keys the conversation: the
-chat id in a direct chat, the reply-chain root in a group.
+chat id in a direct chat; `<chat-id>-r<root-message-id>` in a group; and
+`<chat-id>-t<topic-id>-r<root-message-id>` in a forum topic. Thus
+`trigger-telegram--1004457436194-r7` means chat `-1004457436194`, reply-chain
+root message `7`, not retry `7`.
 Whatever a triggered agent prints on stdout is sent back to whoever
 asked; log to stderr.
 
@@ -279,6 +282,12 @@ asked; log to stderr.
 not persist a transcript or LLM session; the agent decides how to use the key.
 The local API validates it as `^[A-Za-z0-9_-]{1,64}$` and defaults an omitted id
 to `default`.
+
+An agent with `[assistant]` opts into pointer bookkeeping instead: the daemon
+records its reported model-session pointer and transcript size, never the
+transcript itself. When an automatic retirement clears that pointer,
+`AGENT_ASSISTANT_CONTEXT_RETIRED="true"` appears on exactly the next trigger.
+It is absent on later triggers, on toolkit invalidation, and after `/novo`.
 
 ### Slug derivation
 

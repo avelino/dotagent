@@ -67,6 +67,8 @@ Each conversation gets its own `claude` session, so "sim" refers to whatever was
 
 The session belongs to this agent, not to Telegram. The daemon hands over an opaque `AGENT_SESSION_ID` and the script uses it as the conversation key without ever parsing it. Telegram's `chat_id` survives only as a fallback, so conversations started before the upgrade keep their history; running the script by hand with neither set lands in `"default"`. The claude session id itself is a uuid5 of the key plus a generation counter — derived, not stored — so it survives daemon restarts.
 
+In a group, that key is the reply-chain root, not the chat id: a fresh mention roots a thread (`<chat-id>-r<message-id>`, `-t<topic>` inside a forum topic) and every reply in that thread shares one session, so parallel subjects never see each other's context. A `trigger-telegram-…-r7` slug therefore means "rooted at message 7" — not a retry.
+
 That history is not kept forever. `--resume` replays the whole transcript as model input and nothing trims it, so a chat gets slower the more you use it — measured on a real bot, a ~90 KB transcript answers in 8-10s and a 977 KB one in 26-141s. Past 400 KB the session is retired and a fresh one starts, which costs the recent back and forth.
 
 So anything that must survive goes to [memory](../../docs/concepts/memory.md), not to the transcript. State lives in `~/.config/dotagent/state/telegram-assistant/`: `$SESSION_ID.gen` (how many times the conversation was retired) and `$SESSION_ID.started` (which claude session it is in).

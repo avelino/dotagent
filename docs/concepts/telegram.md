@@ -83,7 +83,7 @@ What it does with the message is entirely up to it. [`examples/telegram-assistan
 
 dotagent itself interprets nothing. There is no model, no provider and no prompt in the daemon.
 
-A dispatcher that wants *continuity* declares `[assistant]` in its manifest: the daemon then keeps the conversation's pointers (model session id, toolkit hash, transcript size), reinjects them as `AGENT_ASSISTANT_*` on every trigger, retires sessions whose transcript outgrew the ceiling, and strips `MEMO:` capture lines from replies into the memory workspace. The chat transcript itself still never lives in the daemon. Schema in the [agent spec](../reference/agent-spec.md#assistant-conversational-harness-opt-in).
+A dispatcher that wants *continuity* declares `[assistant]` in its manifest: the daemon then keeps the conversation's pointers (model session id, toolkit hash, transcript size), reinjects them as `AGENT_ASSISTANT_*` on every trigger, retires sessions whose transcript outgrew the ceiling, and strips `MEMO:` capture lines from replies into the memory workspace. The one trigger after automatic retirement receives `AGENT_ASSISTANT_CONTEXT_RETIRED=true`, so the agent can distinguish a forced fresh context from an ordinary new thread. The chat transcript itself still never lives in the daemon. Schema in the [agent spec](../reference/agent-spec.md#assistant-conversational-harness-opt-in).
 
 ## Conversations and threads
 
@@ -92,6 +92,12 @@ Which messages share a conversation depends on the kind of chat:
 - **Direct chat** — one chat, one conversation. Every message shares the session keyed by the chat id. This is the original keying and it does not change.
 - **Group** — every fresh mention roots a new conversation. Replying to any message of a thread — your own question or the bot's answer — continues that thread's conversation. Two subjects asked in parallel never see each other's context.
 - **Group with forum topics** — same as a group, and each topic keeps its own conversations. The bot answers inside the topic it was asked in.
+
+For a group, the opaque session key is `<chat-id>-r<root-message-id>`; a forum
+topic adds `-t<topic-id>` before the root. For example,
+`trigger-telegram--1004457436194-r7` identifies Telegram chat
+`-1004457436194` and reply-chain root message `7`: `r7` is not retry number
+seven.
 
 ```mermaid
 flowchart TD
@@ -104,7 +110,7 @@ flowchart TD
 
 The binding lives in `state/notify/telegram/threads.json`, a bounded table of the last thousand messages per chat — the same philosophy as the notification correlation table, and it can be deleted at any time: an unresolvable reply simply starts a new conversation, which is what every message did before threads existed.
 
-`/novo` (or `/new`) resets the current thread's conversation — the next message there starts from zero, keeping memory facts but dropping the model session. Like `/help`, it yields to a command file you install yourself. In a direct chat it resets the one conversation there is.
+`/novo` (or `/new`) resets the current thread's conversation — the next message there starts from zero, keeping memory facts but dropping the model session. It clears any pending automatic-retirement marker rather than emitting one. Like `/help`, it yields to a command file you install yourself. In a direct chat it resets the one conversation there is.
 
 `!!` and parked `!` confirmations are scoped the same way: a confirmation releases what *this thread* parked, so two threads cannot confirm each other's destructive commands.
 
