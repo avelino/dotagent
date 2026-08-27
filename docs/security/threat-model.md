@@ -143,6 +143,12 @@ enumerable, so assume discovery is free.
 
 - **Numeric allowlist.** `allowed_user_ids` gates every message. `@username` is
   changeable and therefore never used for authorization.
+- **Open chats are operator-listed, not discovered.** `open_chat_ids` lets any
+  member of a *listed* group talk to the dispatcher. The boundary is the
+  operator's choice of group: anyone can add the bot to a group they control,
+  and an unlisted group changes nothing. Typed commands (`!`/`!!`) and direct
+  messages remain `allowed_user_ids`-only even in an open chat, so an open
+  chat grants conversation, never binary execution.
 - **Empty means nobody.** A token configured with an empty allowlist leaves the
   ingress off and logs why. Reading empty as "no restriction" would turn one
   forgotten line into an open remote-execution endpoint.

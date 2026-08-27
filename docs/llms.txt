@@ -1163,6 +1163,8 @@ consumer per bot token):
 [telegram]
 bot_token        = "${TELEGRAM_BOT_TOKEN}"
 allowed_user_ids = [123456789]     # numeric ids; EMPTY MEANS NOBODY
+open_chat_ids = [-1001234567890]   # groups where any member may talk (opt-in;
+                                   # ! / !! and DMs stay allowlist-only)
 dispatcher_agent = "telegram-assistant"
 ```
 

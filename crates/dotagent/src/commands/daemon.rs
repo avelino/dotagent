@@ -1226,7 +1226,13 @@ fn screen_with_store(
     store: &dotagent_state::SentMessageStore,
     threads: &dotagent_state::ThreadSessionStore,
 ) -> Screened {
-    if !cfg.allows(msg.user_id) {
+    let owner = cfg.allows(msg.user_id);
+    // An open chat lets any member *talk*: membership in a group the operator
+    // listed is the trust boundary. It does not hand out typed commands —
+    // running binaries is a different risk class than asking a question —
+    // so `!`/`!!` below stay gated on `owner` even in an open chat.
+    let open_chat = is_group_chat(&msg.chat_type) && cfg.open_chat_ids.contains(&msg.chat_id);
+    if !owner && !open_chat {
         // Someone found the bot.
         return Screened::Reject("user id not in allowed_user_ids");
     }
@@ -1242,9 +1248,15 @@ fn screen_with_store(
     // After the allowlist and the rate limit, before anything that involves
     // the dispatcher: a `!` line is not a conversation turn.
     if crate::os_exec::is_confirmation(&msg.text) {
+        if !owner {
+            return Screened::Reject("!! needs an allowlisted user, even in an open chat");
+        }
         return Screened::Confirm { session };
     }
     if let Some((bin, args)) = crate::os_exec::parse_bang(&msg.text) {
+        if !owner {
+            return Screened::Reject("! lines need an allowlisted user, even in an open chat");
+        }
         return Screened::Bang { bin, args, session };
     }
 
@@ -4050,6 +4062,100 @@ minute = 0
             &empty_catalog()
         )
         .is_rejected());
+    }
+
+    // --- open chats: any member may talk; typed commands stay owner-only.
+    // Every branch here is a privilege boundary, not a preference. ---
+
+    fn open_cfg() -> dotagent_core::TelegramIngressConfig {
+        let mut c = cfg(vec![7]);
+        // The chat id group_message() uses.
+        c.open_chat_ids = vec![-1001234];
+        c
+    }
+
+    fn screen_open(
+        msg: &dotagent_notify::telegram_inbound::InboundMessage,
+        c: &dotagent_core::TelegramIngressConfig,
+    ) -> Screened {
+        let (_dir, threads) = thread_store();
+        screen_with_store(
+            msg,
+            c,
+            &mut limiter(),
+            &empty_catalog(),
+            &dotagent_state::SentMessageStore::new(
+                std::env::temp_dir().join("dotagent-test-sent.json"),
+            ),
+            &threads,
+        )
+    }
+
+    #[test]
+    fn a_stranger_in_an_open_group_talks_to_the_dispatcher() {
+        let mut msg = group_message(9);
+        msg.text = "what agents do you have?".into();
+        assert!(screen_open(&msg, &open_cfg()).is_run());
+    }
+
+    #[test]
+    fn a_stranger_in_a_direct_chat_is_still_refused() {
+        // open_chat_ids must never leak into a DM: the same id as a user id
+        // would mean allowlisting by another name.
+        assert!(screen_open(&inbound(9), &open_cfg())
+            .rejected()
+            .contains("allowed_user_ids"));
+    }
+
+    #[test]
+    fn a_stranger_in_an_unlisted_group_is_refused() {
+        // Anyone can add a bot to a group they control; only the groups the
+        // operator listed are open.
+        let mut msg = group_message(9);
+        msg.chat_id = -1009999;
+        assert!(screen_open(&msg, &open_cfg()).is_rejected());
+    }
+
+    #[test]
+    fn a_stranger_cannot_bang_in_an_open_group() {
+        let mut msg = group_message(9);
+        msg.text = "!ls".into();
+        assert_eq!(
+            screen_open(&msg, &open_cfg()).rejected(),
+            "! lines need an allowlisted user, even in an open chat"
+        );
+    }
+
+    #[test]
+    fn a_stranger_cannot_confirm_in_an_open_group() {
+        let mut msg = group_message(9);
+        msg.text = "!!".into();
+        assert_eq!(
+            screen_open(&msg, &open_cfg()).rejected(),
+            "!! needs an allowlisted user, even in an open chat"
+        );
+    }
+
+    #[test]
+    fn a_stranger_can_novo_in_an_open_group() {
+        // /novo resets that thread's context: conversation-shaped, harmless
+        // to anyone else's thread, so it follows the chat's openness.
+        let mut msg = group_message(9);
+        msg.text = "/novo".into();
+        assert!(matches!(
+            screen_open(&msg, &open_cfg()),
+            Screened::Reset { .. }
+        ));
+    }
+
+    #[test]
+    fn the_owner_keeps_bang_in_an_open_group() {
+        let mut msg = group_message(7);
+        msg.text = "!ls".into();
+        assert!(matches!(
+            screen_open(&msg, &open_cfg()),
+            Screened::Bang { .. }
+        ));
     }
 
     #[test]

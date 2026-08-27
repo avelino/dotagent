@@ -602,6 +602,19 @@ pub struct TelegramIngressConfig {
     /// sender could otherwise keep the daemon busy indefinitely.
     #[serde(default = "default_rate_limit_per_minute")]
     pub rate_limit_per_minute: u32,
+    /// Group chats (`group`/`supergroup`) where **any member** may talk to
+    /// the dispatcher, not just `allowed_user_ids`.
+    ///
+    /// An explicit id list on purpose, never a boolean "all groups": anyone
+    /// can add a bot to a group they control, so membership in a group the
+    /// *operator* listed is the trust boundary — membership in some other
+    /// group is not. Direct messages ignore this field; `!`/`!!` typed
+    /// commands stay restricted to `allowed_user_ids` even in an open chat,
+    /// because running binaries is a different risk class than asking a
+    /// question. Empty (the default) keeps the old behaviour: allowlisted
+    /// users only, everywhere.
+    #[serde(default)]
+    pub open_chat_ids: Vec<i64>,
 }
 
 fn default_dispatcher_agent() -> String {
@@ -622,6 +635,7 @@ impl Default for TelegramIngressConfig {
             dispatcher_agent: default_dispatcher_agent(),
             poll_timeout_seconds: default_poll_timeout_seconds(),
             rate_limit_per_minute: default_rate_limit_per_minute(),
+            open_chat_ids: Vec::new(),
         }
     }
 }

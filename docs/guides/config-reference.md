@@ -116,6 +116,7 @@ manifest's `[[notifiers]]`; see [Notifications](../concepts/notifications.md).
 |---|---|---|
 | `bot_token` | `""` | Bot API token. Accepts `${VAR}`, resolved against the secrets store at poll time. |
 | `allowed_user_ids` | `[]` | Numeric Telegram user ids allowed to trigger runs. |
+| `open_chat_ids` | `[]` | Group chats where **any member** may talk to the dispatcher. Direct messages and `!`/`!!` typed commands stay restricted to `allowed_user_ids`. |
 | `dispatcher_agent` | `"telegram-assistant"` | Agent every accepted message is handed to. |
 | `poll_timeout_seconds` | `30` | Seconds to hold `getUpdates` open. Telegram caps this at 50. |
 | `rate_limit_per_minute` | `10` | Accepted messages per sender per minute. |

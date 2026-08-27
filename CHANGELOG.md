@@ -7,6 +7,16 @@ adheres to [Semantic Versioning](https://semver.org/).
 Pre-1.0: minor bumps may include breaking changes; both `agent.toml`
 schema and the plugin protocol are flagged in each entry.
 
+## [Unreleased]
+
+### Added
+
+- **Open chats.** `open_chat_ids` in `[telegram]` lists group chats where any
+  member may talk to the dispatcher, not just `allowed_user_ids`. The list is
+  explicit on purpose (anyone can add a bot to a group they control), and an
+  open chat grants conversation only: direct messages and `!`/`!!` typed
+  commands stay restricted to allowlisted users.
+
 ## [0.6.2] - 2026-08-26
 
 ### Added

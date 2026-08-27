@@ -69,6 +69,15 @@ Telegram allows exactly one `getUpdates` consumer per bot token. If each manifes
 
 Messages from unlisted senders are refused before anything runs and recorded as `trigger_rejected` at `Critical` severity. That severity is deliberate: it means somebody found your bot.
 
+### Open chats: sharing the bot with a group
+
+`open_chat_ids` lists group chats where **any member** may talk to the dispatcher — useful when the group itself is the team. The list is explicit chat ids on purpose: anyone can add a bot to a group they control, so the trust boundary is membership in a group the *operator* listed, not membership in any group. Two things an open chat deliberately does **not** grant:
+
+- **Direct messages** still require `allowed_user_ids`, always.
+- **`!` and `!!`** (typed commands that run binaries) stay owner-only even in an open chat — running a program is a different risk class than asking a question.
+
+The rate limit applies per sender regardless, and every accepted message still lands in the audit log with the sender's numeric id.
+
 ## Rate limiting
 
 `rate_limit_per_minute` (default 10) caps accepted messages per sender. Excess is dropped with an audit entry. The bot is reachable from anywhere on the internet, so this is the backstop that keeps one sender from occupying the daemon indefinitely.
