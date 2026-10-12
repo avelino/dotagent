@@ -37,10 +37,10 @@ jobs:
           else
             TAG="${GITHUB_REF_NAME}"
           fi
-          case "${TAG}" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::tag must look like v1.2.3, got '${TAG}'"; exit 1 ;;
-          esac
+          if ! [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::tag must look like v1.2.3 (optionally v1.2.3-rc.1), got '${TAG}'"
+            exit 1
+          fi
           VERSION="${TAG#v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Computed stable version: ${VERSION}"
