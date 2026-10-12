@@ -39,12 +39,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14            # Apple silicon
+          - os: macos-15            # Apple silicon
             target: aarch64-apple-darwin
             archive-suffix: aarch64-darwin
-          # GitHub retired the macos-13 Intel runner, so the Intel
+          # GitHub retired macos-13 and is retiring macos-14, so the Intel
           # binary is cross-compiled on Apple silicon.
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             archive-suffix: x86_64-darwin
           - os: ubuntu-latest
