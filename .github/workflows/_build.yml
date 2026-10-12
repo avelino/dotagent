@@ -20,6 +20,11 @@ on:
         type: string
         required: false
         default: release
+      ref:
+        description: "Git ref to build. Empty = the ref that triggered the run."
+        type: string
+        required: false
+        default: ""
       version-file:
         description: "Multi-line content for a VERSION file written into the tarball root. Empty = no VERSION file."
         type: string
@@ -37,7 +42,9 @@ jobs:
           - os: macos-14            # Apple silicon
             target: aarch64-apple-darwin
             archive-suffix: aarch64-darwin
-          - os: macos-13            # Intel
+          # GitHub retired the macos-13 Intel runner, so the Intel
+          # binary is cross-compiled on Apple silicon.
+          - os: macos-14
             target: x86_64-apple-darwin
             archive-suffix: x86_64-darwin
           - os: ubuntu-latest
@@ -48,10 +55,12 @@ jobs:
             archive-suffix: aarch64-linux
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Install rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -67,7 +76,7 @@ jobs:
           EOF
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: ${{ inputs.cache-key }}-${{ matrix.target }}
 
@@ -100,7 +109,7 @@ jobs:
           shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ matrix.archive-suffix }}
           path: |
