@@ -92,7 +92,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
   "trace",
   "logs",
 ] }
-opentelemetry-semantic-conventions = "0.32"
+opentelemetry-semantic-conventions = "0.33"
 opentelemetry-stdout = { version = "0.32", features = ["trace", "logs"] }
 flate2 = "1"
 
