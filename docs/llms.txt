@@ -644,6 +644,9 @@ config = {
 Outl-specific: daily slug is **ISO** (`2026-06-01`); the plugin also
 accepts Roam's ordinal form and normalizes it. Same stdin hierarchy
 convention as `sink-roam` (root + L1/L2, fences stripped, `---` cuts).
+Roam `{{[[query]]: …}}` / `{{query: …}}` becomes a fenced `query` block
+when every clause has an outl equivalent; otherwise the original stays
+in a plain code block and a warning goes to stderr.
 
 ---
 

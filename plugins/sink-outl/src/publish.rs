@@ -119,7 +119,7 @@ fn parse_roam_ordinal_daily(s: &str) -> Option<String> {
 /// Convert the 2-level `Tree` (root + sections of L1 headers with L2 children)
 /// into Outl's tree shape: `{text, children: [{text, children: [{text}]}]}`.
 /// Every text node is passed through [`crate::translate::roam_to_outl`] so
-/// Roam-flavor constructs (`{{[[TODO]]}}`, ordinal dailies, …) render
+/// Roam-flavor constructs (`{{[[TODO]]}}`, queries, ordinal dailies, …) render
 /// natively on the Outl side.
 fn tree_to_outl(tree: &Tree) -> Value {
     let sections: Vec<Value> = tree

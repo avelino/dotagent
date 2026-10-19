@@ -203,6 +203,47 @@ The marker search uses `outl_search` with a cheap FTS probe (first
 contiguous run of `#`/alphanumeric/`_`/`-` from the pattern), then
 re-filters client-side with the full regex.
 
+### Roam queries
+
+Agents still emit Roam native queries. outl does not execute
+`{{[[query]]: …}}` or `{{query: …}}` — both are stored as ordinary text.
+The form it runs is a fenced block tagged `query`: one `key: value`
+directive per line, every line implicitly ANDed, with `not-<key>` as
+the negation of that same directive.
+
+When every clause has an equivalent, the plugin writes that fence:
+
+| Roam clause | outl directive |
+| --- | --- |
+| `{and: …}` | one directive per clause (nested `{and:}` flattens) |
+| `[[TODO]]`, `{{[[TODO]]}}`, `{{TODO}}` | `status: todo` |
+| `[[DONE]]`, `{{[[DONE]]}}`, `{{DONE}}` | `status: done` |
+| `#tag` | `tag: tag` |
+| `[[page]]` | `text: [[page]]` |
+| `{not: <one of the above>}` | `not-status` / `not-tag` / `not-text` |
+| `{search: text}` | `text: text` |
+
+`text: [[page]]` is the reference match (a block whose text contains
+that wikilink). It does not select blocks that merely live on the page —
+outl's `page:` filter is not implemented. A daily-note page
+(`[[today]]`, `[[April 22nd, 2026]]`, `[[2026-04-22]]`) is the case
+where those two readings diverge, and `since:` is a relative duration
+(`7d`, `2w`, `3m`), not a calendar day, so a date page is not translated.
+
+These have no equivalent. The original component is kept, unchanged, in
+a plain code block (no language tag, so outl does not try to run it),
+and the plugin writes one warning per query to stderr:
+
+- `{or:}` — the DSL has no OR and no boolean grouping
+- `{between:}` — a calendar range, not `since:`
+- `{daily-notes:}`, `{by:}`, `{created-by:}`, `{edited-by:}`
+- `((block ref))` — a Roam UID does not map to an outl block handle
+- an empty `{and:}` — an empty outl query matches every block
+
+A query title (`{{[[query]]: "Open tasks" {and: …}}}`) is display-only
+and dropped. A fence already in the block is not scanned again, so a
+preserved query survives a second pass byte for byte.
+
 ### Sanitization
 
 Same convention as `sink-roam`:
