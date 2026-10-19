@@ -9,6 +9,16 @@ schema and the plugin protocol are flagged in each entry.
 
 ## [Unreleased]
 
+### Fixed
+
+- **sink-outl Roam queries.** `{{[[query]]: …}}` and `{{query: …}}` were
+  rewritten to `{{query: …}}`, which outl stores as text and never runs.
+  A query whose clauses outl can say (`{and:}`, `{not:}` of one condition,
+  `[[page]]`, `#tag`, `{search:}`, the TODO/DONE markers) is now a
+  fenced `query` block. `{or:}`, `{between:}`, daily-note pages and the
+  other clauses with no equivalent stay in a plain code block, with a
+  warning on stderr.
+
 ### Added
 
 - **Open chats.** `open_chat_ids` in `[telegram]` lists group chats where any
