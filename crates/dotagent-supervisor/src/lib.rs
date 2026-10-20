@@ -6,11 +6,15 @@
 //!   enforces with `SIGTERM → grace → SIGKILL`.
 //! - **Kill-tree.** Children are placed in their own process group via
 //!   `setpgid(0, 0)`, from the parent before the pid is published and from
-//!   the child. Termination signals are sent with `killpg(2)` so
-//!   grandchildren (e.g. `mcp` invoked by a sink plugin) die with the parent.
-//!   The parent call is what makes a cancellation safe: `Command::process_group`
-//!   only `setpgid`s inside the child, and on the fork path that runs after
-//!   `spawn` has already returned.
+//!   the child. Termination signals go to that group and to descendants
+//!   still parented under the leader, so a grandchild dies with the parent
+//!   even when a shell has moved it into another group (`cmd &` under
+//!   monitor mode). `SIGKILL` stops the leader first: a signal is not
+//!   inherited by a child forked while it is still pending, and `killpg`
+//!   alone misses that child. The parent `setpgid` is what makes a
+//!   cancellation safe to start: `Command::process_group` only `setpgid`s
+//!   inside the child, and on the fork path that runs after `spawn` has
+//!   already returned.
 //! - **Live registry.** `Supervisor::snapshot` returns what is running right
 //!   now — feeds `dotagent status` and `dotagent doctor`.
 //! - **Reaper task.** A sweeper kills entries whose deadline elapsed even if
@@ -268,12 +272,13 @@ impl Inner {
     /// Finish a cancellation claim synchronously.
     ///
     /// Cancellation cannot await the normal TERM grace period: the owning
-    /// task is already being dropped. `killpg(SIGKILL)` is a non-blocking
-    /// syscall and preserves kill-tree semantics without leaving a cleanup
-    /// task detached behind it.
+    /// task is already being dropped. The kill is synchronous — it does not
+    /// arm the grace timer and it does not detach a task. It does wait,
+    /// briefly, until the leader has stopped, so a fork in flight is part
+    /// of the tree before `SIGKILL`.
     fn force_claimed(&self, claim: KillClaim) {
         if let Some(pgid) = claim.pgid {
-            let _ = signal::killpg(pgid, signal::SIGKILL);
+            signal::signal_tree(pgid, signal::SIGKILL);
         }
         let elapsed = {
             let mut reg = self.registry.lock().expect("registry lock poisoned");
@@ -505,9 +510,9 @@ impl Supervisor {
             return;
         };
         if let Some(pgid) = claim.pgid {
-            let _ = signal::killpg(pgid, signal::SIGTERM);
+            signal::signal_tree(pgid, signal::SIGTERM);
             tokio::time::sleep(self.inner.grace).await;
-            let _ = signal::killpg(pgid, signal::SIGKILL);
+            signal::signal_tree(pgid, signal::SIGKILL);
         }
         let elapsed = {
             let mut reg = self.inner.registry.lock().expect("registry lock poisoned");
@@ -551,7 +556,7 @@ impl Supervisor {
             return;
         }
         for pgid in &pgids {
-            let _ = signal::killpg(*pgid, signal::SIGTERM);
+            signal::signal_tree(*pgid, signal::SIGTERM);
         }
         tokio::time::sleep(grace).await;
         let pgids_after: Vec<i32> = {
@@ -559,7 +564,7 @@ impl Supervisor {
             reg.values().filter_map(|e| e.pgid).collect()
         };
         for pgid in &pgids_after {
-            let _ = signal::killpg(*pgid, signal::SIGKILL);
+            signal::signal_tree(*pgid, signal::SIGKILL);
         }
     }
 
@@ -766,7 +771,8 @@ impl std::fmt::Debug for SupervisedHandle {
 /// The guard lives inside `wait_status`/`wait_with_output`, after the child has
 /// been moved into the wait future. Its `Drop` runs before the child can be
 /// released by the canceled future, so the PGID is still owned by the child
-/// we spawned. It never sleeps or spawns a detached cleanup task.
+/// we spawned. It does not arm the grace timer or spawn a detached cleanup
+/// task. The kill it runs may wait until the leader has taken `SIGSTOP`.
 struct WaitCleanup {
     supervisor: Arc<Inner>,
     id: ProcId,
@@ -1035,16 +1041,16 @@ impl SupervisedHandle {
 
     async fn kill_tree(&self) {
         if let Some(pgid) = self.pgid {
-            let _ = signal::killpg(pgid, signal::SIGTERM);
+            signal::signal_tree(pgid, signal::SIGTERM);
             tokio::time::sleep(self.grace).await;
-            let _ = signal::killpg(pgid, signal::SIGKILL);
+            signal::signal_tree(pgid, signal::SIGKILL);
         } else if let Some(child_id) = self.child.as_ref().and_then(|c| c.id()) {
             // Fallback for non-Unix or when pgid couldn't be captured.
             #[cfg(unix)]
             {
-                let _ = signal::killpg(child_id as i32, signal::SIGTERM);
+                signal::signal_tree(child_id as i32, signal::SIGTERM);
                 tokio::time::sleep(self.grace).await;
-                let _ = signal::killpg(child_id as i32, signal::SIGKILL);
+                signal::signal_tree(child_id as i32, signal::SIGKILL);
             }
             #[cfg(not(unix))]
             {

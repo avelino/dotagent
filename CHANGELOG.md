@@ -16,10 +16,14 @@ schema and the plugin protocol are flagged in each entry.
   group does not exist until the child runs `setpgid`, and `killpg` in that
   window reports "no such process", which was treated as success. The parent
   now puts the child in its own group before the pid is registered, so the
-  signal has a group to land on. The regression test matches a per-run marker
-  in `ps` instead of `ps -g`: a numeric `-g` is a session id on Linux and a
-  pid in legacy BSD `ps`, and the pgid we record is the pid, which macOS
-  recycles. A recycled id no longer looks like a survivor.
+  signal has a group to land on. That was not sufficient: a signal is not
+  inherited by a child forked while it is still pending, and `killpg` does
+  not see a job the shell has moved into another group. The macOS loop left
+  that `sleep` alive. `SIGKILL` now stops the leader and then signals every
+  descendant still parented under it. The regression test matches a per-run
+  marker in `ps` instead of `ps -g`: a numeric `-g` is a session id on Linux
+  and a pid in legacy BSD `ps`, and the pgid we record is the pid, which
+  macOS recycles. A recycled id no longer looks like a survivor.
 
 - **sink-outl Roam queries.** `{{[[query]]: …}}` and `{{query: …}}` were
   rewritten to `{{query: …}}`, which outl stores as text and never runs.
