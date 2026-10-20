@@ -11,6 +11,16 @@ schema and the plugin protocol are flagged in each entry.
 
 ### Fixed
 
+- **Abort leaves the agent running.** Cancelling the task that is waiting on
+  a run sends `SIGKILL` to the agent's process group. On the fork path that
+  group does not exist until the child runs `setpgid`, and `killpg` in that
+  window reports "no such process", which was treated as success. The parent
+  now puts the child in its own group before the pid is registered, so the
+  signal has a group to land on. The regression test matches a per-run marker
+  in `ps` instead of `ps -g`: a numeric `-g` is a session id on Linux and a
+  pid in legacy BSD `ps`, and the pgid we record is the pid, which macOS
+  recycles. A recycled id no longer looks like a survivor.
+
 - **sink-outl Roam queries.** `{{[[query]]: …}}` and `{{query: …}}` were
   rewritten to `{{query: …}}`, which outl stores as text and never runs.
   A query whose clauses outl can say (`{and:}`, `{not:}` of one condition,
