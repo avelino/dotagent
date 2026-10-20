@@ -37,6 +37,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(script: &str) -> Self {
+        Self::with_script_args(script, &[])
+    }
+
+    fn with_script_args(script: &str, script_args: &[&str]) -> Self {
         redirect_log_home();
         let dir = tempfile::tempdir().expect("tempdir");
         let script_path = dir.path().join("agent.sh");
@@ -46,7 +50,10 @@ impl Fixture {
             std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod");
         }
-        let toml = r#"
+        let mut args = vec!["\"./agent.sh\"".to_string()];
+        args.extend(script_args.iter().map(|arg| format!("\"{arg}\"")));
+        let toml = format!(
+            r#"
 [agent]
 name = "fixture"
 monitor = false
@@ -54,9 +61,11 @@ timeout_seconds = 30
 
 [run]
 command = "bash"
-args = ["./agent.sh"]
-"#;
-        let manifest: AgentManifest = toml::from_str(toml).expect("fixture manifest parses");
+args = [{}]
+"#,
+            args.join(", ")
+        );
+        let manifest: AgentManifest = toml::from_str(&toml).expect("fixture manifest parses");
         manifest.validate().expect("fixture manifest validates");
         Self {
             dir,
@@ -87,16 +96,39 @@ fn spec<'a>(f: &'a Fixture, args: &'a [String]) -> RunSpec<'a> {
     }
 }
 
-fn process_group_has_live_process(pgid: i32) -> bool {
+/// Live (non-zombie) processes whose command line contains `marker`.
+///
+/// `ps -g <pgid>` does not answer "who is in this process group" on both
+/// platforms. procps treats a numeric `-g` as a session id, so a child that
+/// called `setpgid` without `setsid` is invisible and a leaked group looks
+/// empty. BSD `ps` selects the process group with `-g` only in unix2003
+/// mode; in legacy mode the flag is ignored and the number is a pid. That
+/// pid is also the pgid of every supervised spawn, and macOS recycles it
+/// quickly enough that the next group leader looks like a survivor.
+///
+/// The marker is on the agent's argv and on the grandchild's argv0, so a
+/// recycled pid running something else does not match, and a grandchild
+/// that left the group still does.
+fn live_marked(marker: &str) -> Vec<String> {
     let output = std::process::Command::new("ps")
-        .args(["-o", "stat=", "-g", &pgid.to_string()])
+        .args(["-axo", "pid=,stat=,command="])
         .output()
         .expect("ps must be available on Unix");
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|stat| !stat.is_empty())
-        .any(|stat| !stat.starts_with('Z'))
+    let mut live = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.contains(marker) {
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let Some(pid) = cols.next() else { continue };
+        let Some(stat) = cols.next() else { continue };
+        if stat.starts_with('Z') {
+            continue;
+        }
+        live.push(format!("pid={pid} stat={stat} line={line}"));
+    }
+    live
 }
 
 // ---------------------------------------------------------------------------
@@ -224,9 +256,23 @@ async fn aborting_run_task_kills_agent_group_and_clears_registry() {
             }
         }),
     );
+    // On the agent's argv and, via `exec -a`, on the grandchild's argv0.
+    // `ps` then names our processes without consulting `-g`.
+    let marker = format!(
+        "dotagent-abort-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let marker_for_task = marker.clone();
     let task_supervisor = supervisor.clone();
     let task = tokio::spawn(async move {
-        let fixture = Fixture::new("#!/usr/bin/env bash\nsleep 30 & wait\n");
+        let fixture = Fixture::with_script_args(
+            "#!/usr/bin/env bash\nbash -c 'exec -a \"$1\" sleep 30' _ \"$1\" &\nwait\n",
+            &[&marker_for_task],
+        );
         let state = fixture.state();
         let args = Vec::new();
         run_streaming(
@@ -271,11 +317,12 @@ async fn aborting_run_task_kills_agent_group_and_clears_registry() {
     );
 
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while process_group_has_live_process(pgid) && std::time::Instant::now() < deadline {
+    while !live_marked(&marker).is_empty() && std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    let still = live_marked(&marker);
     assert!(
-        !process_group_has_live_process(pgid),
-        "canceled run left a live process in group {pgid}"
+        still.is_empty(),
+        "canceled run left a live process in group {pgid}: {still:?}"
     );
 }

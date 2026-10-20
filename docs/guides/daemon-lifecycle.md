@@ -240,7 +240,7 @@ record is reaped only when **all** of these hold:
 |---|---|
 | pid > 1, and not our own | signalling init or ourselves |
 | the record carries `pgid` and `command` | a snapshot from a build that predates identity checking |
-| recorded `pgid == pid` | a record this supervisor did not produce — every supervised spawn does `setpgid(0, 0)` |
+| recorded `pgid == pid` | a record this supervisor did not produce — every supervised spawn does `setpgid(0, 0)`, from the parent before the pid is registered and again from the child |
 | the OS still reports the pid | a process that already exited (the common case) |
 | observed `pgid == pid` | a recycled pid that is not its own group leader |
 | observed start time within 5s of the recorded one | a process that inherited the number after the old daemon died |

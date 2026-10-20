@@ -49,6 +49,41 @@ fn sh(script: &str) -> Command {
     cmd
 }
 
+/// Non-zombie processes whose process group is `pgid`.
+///
+/// `ps -g <n>` is not that query on both platforms. procps treats a numeric
+/// `-g` as a session id, so a child that called `setpgid` but not `setsid`
+/// produces no rows and a leaked group looks empty. BSD `ps` uses `-g` for
+/// the process group only in unix2003 mode; with `COMMAND_MODE=legacy` the
+/// flag is ignored and the number is parsed as a pid, which is the reuse
+/// flake this file used to hit with `ps -p`. The `pgid` column means the
+/// same thing on both.
+fn live_in_group(pgid: i32) -> Vec<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pgid=,pid=,stat=,command="])
+        .output()
+        .expect("ps");
+    let mut live = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let Some(got) = cols.next() else { continue };
+        let Some(pid) = cols.next() else { continue };
+        let Some(stat) = cols.next() else { continue };
+        let Ok(got_pgid) = got.parse::<i32>() else {
+            continue;
+        };
+        if got_pgid == pgid && !stat.starts_with('Z') {
+            let cmd: Vec<&str> = cols.collect();
+            live.push(format!("pid={pid} stat={stat} cmd={}", cmd.join(" ")));
+        }
+    }
+    live
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn happy_path_returns_output_and_clears_registry() {
     let sup = Supervisor::with_grace(Duration::from_millis(200));
@@ -111,14 +146,11 @@ async fn timeout_reaps_grandchildren_via_process_group() {
     // Give the OS a beat to update its bookkeeping.
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    let ps = std::process::Command::new("ps")
-        .args(["-o", "pid=", "-g", &pgid.to_string()])
-        .output()
-        .expect("ps");
-    let stdout = String::from_utf8_lossy(&ps.stdout);
+    let live = live_in_group(pgid);
     assert!(
-        stdout.trim().is_empty(),
-        "process group {pgid} should be empty after kill_tree, ps stdout=\n{stdout}"
+        live.is_empty(),
+        "process group {pgid} should be empty after kill_tree, still live:\n{}",
+        live.join("\n")
     );
 }
 
@@ -147,19 +179,13 @@ async fn reaper_kills_forgotten_handle_via_deadline() {
         "reaper should have removed the entry"
     );
     // After killpg, every member of the group must be gone or zombie —
-    // never still running (S/R). Using `ps -g` keeps the check stable
-    // against macOS pid reuse.
-    let ps = std::process::Command::new("ps")
-        .args(["-o", "stat=", "-g", &pgid.to_string()])
-        .output()
-        .expect("ps");
-    let stats = String::from_utf8_lossy(&ps.stdout);
-    for stat in stats.lines().map(str::trim).filter(|s| !s.is_empty()) {
-        assert!(
-            stat.starts_with('Z'),
-            "process group {pgid} still has a non-zombie entry stat={stat:?}"
-        );
-    }
+    // never still running (S/R). `live_in_group` already drops zombies.
+    let live = live_in_group(pgid);
+    assert!(
+        live.is_empty(),
+        "process group {pgid} still has a non-zombie entry:\n{}",
+        live.join("\n")
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -234,14 +260,11 @@ async fn shutdown_signals_every_live_entry() {
     // Give the OS a beat to clear the process group bookkeeping.
     tokio::time::sleep(Duration::from_millis(300)).await;
     for pgid in [pg1, pg2] {
-        let ps = std::process::Command::new("ps")
-            .args(["-o", "pid=", "-g", &pgid.to_string()])
-            .output()
-            .expect("ps");
-        let stdout = String::from_utf8_lossy(&ps.stdout);
+        let live = live_in_group(pgid);
         assert!(
-            stdout.trim().is_empty(),
-            "process group {pgid} should be empty after shutdown, ps stdout=\n{stdout}"
+            live.is_empty(),
+            "process group {pgid} should be empty after shutdown, still live:\n{}",
+            live.join("\n")
         );
     }
 }
@@ -326,6 +349,33 @@ async fn drop_without_await_clears_registry() {
     // tests.
     // SAFETY: kill with a known pid is a stable syscall.
     let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+}
+
+/// `spawn_supervised` must not return until the child leads its own group.
+///
+/// A cancellation that fires in the gap used to `killpg` a group that did
+/// not exist yet (ESRCH, ignored). The child then called `setpgid` and kept
+/// running. Twenty spawns in a row is enough to catch a parent that returns
+/// before `setpgid`; it is not a sleep.
+#[tokio::test(flavor = "current_thread")]
+async fn spawn_returns_only_once_the_child_leads_its_group() {
+    let sup = Supervisor::with_grace(Duration::from_millis(50));
+    for _ in 0..20 {
+        let handle = sup
+            .spawn_supervised(sh("sleep 30"), spec("leader", 5_000))
+            .await
+            .expect("spawn");
+        let pid = handle.pid().expect("pid") as i32;
+        // SAFETY: `pid` is a child we have not waited on. `getpgid` and
+        // `killpg` take integer ids only.
+        let pgid = unsafe { libc::getpgid(pid) };
+        assert_eq!(
+            pgid, pid,
+            "spawn returned before pid {pid} led its group (pgid {pgid})"
+        );
+        let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+        drop(handle);
+    }
 }
 
 /// Audit hooks fire for the success path.
@@ -452,16 +502,11 @@ async fn terminate_kills_the_tree_and_deregisters() {
 
     // Nothing from the group may still be running — the grandchild `sleep`
     // included.
-    let out = std::process::Command::new("ps")
-        .args(["-g", &pgid.to_string(), "-o", "stat="])
-        .output()
-        .expect("ps");
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let live = live_in_group(pgid);
     assert!(
-        stdout
-            .lines()
-            .all(|l| l.trim().starts_with('Z') || l.trim().is_empty()),
-        "process group {pgid} should be dead, ps stdout=\n{stdout}"
+        live.is_empty(),
+        "process group {pgid} should be dead, still live:\n{}",
+        live.join("\n")
     );
 }
 

@@ -33,3 +33,44 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace --all-targets
+
+  # Proves the abort/process-group fix. The streaming test used to pass on
+  # Linux while a live group survived, because `ps -g` there selects a
+  # session. Drop this job once main has a green run of it; it is not part
+  # of the regular suite's signal.
+  abort-group-loop:
+    name: abort process group 200x
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: aborting_run_task 200 times
+        run: |
+          set -euo pipefail
+          pass=0
+          for i in $(seq 1 200); do
+            if cargo test -p dotagent-runner --test streaming -- --test-threads=1 --exact aborting_run_task_kills_agent_group_and_clears_registry >"/tmp/abort-$i.log" 2>&1; then
+              pass=$((pass + 1))
+              printf '.'
+            else
+              echo
+              echo "FAIL iteration $i"
+              cat "/tmp/abort-$i.log"
+              echo "passed $pass before the failure"
+              exit 1
+            fi
+          done
+          echo
+          echo "$pass/200 passed"

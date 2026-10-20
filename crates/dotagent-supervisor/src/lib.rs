@@ -5,8 +5,12 @@
 //! - **Bounded deadlines.** Every spawn carries a `Duration` the supervisor
 //!   enforces with `SIGTERM → grace → SIGKILL`.
 //! - **Kill-tree.** Children are placed in their own process group via
-//!   `setpgid(0, 0)`. Termination signals are sent with `killpg(2)` so
+//!   `setpgid(0, 0)`, from the parent before the pid is published and from
+//!   the child. Termination signals are sent with `killpg(2)` so
 //!   grandchildren (e.g. `mcp` invoked by a sink plugin) die with the parent.
+//!   The parent call is what makes a cancellation safe: `Command::process_group`
+//!   only `setpgid`s inside the child, and on the fork path that runs after
+//!   `spawn` has already returned.
 //! - **Live registry.** `Supervisor::snapshot` returns what is running right
 //!   now — feeds `dotagent status` and `dotagent doctor`.
 //! - **Reaper task.** A sweeper kills entries whose deadline elapsed even if
@@ -369,6 +373,19 @@ impl Supervisor {
         // On Unix, with `process_group(0)`, the child becomes its own group
         // leader (pgid == pid). On other platforms we leave the field empty
         // and `killpg` becomes a no-op.
+        //
+        // Join the group here, before the registry insert below. `spawn`
+        // returns as soon as the pid exists. `process_group(0)` performs its
+        // `setpgid` in the child (or inside `posix_spawn`, when that path is
+        // taken). On the fork path the child may not have run yet, so a
+        // cancellation that observes this entry and `killpg`s would be told
+        // ESRCH — which we treat as "already gone" — and the child would then
+        // become the leader and keep running. The parent `setpgid` closes
+        // that window. POSIX allows either side to win.
+        #[cfg(unix)]
+        if let Some(pid) = pid {
+            lead_own_process_group(pid);
+        }
         let pgid = if cfg!(unix) {
             pid.map(|p| p as i32)
         } else {
@@ -636,6 +653,41 @@ impl Inner {
         if let Ok(slot) = self.on_event.read() {
             if let Some(h) = slot.as_ref() {
                 (h)(evt);
+            }
+        }
+    }
+}
+
+/// Make `pid` the leader of its own process group.
+///
+/// Called only for a child this supervisor just spawned, before that pid is
+/// inserted into the registry. `EACCES` means the child already `exec`d after
+/// its own `setpgid(0, 0)` (the `posix_spawn` path, or a child that won the
+/// race). `ESRCH` means it exited before we got here. Either way the group
+/// is not ours to create anymore.
+#[cfg(unix)]
+fn lead_own_process_group(pid: u32) {
+    let pid = pid as i32;
+    // SAFETY: `pid` is a child of this process that has not been waited on,
+    // so the kernel has not reused it. `setpgid` / `getpgid` take integer
+    // ids and do not dereference pointers we own.
+    let rc = unsafe { libc::setpgid(pid, pid) };
+    if rc == 0 {
+        return;
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EACCES) | Some(libc::ESRCH) => {}
+        _ => {
+            // SAFETY: same pid, still unreaped. `getpgid` returns -1 on error.
+            let current = unsafe { libc::getpgid(pid) };
+            if current != pid && current != -1 {
+                warn!(
+                    pid,
+                    pgid = current,
+                    error = %err,
+                    "supervised child is not its own process group leader"
+                );
             }
         }
     }
