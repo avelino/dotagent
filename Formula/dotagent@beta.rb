@@ -27,7 +27,7 @@
 class DotagentATBeta < Formula
   desc "Polyglot agent orchestrator (beta — built from main)"
   homepage "https://github.com/avelino/dotagent"
-  version "0.6.2-beta.77" # DOTAGENT_BETA_VERSION
+  version "0.6.2-beta.79" # DOTAGENT_BETA_VERSION
   license "MIT"
 
   keg_only :versioned_formula
@@ -35,22 +35,22 @@ class DotagentATBeta < Formula
   on_macos do
     on_arm do
       url "https://github.com/avelino/dotagent/releases/download/beta/dotagent-beta-aarch64-darwin.tar.gz"
-      sha256 "2a1aecf1e81345c6349d970ba6c0aa943960e1fbaa255aa8bd803db94ac36487" # DOTAGENT_BETA_AARCH64_DARWIN_SHA
+      sha256 "ae6fe7cb7b7e93ccea7fecc3446094cb079cab3faaed101a6104ed59fb51abe5" # DOTAGENT_BETA_AARCH64_DARWIN_SHA
     end
     on_intel do
       url "https://github.com/avelino/dotagent/releases/download/beta/dotagent-beta-x86_64-darwin.tar.gz"
-      sha256 "48f00674e070c84058f88214cd3c4c9b077d0ab5daf3ab32118af7d35efb016b" # DOTAGENT_BETA_X86_64_DARWIN_SHA
+      sha256 "35553037f69be00597de996f355f96722f1a91b716116c841675e2b9c52bfc3c" # DOTAGENT_BETA_X86_64_DARWIN_SHA
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/avelino/dotagent/releases/download/beta/dotagent-beta-aarch64-linux.tar.gz"
-      sha256 "0ae63e57095d506ceeee8d9d9954abfe52ba2b31407fbb12d081da70d19313d3" # DOTAGENT_BETA_AARCH64_LINUX_SHA
+      sha256 "7543c93c0265db93622e64c51828a4a0f2224e0d72a29dddbf89cd8579f10ed3" # DOTAGENT_BETA_AARCH64_LINUX_SHA
     end
     on_intel do
       url "https://github.com/avelino/dotagent/releases/download/beta/dotagent-beta-x86_64-linux.tar.gz"
-      sha256 "b1c84672277f65dcc6f7a763769f91c7cda2125b5b64b0a897238adbc91c9119" # DOTAGENT_BETA_X86_64_LINUX_SHA
+      sha256 "499b458d5182dbfc9e52703ed93b73be008c2ea8bd72a73c935b15cf46a0092a" # DOTAGENT_BETA_X86_64_LINUX_SHA
     end
   end
 
