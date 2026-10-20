@@ -128,7 +128,7 @@ async fn sweep_once(inner: &Inner) {
             age_seconds = age.as_secs(),
             "reaper: deadline exceeded, sending SIGTERM"
         );
-        let _ = signal::killpg(*pgid, signal::SIGTERM);
+        signal::signal_tree(*pgid, signal::SIGTERM);
     }
 
     tokio::time::sleep(grace).await;
@@ -136,7 +136,7 @@ async fn sweep_once(inner: &Inner) {
     // Final pass: SIGKILL stragglers + remove from registry + emit events.
     let mut reg = inner.registry.lock().expect("registry lock poisoned");
     for (id, pgid, age) in victims {
-        let _ = signal::killpg(pgid, signal::SIGKILL);
+        signal::signal_tree(pgid, signal::SIGKILL);
         if let Some(entry) = reg.remove(&id) {
             debug!(proc_id = id, pgid, "reaper: removed entry");
             inner.emit(SupervisorEvent::KilledTimeout {

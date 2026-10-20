@@ -132,7 +132,8 @@ same supervisor as every other subprocess, which is the entire argument for
 this living in the orchestrator rather than beside it:
 
 - **Supervision.** Real process groups, real kill-tree. A deadline reaches
-  grandchildren.
+  grandchildren, including a background job the shell has moved into its
+  own process group.
 - **Visibility.** It shows up in `dotagent status` under `persistent`, and its
   spawn and recycle land in the audit log.
 - **Reaping.** A graceful daemon shutdown retires it through the pool, then

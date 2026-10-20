@@ -378,6 +378,108 @@ async fn spawn_returns_only_once_the_child_leads_its_group() {
     }
 }
 
+/// A shell with monitor mode puts `cmd &` in its own process group. `killpg`
+/// of the leader does not reach it. Cancelling the wait must still kill it:
+/// the grandchild stays parented under the leader until the leader dies.
+#[tokio::test(flavor = "current_thread")]
+async fn aborting_wait_kills_grandchild_that_left_the_group() {
+    let sup = Supervisor::with_grace(Duration::from_millis(50));
+    let marker = format!(
+        "dotagent-leave-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos()
+    );
+    let script = format!("set -m; bash -c 'exec -a {marker} sleep 60' _ x & wait");
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c").arg(script);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    let handle = sup
+        .spawn_supervised(cmd, spec("left-group", 30_000))
+        .await
+        .expect("spawn");
+    let leader = handle.pid().expect("pid") as i32;
+
+    let marker_for_poll = marker.clone();
+    assert!(
+        until(Duration::from_secs(2), || {
+            marked_outside_group(&marker_for_poll, leader)
+        })
+        .await,
+        "grandchild never left group {leader}: {:?}",
+        marked_lines(&marker)
+    );
+
+    let task = tokio::spawn(async move {
+        let _ = handle.wait_with_output().await;
+    });
+    // First poll arms the cancellation kill inside `wait_with_output`.
+    // Aborting an unpolled task drops the handle without signalling.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !task.is_finished(),
+        "wait future exited before it could be aborted"
+    );
+    task.abort();
+    let joined = task.await;
+    assert!(
+        joined.expect_err("abort cancels the wait").is_cancelled(),
+        "abort must cancel the wait"
+    );
+
+    let marker_for_dead = marker.clone();
+    assert!(
+        until(Duration::from_secs(2), || marked_lines(&marker_for_dead)
+            .is_empty())
+        .await,
+        "grandchild survived abort: {:?}",
+        marked_lines(&marker)
+    );
+}
+
+/// Non-zombie `ps` rows whose command contains `marker`.
+fn marked_lines(marker: &str) -> Vec<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid=,stat=,command="])
+        .output()
+        .expect("ps");
+    let mut live = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim();
+        if line.is_empty() || !line.contains(marker) {
+            continue;
+        }
+        let mut cols = line.split_whitespace();
+        let Some(_pid) = cols.next() else { continue };
+        let Some(_ppid) = cols.next() else { continue };
+        let Some(_pgid) = cols.next() else { continue };
+        let Some(stat) = cols.next() else { continue };
+        if stat.starts_with('Z') {
+            continue;
+        }
+        live.push(line.to_string());
+    }
+    live
+}
+
+fn marked_outside_group(marker: &str, leader: i32) -> bool {
+    marked_lines(marker).iter().any(|line| {
+        let mut cols = line.split_whitespace();
+        let _pid = cols.next();
+        let _ppid = cols.next();
+        let Some(pgid) = cols.next() else {
+            return false;
+        };
+        pgid.parse::<i32>().ok() != Some(leader)
+    })
+}
+
 /// Audit hooks fire for the success path.
 #[tokio::test(flavor = "current_thread")]
 async fn event_handler_observes_started_and_finished() {

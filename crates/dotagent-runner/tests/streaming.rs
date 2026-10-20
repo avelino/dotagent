@@ -111,7 +111,7 @@ fn spec<'a>(f: &'a Fixture, args: &'a [String]) -> RunSpec<'a> {
 /// that left the group still does.
 fn live_marked(marker: &str) -> Vec<String> {
     let output = std::process::Command::new("ps")
-        .args(["-axo", "pid=,stat=,command="])
+        .args(["-axo", "pid=,ppid=,pgid=,stat=,command="])
         .output()
         .expect("ps must be available on Unix");
     let mut live = Vec::new();
@@ -122,11 +122,15 @@ fn live_marked(marker: &str) -> Vec<String> {
         }
         let mut cols = line.split_whitespace();
         let Some(pid) = cols.next() else { continue };
+        let Some(ppid) = cols.next() else { continue };
+        let Some(pgid) = cols.next() else { continue };
         let Some(stat) = cols.next() else { continue };
         if stat.starts_with('Z') {
             continue;
         }
-        live.push(format!("pid={pid} stat={stat} line={line}"));
+        live.push(format!(
+            "pid={pid} ppid={ppid} pgid={pgid} stat={stat} line={line}"
+        ));
     }
     live
 }
