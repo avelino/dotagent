@@ -84,16 +84,18 @@ tracing-subscriber = { version = "0.3", features = [
   "fmt",
 ] }
 tracing-appender = "0.2"
-tracing-opentelemetry = "0.33"
-opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+# The OpenTelemetry crates and tracing-opentelemetry share the Tracer trait.
+# A one-crate bump fails to compile (E0277). Move them together.
+tracing-opentelemetry = "0.34"
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
   "grpc-tonic",
   "trace",
   "logs",
 ] }
-opentelemetry-semantic-conventions = "0.32"
-opentelemetry-stdout = { version = "0.32", features = ["trace", "logs"] }
+opentelemetry-semantic-conventions = "0.33"
+opentelemetry-stdout = { version = "0.33", features = ["trace", "logs"] }
 flate2 = "1"
 
 # Errors

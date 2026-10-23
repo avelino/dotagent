@@ -5,6 +5,12 @@ updates:
     schedule:
       interval: weekly
     groups:
+      # First match wins. These crates implement one Tracer trait, so a
+      # single-crate bump does not compile. Keep them out of cargo-minor-patch.
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
       cargo-minor-patch:
         update-types: [minor, patch]
   - package-ecosystem: github-actions

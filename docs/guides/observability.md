@@ -483,7 +483,10 @@ tail -F ~/.config/dotagent/logs/daemon/dotagent.log | jq 'select(.fields.message
 Common gotchas:
 
 - **TLS error**: the OTLP endpoint requires `https://` (gRPC over TLS).
-  Local Jaeger uses `http://localhost:4317`.
+  Local Jaeger uses `http://localhost:4317`. An endpoint with no scheme
+  is sent as `https://`, so a plaintext collector has to say `http://`.
+- **Retries**: a failed export is retried up to three times, with backoff.
+  A collector that is down delays the batch. It does not fail the agent run.
 - **Headers**: vendor-specific auth goes in `OTEL_EXPORTER_OTLP_HEADERS`,
   not in `config.toml`. Comma-separated `k1=v1,k2=v2`.
 - **Reload required**: changing config without restarting the daemon
