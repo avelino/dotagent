@@ -41,6 +41,15 @@ schema and the plugin protocol are flagged in each entry.
   open chat grants conversation only: direct messages and `!`/`!!` typed
   commands stay restricted to allowlisted users.
 
+### Changed
+
+- **OpenTelemetry export.** The OTLP crates and `tracing-opentelemetry`
+  move together (`opentelemetry` 0.33, `tracing-opentelemetry` 0.34).
+  They share one `Tracer` trait, so bumping a single crate does not
+  compile. A failed export is now retried (three retries, with backoff).
+  An endpoint that already says `http://` or `https://` is unchanged; one
+  without a scheme is sent as `https://`.
+
 ## [0.6.2] - 2026-08-26
 
 ### Added

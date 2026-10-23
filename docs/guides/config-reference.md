@@ -480,6 +480,11 @@ leaves your machine until you set `otlp_endpoint`.
 | `protocol`      | string | `"grpc"`       | `grpc` or `http` (HTTP/protobuf).                                    |
 | `service_name`  | string | `"dotagent"`   | `service.name` resource attribute on every span/log.                  |
 
+An endpoint with no scheme is sent as `https://`. A collector on
+plaintext has to include `http://` (for example `http://localhost:4317`).
+A failed export is retried up to three times. That delays the batch; it
+does not fail the agent run.
+
 ### `[telemetry.headers]`
 
 Inline TOML table. Keys/values sent verbatim as HTTP/gRPC headers on
